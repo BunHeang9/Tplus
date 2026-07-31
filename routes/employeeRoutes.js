@@ -1,0 +1,17 @@
+const express = require('express');
+const router = express.Router();
+const employeeController = require('../controllers/employeeController');
+const { authenticate, requireAdmin } = require('../middleware/auth');
+
+// NOTE: /search must be declared before /:id, otherwise Express would
+// treat the word "search" as an :id value and never reach this handler.
+router.get('/search', authenticate, employeeController.search);
+router.get('/', authenticate, employeeController.getAll);
+router.get('/:id', authenticate, employeeController.getById);
+router.get('/:id/replacements', authenticate, employeeController.getReplacements);
+
+router.post('/', authenticate, requireAdmin, employeeController.create);
+router.put('/:id', authenticate, requireAdmin, employeeController.update);
+router.delete('/:id', authenticate, requireAdmin, employeeController.remove);
+
+module.exports = router;

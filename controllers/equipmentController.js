@@ -1,0 +1,153 @@
+const equipmentModel = require('../models/equipmentModel');
+const categoryModel = require('../models/categoryModel');
+const departmentModel = require('../models/departmentModel');
+const { sql, poolPromise } = require('../config/db');
+
+async function getAll(req, res, next) {
+  try {
+    const equipment = await equipmentModel.findAll(req.query);
+    res.json(equipment);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getCategories(req, res, next) {
+  try {
+    const summary = await equipmentModel.getCategorySummary();
+    res.json(summary);
+  } catch (err) {
+    next(err);
+  }
+}
+//unssign
+async function unassign(req, res) {
+  const { equipment_id, equipment_ids, owner_id, status } = req.body;
+
+  if (!equipment_id && !equipment_ids && !owner_id) {
+    return res.status(400).json({ error: 'Provide equipment_id, equipment_ids, or owner_id' });
+  }
+
+  let pool;
+  let transaction;
+  try {
+    pool = await poolPromise;
+    transaction = new sql.Transaction(pool);
+    await transaction.begin();
+    const request = transaction.request();
+
+    let result;
+    if (equipment_id) {
+      result = await equipmentModel.unassignById(request, equipment_id, status);
+    } else if (Array.isArray(equipment_ids) && equipment_ids.length) {
+      result = await equipmentModel.unassignByIds(request, equipment_ids, status);
+    } else {
+      result = await equipmentModel.unassignByOwnerId(request, owner_id, status);
+    }
+
+    if (!result || !result.recordset || result.recordset.length === 0) {
+      await transaction.rollback();
+      return res.status(404).json({ error: 'No matching equipment found' });
+    }
+
+    await transaction.commit();
+    // return single object for single id, otherwise array
+    return res.json(result.recordset.length === 1 ? result.recordset[0] : result.recordset);
+  } catch (err) {
+    try {
+      if (transaction) await transaction.rollback();
+    } catch (rbErr) {
+      console.error('Rollback failed', rbErr);
+    }
+    console.error('unassign error', err);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+async function getById(req, res, next) {
+  try {
+    const equipment = await equipmentModel.findById(req.params.id);
+    if (!equipment) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    res.json(equipment);
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function updateOwner(req, res, next) {
+  try {
+    const equipment = await equipmentModel.updateOwner(req.params.id, req.body.owner_id);
+    if (!equipment) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+    res.json(equipment);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Full detail edit - fixing a typo, recording a RAM upgrade, changing status.
+// Accepts category and department as either name or id.
+async function update(req, res, next) {
+  try {
+    const existing = await equipmentModel.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+
+    let category_id = req.body.category_id;
+    if (!category_id && req.body.category) {
+      const cat = await categoryModel.findByName(req.body.category);
+      if (!cat) {
+        return res.status(400).json({
+          error: `Unknown category "${req.body.category}". See GET /api/categories.`,
+        });
+      }
+      category_id = cat.category_id;
+    }
+
+    let department_id = req.body.department_id;
+    if (!department_id && req.body.department) {
+      const dept = await departmentModel.findByCode(req.body.department);
+      if (!dept) {
+        return res.status(400).json({
+          error: `Unknown department "${req.body.department}". See GET /api/departments.`,
+        });
+      }
+      department_id = dept.department_id;
+    }
+
+    // Don't let an edit hand this asset code or service tag to a second record
+    if (req.body.equipment_code && req.body.equipment_code !== existing.equipment_code) {
+      const clash = await equipmentModel.findByEquipmentCode(req.body.equipment_code);
+      if (clash && clash.equipment_id !== Number(req.params.id)) {
+        return res.status(409).json({
+          error: `Asset code "${req.body.equipment_code}" is already used by equipment_id ${clash.equipment_id}`,
+        });
+      }
+    }
+    if (req.body.service_tag && req.body.service_tag !== existing.service_tag) {
+      const clash = await equipmentModel.findByServiceTag(req.body.service_tag);
+      if (clash && clash.equipment_id !== Number(req.params.id)) {
+        return res.status(409).json({
+          error: `Service tag "${req.body.service_tag}" is already used by equipment_id ${clash.equipment_id}`,
+        });
+      }
+    }
+
+    const updated = await equipmentModel.update(req.params.id, {
+      ...req.body, category_id, department_id,
+    });
+    res.json({ message: 'Equipment updated', equipment: updated });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { 
+  getAll, getCategories, getById, updateOwner, 
+  update ,unassign
+
+};
