@@ -192,7 +192,19 @@ is refused, since it would leave nobody able to manage the system.
 
 ## Editing and deleting
 
-**Deletable (admin only, all guarded):** employees, departments, categories.
+### Audit log
+
+Successful updates and deletes are recorded with the acting account, action,
+record type and ID, submitted changes, and time. Run
+`migrations/20260803_add_audit_log.sql` once before deploying. Administrators
+can read the newest entries from `GET /api/audit?limit=200`.
+
+Authenticated non-admin users may update or delete employees, equipment details,
+departments, and categories, and may unassign equipment before deleting a staff
+member. Creating records, assigning equipment, stock actions, borrowing/returns,
+and user-account management remain admin-only.
+
+**Deletable (authenticated users, all guarded):** employees, departments, categories.
 
 **Not deletable:** equipment and borrow records. Removing a device with borrow
 history would orphan those records, and the history is usually the part worth

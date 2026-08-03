@@ -216,13 +216,55 @@ async function countReferences(id) {
   return result.recordset[0];
 }
 
-async function remove(id) {
+async function remove(id, fullName) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query('DELETE FROM dbo.employee OUTPUT DELETED.* WHERE employee_id = @id');
-  return result.recordset[0] || null;
+  const transaction = new sql.Transaction(pool);
+  const recycleBinModel = require("./recycleBinModel");
+  await transaction.begin();
+
+  try {
+    const row = await new sql.Request(transaction)
+      .input("id", sql.Int, id)
+      .query("SELECT * full_name FROM dbo.employee WHERE employee_id = @id");
+    await recycleBinModel.create(
+      {
+        entityType: "employee",
+        entityId: id,
+        entityLabel: row.recordset[0].full_name,
+        entityData: JSON.stringify({
+          employee_id: id,
+          full_name: row.recordset[0].full_name,
+        }),
+        actor: "system", // You might want to replace this with the actual user performing the deletion
+        reason: "Employee record deleted",
+      },
+      transaction,
+    );
+    // Snapshot the name and clear each reference before deletion. Doing this
+    // explicitly avoids SQL Server's multiple-cascade-path restriction.
+    await new sql.Request(transaction)
+      .input("id", sql.Int, id)
+      .input("full_name", sql.NVarChar, fullName).query(`
+        UPDATE dbo.borrow_record
+        SET borrower_name = CASE WHEN borrower_id = @id THEN COALESCE(borrower_name, @full_name) ELSE borrower_name END,
+            issued_by_name = CASE WHEN issued_by_id = @id THEN COALESCE(issued_by_name, @full_name) ELSE issued_by_name END,
+            received_by_name = CASE WHEN received_by_id = @id THEN COALESCE(received_by_name, @full_name) ELSE received_by_name END,
+            borrower_id = CASE WHEN borrower_id = @id THEN NULL ELSE borrower_id END,
+            issued_by_id = CASE WHEN issued_by_id = @id THEN NULL ELSE issued_by_id END,
+            received_by_id = CASE WHEN received_by_id = @id THEN NULL ELSE received_by_id END
+        WHERE borrower_id = @id OR issued_by_id = @id OR received_by_id = @id
+      `);
+
+    const result = await new sql.Request(transaction)
+      .input("id", sql.Int, id)
+      .query("DELETE FROM dbo.employee WHERE employee_id = @id");
+
+    await transaction.commit();
+    return (result.rowsAffected[0] || 0) > 0;
+  } catch (err) {
+    await transaction.rollback();
+    throw err;
+  }
 }
 
 module.exports = {

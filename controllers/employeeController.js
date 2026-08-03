@@ -105,7 +105,7 @@ async function remove(req, res, next) {
     const refs = await employeeModel.countReferences(req.params.id);
 
     // items_still_out is a subset of borrow_records, so exclude it from the total
-    const { items_still_out, ...countable } = refs;
+    const { borrow_records, items_still_out, ...countable } = refs;
     const total = Object.values(countable).reduce((a, b) => a + b, 0);
 
     if (total > 0) {
@@ -113,28 +113,33 @@ async function remove(req, res, next) {
       // by the user; the other is a deliberate refusal to destroy history.
       const fixable = [];
       if (items_still_out > 0) {
-        fixable.push(`${items_still_out} item(s) still on loan - process the returns first`);
+        fixable.push(
+          `${items_still_out} item(s) still on loan - process the returns first`,
+        );
       }
       if (refs.owned_equipment > 0) {
-        fixable.push(`${refs.owned_equipment} device(s) still assigned - reassign them first`);
+        fixable.push(
+          `${refs.owned_equipment} device(s) still assigned - reassign them first`,
+        );
       }
 
-      const historyOnly = fixable.length === 0;
-
       return res.status(409).json({
-        error: historyOnly
-          ? `Cannot delete ${existing.full_name}: they have past records that would be lost`
-          : `Cannot delete ${existing.full_name}: there are things to sort out first`,
+        error: `Cannot delete ${existing.full_name}: there are things to sort out first`,
         references: refs,
         blocking: fixable,
-        hint: historyOnly
-          ? 'Their loan history has to keep a real name attached, or it becomes unusable. Set is_active to false instead - they disappear from dropdowns but the history stays intact.'
-          : 'Clear the items listed above, then try again. If you only want them out of the dropdowns, set is_active to false instead.',
+        hint: "Clear the items listed above, then try again. Completed borrow history will keep the saved employee name after deletion.",
       });
     }
 
-    const deleted = await employeeModel.remove(req.params.id);
-    res.json({ message: 'Employee deleted', employee: deleted });
+    const deleted = await employeeModel.remove(
+      req.params.id,
+      existing.full_name,
+      req.user,
+    );
+    if (!deleted) {
+      return res.status(404).json({ error: "Employee not found" });
+    }
+    res.json({ message: "Employee deleted", employee: existing });
   } catch (err) {
     next(err);
   }

@@ -285,59 +285,76 @@ async function assign(id, d) {
 }
 //Unassign
 // name=models/equipmentModel.js
-async function unassignById(request, equipmentId, status) {
-  request.input('id', sql.Int, equipmentId);
-  if (status !== undefined) {
-    request.input('status', sql.VarChar, status);
-    return await request.query(`
-      UPDATE dbo.equipment
-      SET owner_id = NULL, status = @status
-      OUTPUT INSERTED.*
-      WHERE equipment_id = @id
-    `);
-  }
-  return await request.query(`
+async function unassignById(
+  request,
+  equipmentId,
+  status = "Working - IT Stock",
+) {
+  request.input("id", sql.Int, equipmentId);
+  request.input("status", sql.VarChar, status);
+
+  return request.query(`
     UPDATE dbo.equipment
-    SET owner_id = NULL
+    SET owner_id = NULL,
+        status = @status,
+        status_id = (
+          SELECT status_id
+          FROM dbo.equipment_status
+          WHERE status_name = @status
+        )
     OUTPUT INSERTED.*
     WHERE equipment_id = @id
   `);
 }
 
-async function unassignByIds(request, equipmentIds, status) {
-  // add each id as a separate parameter to avoid injection
-  equipmentIds.forEach((val, i) => request.input(`id${i}`, sql.Int, val));
-  const placeholders = equipmentIds.map((_, i) => `@id${i}`).join(', ');
-  if (status !== undefined) {
-    request.input('status', sql.VarChar, status);
-  }
-  return await request.query(`
+async function unassignByIds(
+  request,
+  equipmentIds,
+  status = "Working - IT Stock",
+) {
+  equipmentIds.forEach((id, index) => {
+    request.input(`id${index}`, sql.Int, id);
+  });
+
+  const placeholders = equipmentIds.map((_, index) => `@id${index}`).join(", ");
+
+  request.input("status", sql.VarChar, status);
+
+  return request.query(`
     UPDATE dbo.equipment
-    SET owner_id = NULL ${status !== undefined ? ', status = @status' : ''}
+    SET owner_id = NULL,
+        status = @status,
+        status_id = (
+          SELECT status_id
+          FROM dbo.equipment_status
+          WHERE status_name = @status
+        )
     OUTPUT INSERTED.*
     WHERE equipment_id IN (${placeholders})
   `);
 }
 
-async function unassignByOwnerId(request, ownerId, status) {
-  request.input('owner_id', sql.Int, ownerId);
-  if (status !== undefined) {
-    request.input('status', sql.VarChar, status);
-    return await request.query(`
-      UPDATE dbo.equipment
-      SET owner_id = NULL, status = @status
-      OUTPUT INSERTED.*
-      WHERE owner_id = @owner_id
-    `);
-  }
-  return await request.query(`
+async function unassignByOwnerId(
+  request,
+  ownerId,
+  status = "Working - IT Stock",
+) {
+  request.input("owner_id", sql.Int, ownerId);
+  request.input("status", sql.VarChar, status);
+
+  return request.query(`
     UPDATE dbo.equipment
-    SET owner_id = NULL
+    SET owner_id = NULL,
+        status = @status,
+        status_id = (
+          SELECT status_id
+          FROM dbo.equipment_status
+          WHERE status_name = @status
+        )
     OUTPUT INSERTED.*
     WHERE owner_id = @owner_id
   `);
 }
-
 
 // What can actually be handed to an employee.
 //

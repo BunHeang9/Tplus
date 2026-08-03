@@ -23,9 +23,17 @@ async function getCategories(req, res, next) {
 //unssign
 async function unassign(req, res) {
   const { equipment_id, equipment_ids, owner_id, status } = req.body;
+    const selectors = [
+      Boolean(equipment_id),
+      Array.isArray(equipment_ids) && equipment_ids.length > 0,
+      Boolean(owner_id),
+    ].filter(Boolean).length;
 
-  if (!equipment_id && !equipment_ids && !owner_id) {
-    return res.status(400).json({ error: 'Provide equipment_id, equipment_ids, or owner_id' });
+  if (selectors !== 1) {
+    return res.status(400).json({
+      error:
+        "Provide exactly one of: equipment_id, a non-empty equipment_ids array, or owner_id",
+    });
   }
 
   let pool;
