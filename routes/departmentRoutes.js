@@ -8,6 +8,12 @@ router.get('/', authenticate, departmentController.getAll);
 router.get('/:id', authenticate, departmentController.getById);
 router.post('/', authenticate, requireAdmin, departmentController.create);
 router.put('/:id', authenticate, auditActivity('department'), departmentController.update);
-router.delete('/:id', authenticate, auditActivity('department'), departmentController.remove);
+router.delete(
+  "/:id",
+  authenticate,
+  requireAdmin,
+  auditActivity("department"),
+  departmentController.remove,
+);
 
 module.exports = router;

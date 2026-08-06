@@ -18,6 +18,8 @@ const auditRoutes = require("./routes/auditRoutes");
 const recycleBinRoutes = require("./routes/recycleBinRoutes");
 
 const { notFound, errorHandler } = require('./middleware/errorHandler');
+const viewColumnRoutes = require("./routes/viewColumnRoutes");
+const customFieldRoutes = require("./routes/customFieldRoutes");
 
 const app = express();
 
@@ -131,6 +133,7 @@ app.get('/', (req, res) => {
         ssdUpgrades: "GET /api/ssd-upgrades",
         ssdProcurement: "GET /api/ssd-procurement",
         licenses: "GET /api/licenses",
+        createLicense: "POST /api/licenses",
         serverUsage: "GET /api/server-usage",
         antivirus: "GET /api/antivirus",
         replacements: "GET /api/replacements",
@@ -153,9 +156,12 @@ app.use('/api/borrow', borrowRoutes);
 app.use('/api/statuses', statusRoutes);
 app.use('/api/users', userRoutes);
 app.use("/api/audit", auditRoutes);
-app.use('/api', miscRoutes);
 app.use("/api/recycle-bin", recycleBinRoutes);
-
+app.use("/api/view-columns", viewColumnRoutes);
+app.use("/api/custom-fields", customFieldRoutes);
+// Mounted at /api, so this catch-all must come last or it swallows
+// every more specific route declared after it.
+app.use("/api", miscRoutes);
 app.use(notFound);
 app.use(errorHandler);
 

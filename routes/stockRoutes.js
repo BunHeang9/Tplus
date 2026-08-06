@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const stockController = require('../controllers/stockController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
-const { auditActivity } = require('../middleware/audit'); // <-- add this
+const { auditActivity } = require("../middleware/auditActivity");
 router.post('/add', authenticate, requireAdmin, stockController.addStock);
 router.post(
   "/assign",

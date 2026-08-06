@@ -7,12 +7,12 @@ async function searchAll(term) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('term', sql.NVarChar, `%${term.trim()}%`)
-    .query(`
+    .input("term", sql.NVarChar, `%${term.trim()}%`).query(`
       SELECT
         'Equipment' AS match_type,
         e.equipment_id,
         c.category_name AS category,
+        e.device_name,
         e.device_type,
         e.computer_name,
         e.device_model,
@@ -36,7 +36,8 @@ async function searchAll(term) {
       LEFT JOIN dbo.department eqd ON e.department_id = eqd.department_id
       LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
       LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      WHERE e.computer_name    LIKE @term
+      WHERE e.device_name      LIKE @term
+         OR e.computer_name    LIKE @term
          OR e.device_model     LIKE @term
          OR e.equipment_code   LIKE @term
          OR e.service_tag      LIKE @term
@@ -57,7 +58,7 @@ async function searchAll(term) {
       -- Employees who own nothing still need to appear in results
       SELECT
         'Employee' AS match_type,
-        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
         NULL, NULL, NULL, NULL, NULL, NULL, NULL,
         emp.employee_id,
         emp.full_name AS owner_name,

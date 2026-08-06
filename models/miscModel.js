@@ -1,5 +1,5 @@
 const { poolPromise } = require('../config/db');
-
+const sql = require("mssql");
 // Queries for the supporting tables: SSD, licences, servers,
 // antivirus, replacements and cloud costs.
 // Each returns names rather than bare IDs so the frontend can display
@@ -45,7 +45,17 @@ async function getSsdProcurement() {
 async function getLicenses() {
   const pool = await poolPromise;
   const result = await pool.request().query(`
-    SELECT license_id, product_name, product_type, date_expire, date_renewed, status, remark
+    SELECT license_id, product_name, product_type,
+           date_start, date_expire, remark,
+           -- Derived rather than stored: a saved status would be wrong the day
+           -- after a licence expires, and 'near expire' could never be accurate
+           -- without a scheduled job to keep it up to date.
+           CASE
+             WHEN date_expire IS NULL THEN 'unknown'
+             WHEN date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
+             WHEN date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
+             ELSE 'active'
+           END AS status
     FROM dbo.license
     ORDER BY date_expire
   `);
@@ -168,6 +178,118 @@ async function getCloudUsage() {
   return result.recordset;
 }
 
+// status is never accepted from the caller - it is computed from date_expire.
+// Letting someone pick it would allow "active" on a licence that expired last
+// week. The stored column is set here only so direct SQL queries see something
+// sensible; getLicenses derives it fresh on every read.
+async function createLicense(data) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('product_name', sql.NVarChar, data.product_name)
+    .input('product_type', sql.VarChar, data.product_type || null)
+    .input('date_start', sql.Date, data.date_start || null)
+    .input('date_expire', sql.Date, data.date_expire || null)
+    .input('remark', sql.NVarChar, data.remark || null)
+    .query(`
+      INSERT INTO dbo.license (product_name, product_type, date_start, date_expire, status, remark)
+      OUTPUT INSERTED.license_id, INSERTED.product_name, INSERTED.product_type,
+             INSERTED.date_start, INSERTED.date_expire, INSERTED.remark, INSERTED.status
+      VALUES (
+        @product_name, @product_type, @date_start, @date_expire,
+        CASE
+          WHEN @date_expire IS NULL THEN 'unknown'
+          WHEN @date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
+          WHEN @date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
+          ELSE 'active'
+        END,
+        @remark
+      )
+    `);
+  return result.recordset[0];
+}
+// Partial update - COALESCE keeps existing values for anything not supplied.
+// status is always recomputed from the resulting date_expire, so extending an
+// expiry moves a licence from 'near expire' back to 'active' automatically.
+async function updateLicense(id, data) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('id', sql.Int, id)
+    .input('product_name', sql.NVarChar, data.product_name)
+    .input('product_type', sql.VarChar, data.product_type)
+    .input('date_start', sql.Date, data.date_start)
+    .input('date_expire', sql.Date, data.date_expire)
+    .input('remark', sql.NVarChar, data.remark)
+    .query(`
+      UPDATE dbo.license
+      SET product_name = COALESCE(@product_name, product_name),
+          product_type = COALESCE(@product_type, product_type),
+          date_start   = COALESCE(@date_start, date_start),
+          date_expire  = COALESCE(@date_expire, date_expire),
+          remark       = COALESCE(@remark, remark),
+          status = CASE
+            WHEN COALESCE(@date_expire, date_expire) IS NULL THEN 'unknown'
+            WHEN COALESCE(@date_expire, date_expire) < CAST(GETDATE() AS DATE) THEN 'expired'
+            WHEN COALESCE(@date_expire, date_expire) <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
+            ELSE 'active'
+          END
+      OUTPUT INSERTED.license_id, INSERTED.product_name, INSERTED.product_type,
+             INSERTED.date_start, INSERTED.date_expire, INSERTED.remark, INSERTED.status
+      WHERE license_id = @id
+    `);
+  return result.recordset[0] || null;
+}
+
+async function findLicenseById(id) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('id', sql.Int, id)
+    .query('SELECT * FROM dbo.license WHERE license_id = @id');
+  return result.recordset[0] || null;
+}
+
+// Captures the row into the recycle bin before removing it, both in one
+// transaction - so a failed delete cannot leave an orphaned bin entry, and a
+// failed bin write cannot lose the licence.
+async function removeLicense(id, actor) {
+  const recycleBinModel = require('./recycleBinModel');
+  const pool = await poolPromise;
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin();
+
+  try {
+    const row = await new sql.Request(transaction)
+      .input('id', sql.Int, id)
+      .query('SELECT * FROM dbo.license WHERE license_id = @id');
+
+    const license = row.recordset[0];
+    if (!license) {
+      await transaction.rollback();
+      return null;
+    }
+
+    await recycleBinModel.create({
+      entityType: 'license',
+      entityId: id,
+      entityLabel: license.product_name,
+      entityData: license,
+      actor,
+      reason: 'Licence deleted',
+    }, transaction);
+
+    await new sql.Request(transaction)
+      .input('id', sql.Int, id)
+      .query('DELETE FROM dbo.license WHERE license_id = @id');
+
+    await transaction.commit();
+    return license;
+  } catch (err) {
+    try { await transaction.rollback(); } catch { /* already rolled back */ }
+    throw err;
+  }
+}
 module.exports = {
   getSsdUpgrades,
   getSsdProcurement,
@@ -177,4 +299,8 @@ module.exports = {
   getReplacements,
   getCloudRates,
   getCloudUsage,
+  createLicense,
+  updateLicense,
+  findLicenseById,
+  removeLicense,
 };

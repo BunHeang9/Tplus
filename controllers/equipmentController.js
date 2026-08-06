@@ -154,8 +154,54 @@ async function update(req, res, next) {
   }
 }
 
-module.exports = { 
-  getAll, getCategories, getById, updateOwner, 
-  update ,unassign
+// Admin only. Refused while anything still references the equipment - the
+// database would reject it anyway via the foreign keys, but checking first
+// lets us say exactly what is blocking it rather than surfacing a raw SQL error.
+//
+// Retiring (PUT status = 'Retired - IT Stock') is usually the better move for a
+// real device; delete is for records entered by mistake.
+async function remove(req, res, next) {
+  try {
+    const existing = await equipmentModel.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
 
+    const refs = await equipmentModel.countReferences(req.params.id);
+    const total = Object.values(refs).reduce((a, b) => a + b, 0);
+
+    if (total > 0) {
+      const blocking = [];
+      if (refs.borrow_records > 0)      blocking.push(`${refs.borrow_records} borrow record(s)`);
+      if (refs.antivirus_records > 0)   blocking.push(`${refs.antivirus_records} antivirus record(s)`);
+      if (refs.server_usage_records > 0) blocking.push(`${refs.server_usage_records} server usage record(s)`);
+      if (refs.ssd_upgrade_records > 0) blocking.push(`${refs.ssd_upgrade_records} SSD upgrade record(s)`);
+      if (refs.replacement_records > 0) blocking.push(`${refs.replacement_records} replacement record(s)`);
+
+      return res.status(409).json({
+        error: `Cannot delete: this equipment has history attached`,
+        references: refs,
+        blocking,
+        hint: "Set status to 'Retired - IT Stock' via PUT /api/equipment/:id instead - that keeps the history.",
+      });
+    }
+
+    const deleted = await equipmentModel.remove(req.params.id, req.user);
+    res.json({
+      message: `Equipment "${deleted.device_name || deleted.computer_name || req.params.id}" moved to the recycle bin`,
+      equipment: deleted,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  getAll,
+  getCategories,
+  getById,
+  updateOwner,
+  update,
+  unassign,
+  remove,
 };

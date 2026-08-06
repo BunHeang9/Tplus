@@ -97,14 +97,14 @@ async function idIsTaken(entityType, entityId) {
 // transaction, including on the error path.
 async function restore(binId, restoredBy) {
   const entry = await findById(binId);
-  if (!entry) return { error: 'not_found' };
-  if (entry.restored_at) return { error: 'already_restored', entry };
+  if (!entry) return { error: "not_found" };
+  if (entry.restored_at) return { error: "already_restored", entry };
 
   const target = RESTORE_TARGETS[entry.entity_type];
-  if (!target) return { error: 'unknown_type', entry };
+  if (!target) return { error: "unknown_type", entry };
 
   const taken = await idIsTaken(entry.entity_type, entry.entity_id);
-  if (taken) return { error: 'id_taken', entry };
+  if (taken) return { error: "id_taken", entry };
 
   const data = JSON.parse(entry.entity_data);
 
@@ -113,39 +113,61 @@ async function restore(binId, restoredBy) {
   const pool = await poolPromise;
   const cols = await pool
     .request()
-    .input('table', sql.VarChar, target.table.replace('dbo.', ''))
-    .query(`
+    .input("table", sql.VarChar, target.table.replace("dbo.", "")).query(`
       SELECT COLUMN_NAME
       FROM INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_NAME = @table AND TABLE_SCHEMA = 'dbo'
     `);
-  const liveColumns = new Set(cols.recordset.map(r => r.COLUMN_NAME));
+  const liveColumns = new Set(cols.recordset.map((r) => r.COLUMN_NAME));
 
-  const columns = Object.keys(data).filter(c => liveColumns.has(c) && data[c] !== undefined);
-  if (columns.length === 0) return { error: 'no_columns', entry };
+  const columns = Object.keys(data).filter(
+    (c) => liveColumns.has(c) && data[c] !== undefined,
+  );
+  if (columns.length === 0) return { error: "no_columns", entry };
 
   const transaction = new sql.Transaction(pool);
   await transaction.begin();
 
+  // Once SQL Server aborts a transaction, calling rollback() on it throws a
+  // second error that masks the first. Track state so the real cause survives.
+  let aborted = false;
+
   try {
-    const insertRequest = new sql.Request(transaction);
-    columns.forEach((col, i) => {
-      insertRequest.input(`p${i}`, data[col]);
-    });
+    const columnList = columns.map((c) => `[${c}]`).join(", ");
+    const valueList = columns.map((_, i) => `@p${i}`).join(", ");
 
-    const columnList = columns.map(c => `[${c}]`).join(', ');
-    const valueList = columns.map((_, i) => `@p${i}`).join(', ');
+    // IDENTITY_INSERT is session state, so it has to be set, used and cleared
+    // as separate statements on the same transaction. Batching all three into
+    // one query() lets the driver run them out of context and the INSERT then
+    // fails for writing an explicit identity value.
+    await new sql.Request(transaction).query(
+      `SET IDENTITY_INSERT ${target.table} ON`,
+    );
 
-    await insertRequest.query(`
-      SET IDENTITY_INSERT ${target.table} ON;
-      INSERT INTO ${target.table} (${columnList}) VALUES (${valueList});
-      SET IDENTITY_INSERT ${target.table} OFF;
-    `);
+    try {
+      const insertRequest = new sql.Request(transaction);
+      columns.forEach((col, i) => {
+        insertRequest.input(`p${i}`, data[col]);
+      });
+
+      await insertRequest.query(
+        `INSERT INTO ${target.table} (${columnList}) VALUES (${valueList})`,
+      );
+    } finally {
+      // Clear it even if the insert failed - SQL Server permits IDENTITY_INSERT
+      // on only one table per session, so leaving it on breaks the next restore.
+      try {
+        await new sql.Request(transaction).query(
+          `SET IDENTITY_INSERT ${target.table} OFF`,
+        );
+      } catch {
+        aborted = true; // transaction already dead; nothing to clean up
+      }
+    }
 
     await new sql.Request(transaction)
-      .input('id', sql.Int, binId)
-      .input('restored_by', sql.NVarChar, restoredBy || null)
-      .query(`
+      .input("id", sql.Int, binId)
+      .input("restored_by", sql.NVarChar, restoredBy || null).query(`
         UPDATE dbo.recycle_bin
         SET restored_at = GETDATE(), restored_by = @restored_by
         WHERE bin_id = @id
@@ -154,7 +176,13 @@ async function restore(binId, restoredBy) {
     await transaction.commit();
     return { restored: data, entry };
   } catch (err) {
-    await transaction.rollback();
+    if (!aborted) {
+      try {
+        await transaction.rollback();
+      } catch {
+        // Already rolled back by SQL Server - keep the original error.
+      }
+    }
     throw err;
   }
 }

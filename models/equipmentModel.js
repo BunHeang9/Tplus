@@ -192,30 +192,29 @@ async function createStock(d) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('category_id', sql.Int, d.category_id)
-    .input('device_type', sql.VarChar, d.device_type || null)
-    .input('device_model', sql.VarChar, d.device_model || null)
-    .input('manufacturer', sql.VarChar, d.manufacturer || null)
-    .input('equipment_code', sql.VarChar, d.equipment_code || null)
-    .input('service_tag', sql.VarChar, d.service_tag || null)
-    .input('serial_no', sql.VarChar, d.serial_no || null)
-    .input('product_id', sql.VarChar, d.product_id || null)
-    .input('mac_address', sql.VarChar, d.mac_address || null)
-    .input('ip_address', sql.VarChar, d.ip_address || null)
-    .input('os_type', sql.VarChar, d.os_type || null)
-    .input('os_version', sql.VarChar, d.os_version || null)
-    .input('cpu', sql.NVarChar, d.cpu || null)
-    .input('ram', sql.NVarChar, d.ram || null)
-    .input('hd', sql.NVarChar, d.hd || null)
-    .input('windows_license', sql.NVarChar, d.windows_license || null)
-    .input('av_license', sql.NVarChar, d.av_license || null)
-    .input('purchase_date', sql.Date, d.purchase_date || null)
-    .input('received_date', sql.Date, d.received_date || null)
-    .input('location', sql.VarChar, d.location || 'IT-Stock-Working')
-    .input('department_id', sql.Int, d.department_id || null)
-    .input('status', sql.VarChar, d.status || 'Working - IT Stock')
-    .input('remark', sql.VarChar, d.remark || null)
-    .query(`
+    .input("category_id", sql.Int, d.category_id)
+    .input("device_type", sql.VarChar, d.device_type || null)
+    .input("device_model", sql.VarChar, d.device_model || null)
+    .input("manufacturer", sql.VarChar, d.manufacturer || null)
+    .input("equipment_code", sql.VarChar, d.equipment_code || null)
+    .input("service_tag", sql.VarChar, d.service_tag || null)
+    .input("serial_no", sql.VarChar, d.serial_no || null)
+    .input("product_id", sql.VarChar, d.product_id || null)
+    .input("mac_address", sql.VarChar, d.mac_address || null)
+    .input("ip_address", sql.VarChar, d.ip_address || null)
+    .input("os_type", sql.VarChar, d.os_type || null)
+    .input("os_version", sql.VarChar, d.os_version || null)
+    .input("cpu", sql.NVarChar, d.cpu || null)
+    .input("ram", sql.NVarChar, d.ram || null)
+    .input("hd", sql.NVarChar, d.hd || null)
+    .input("windows_license", sql.NVarChar, d.windows_license || null)
+    .input("av_license", sql.NVarChar, d.av_license || null)
+    .input("purchase_date", sql.Date, d.purchase_date || null)
+    .input("received_date", sql.Date, d.received_date || null)
+    .input("location", sql.VarChar, d.location || null)
+    .input("department_id", sql.Int, d.department_id || null)
+    .input("status", sql.VarChar, d.status || "Working - IT Stock")
+    .input("remark", sql.VarChar, d.remark || null).query(`
       INSERT INTO dbo.equipment (
         category_id, device_type, device_model, manufacturer,
         equipment_code, service_tag, serial_no, product_id,
@@ -510,13 +509,70 @@ async function countReferences(id) {
   return result.recordset[0];
 }
 
-async function remove(id) {
+// Captures the row into the recycle bin before removing it, both in one
+// transaction - so a failed delete cannot leave an orphaned bin entry, and a
+// failed bin write cannot lose the equipment.
+//
+// Custom field values go into the snapshot too, otherwise restoring would
+// bring back the device without whatever an admin had recorded against it.
+async function remove(id, actor) {
+  const recycleBinModel = require('./recycleBinModel');
+  const customFieldModel = require('./customFieldModel');
+
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query('DELETE FROM dbo.equipment OUTPUT DELETED.* WHERE equipment_id = @id');
-  return result.recordset[0] || null;
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin();
+
+  try {
+    const row = await new sql.Request(transaction)
+      .input("id", sql.Int, id)
+      .query("SELECT * FROM dbo.equipment WHERE equipment_id = @id");
+
+    const equipment = row.recordset[0];
+    if (!equipment) {
+      await transaction.rollback();
+      return null;
+    }
+
+    let customValues = [];
+    try {
+      customValues = await customFieldModel.getValues(id);
+    } catch {
+      // A device in a category with no custom fields has none - not an error.
+    }
+
+    const label =
+      equipment.device_name ||
+      equipment.computer_name ||
+      equipment.device_model ||
+      `Equipment ${id}`;
+
+    await recycleBinModel.create(
+      {
+        entityType: "equipment",
+        entityId: id,
+        entityLabel: label,
+        entityData: { ...equipment, _custom_values: customValues },
+        actor,
+        reason: "Equipment deleted",
+      },
+      transaction,
+    );
+
+    await new sql.Request(transaction)
+      .input("id", sql.Int, id)
+      .query("DELETE FROM dbo.equipment WHERE equipment_id = @id");
+
+    await transaction.commit();
+    return equipment;
+  } catch (err) {
+    try {
+      await transaction.rollback();
+    } catch {
+      /* already rolled back */
+    }
+    throw err;
+  }
 }
 
 module.exports = {
@@ -532,7 +588,7 @@ module.exports = {
   createStock,
   findWithOwnerName,
   assign,
-   unassignById,
+  unassignById,
   unassignByIds,
   unassignByOwnerId,
   findAvailable,

@@ -8,6 +8,12 @@ router.get('/', authenticate, categoryController.getAll);
 router.get('/:id', authenticate, categoryController.getById);
 router.post('/', authenticate, requireAdmin, categoryController.create);
 router.put('/:id', authenticate, auditActivity('category'), categoryController.update);
-router.delete('/:id', authenticate, auditActivity('category'), categoryController.remove);
+router.delete(
+  "/:id",
+  authenticate,
+  requireAdmin,
+  auditActivity("category"),
+  categoryController.remove,
+);
 
 module.exports = router;

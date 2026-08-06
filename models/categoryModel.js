@@ -35,12 +35,16 @@ async function create({ category_name, description }) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('name', sql.VarChar, category_name)
-    .input('description', sql.NVarChar, description || null)
-    .query(`
-      INSERT INTO dbo.category (category_name, description)
+    .input("name", sql.VarChar, category_name)
+    .input("description", sql.NVarChar, description || null).query(`
+      INSERT INTO dbo.category (category_name, description, view_key)
       OUTPUT INSERTED.*
-      VALUES (@name, @description)
+      VALUES (
+        @name, @description,
+        -- Generated from the name so /api/equipment/network-device works.
+        -- Without this a new category has no reachable view.
+        LOWER(REPLACE(REPLACE(@name, ' ', '-'), '_', '-'))
+      )
     `);
   return result.recordset[0];
 }
@@ -49,15 +53,22 @@ async function update(id, { category_name, description, is_active }) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('id', sql.Int, id)
-    .input('name', sql.VarChar, category_name)
-    .input('description', sql.NVarChar, description)
-    .input('is_active', sql.Bit, is_active)
-    .query(`
+    .input("id", sql.Int, id)
+    .input("name", sql.VarChar, category_name)
+    .input("description", sql.NVarChar, description)
+    .input("is_active", sql.Bit, is_active).query(`
       UPDATE dbo.category
       SET category_name = COALESCE(@name, category_name),
           description   = COALESCE(@description, description),
-          is_active     = COALESCE(@is_active, is_active)
+          is_active     = COALESCE(@is_active, is_active),
+          -- Regenerated on rename so the URL keeps matching the name -
+          -- otherwise a category renamed to "Testing" would still be served
+          -- at /api/equipment/test. Only changes when the name does.
+          view_key      = CASE
+                            WHEN @name IS NOT NULL
+                            THEN LOWER(REPLACE(REPLACE(@name, ' ', '-'), '_', '-'))
+                            ELSE view_key
+                          END
       OUTPUT INSERTED.*
       WHERE category_id = @id
     `);

@@ -1,4 +1,5 @@
 const { sql, poolPromise } = require('../config/db');
+const recycleBinModel = require("./recycleBinModel");
 
 // All database access for employees lives here.
 // Controllers call these functions; they never write SQL themselves.
@@ -146,15 +147,15 @@ async function create(data) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('full_name', sql.NVarChar, data.full_name)
-    .input('staff_code', sql.VarChar, data.staff_code || null)
-    .input('phone', sql.VarChar, data.phone || null)
-    .input('sex', sql.VarChar, data.sex || null)
-    .input('department_id', sql.Int, data.department_id || null)
-    .input('location', sql.VarChar, data.location || null)
-    .input('position', sql.NVarChar, data.position || null)
-    .query(`
-      INSERT INTO dbo.employee (full_name, staff_code, phone, sex, department_id, location, position)
+    .input("full_name", sql.NVarChar, data.full_name)
+    .input("staff_code", sql.VarChar, data.staff_code || null)
+    .input("phone", sql.VarChar, data.phone || null)
+    .input("sex", sql.VarChar, data.sex || null)
+    .input("department_id", sql.Int, data.department_id || null)
+    .input("location", sql.VarChar, data.location || null)
+    .input("position", sql.NVarChar, data.position || null).query(`
+      INSERT INTO dbo.employee
+        ([full_name], [staff_code], [phone], [sex], [department_id], [location], [position])
       OUTPUT INSERTED.*
       VALUES (@full_name, @staff_code, @phone, @sex, @department_id, @location, @position)
     `);
@@ -216,26 +217,31 @@ async function countReferences(id) {
   return result.recordset[0];
 }
 
-async function remove(id, fullName) {
+async function remove(id, fullName, actor) {
   const pool = await poolPromise;
   const transaction = new sql.Transaction(pool);
-  const recycleBinModel = require("./recycleBinModel");
   await transaction.begin();
 
   try {
     const row = await new sql.Request(transaction)
       .input("id", sql.Int, id)
-      .query("SELECT * full_name FROM dbo.employee WHERE employee_id = @id");
+      .query("SELECT * FROM dbo.employee WHERE employee_id = @id");
+    const employee = row.recordset[0];
+    if (!employee) {
+      await transaction.rollback();
+      return false;
+    }
+
+    // Capture the whole row before anything is changed, inside the same
+    // transaction - if the delete fails, the bin entry rolls back with it.
+    // recycleBinModel.create serialises entityData, so pass the object.
     await recycleBinModel.create(
       {
         entityType: "employee",
         entityId: id,
-        entityLabel: row.recordset[0].full_name,
-        entityData: JSON.stringify({
-          employee_id: id,
-          full_name: row.recordset[0].full_name,
-        }),
-        actor: "system", // You might want to replace this with the actual user performing the deletion
+        entityLabel: employee.full_name,
+        entityData: employee,
+        actor,
         reason: "Employee record deleted",
       },
       transaction,

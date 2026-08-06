@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const borrowController = require('../controllers/borrowController');
 const { authenticate, requireAdmin } = require('../middleware/auth');
-const { auditActivity } = require('../middleware/audit'); // <-- add this
+const { auditActivity } = require("../middleware/auditActivity");
 // Specific paths before /:id so they aren't swallowed as an id
 router.get('/available', authenticate, borrowController.getAvailable);
 router.get('/current', authenticate, borrowController.getCurrent);
