@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { sql, poolPromise } = require('../config/db');
 const { authenticate, requireAdmin } = require('../middleware/auth');
+const equipmentController = require("../controllers/equipmentController");
+const { auditActivity } = require("../middleware/auditActivity");
 
 // GET /api/equipment
 // List all equipment. Optional query params: ?category=Server  ?unowned=true
@@ -85,54 +87,78 @@ router.get('/categories', authenticate, async (req, res) => {
   }
 });
 
+// GET /api/equipment/licenses/available
+// Get all software licenses for dropdown
+router.get('/licenses/available', authenticate, equipmentController.getLicenses);
+
 // GET /api/equipment/:id
-router.get('/:id', authenticate, async (req, res) => {
-  try {
-    const pool = await poolPromise;
-    const result = await pool
-      .request()
-      .input('id', sql.Int, req.params.id)
-      .query(`
-        SELECT e.*, emp.full_name AS owner_name
-        FROM dbo.equipment e
-        LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-        WHERE e.equipment_id = @id
-      `);
-    if (result.recordset.length === 0) {
-      return res.status(404).json({ error: 'Equipment not found' });
-    }
-    res.json(result.recordset[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+router.get("/:id", authenticate, equipmentController.getById);
+
+// GET /api/equipment/:id/license
+// Get current software license assigned to equipment
+router.get(
+  "/:id/license",
+  authenticate,
+  equipmentController.getEquipmentLicense,
+);
+
+// POST /api/equipment/:id/license
+// Assign software license to equipment
+router.post(
+  "/:id/license",
+  authenticate,
+  requireAdmin,
+  auditActivity("equipment", "assign_license"),
+  equipmentController.assignLicense,
+);
+
+// DELETE /api/equipment/:id/license
+// Remove software license from equipment
+router.delete(
+  "/:id/license",
+  authenticate,
+  requireAdmin,
+  auditActivity("equipment", "remove_license"),
+  equipmentController.removeLicense,
+);
 
 // PUT /api/equipment/:id/owner
 // Reassign equipment to a different employee (or null it out to make it unowned/stock)
-router.put('/:id/owner', authenticate, requireAdmin, async (req, res) => {
-  const { owner_id } = req.body;
-  try {
-    const pool = await poolPromise;
-    const result = await pool
-      .request()
-      .input('id', sql.Int, req.params.id)
-      .input('owner_id', sql.Int, owner_id || null)
-      .query(`
-        UPDATE dbo.equipment
-        SET owner_id = @owner_id
-        OUTPUT INSERTED.*
-        WHERE equipment_id = @id
-      `);
-    if (result.recordset.length === 0) {
-      return res.status(404).json({ error: 'Equipment not found' });
-    }
-    res.json(result.recordset[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+router.put(
+  "/:id/owner",
+  authenticate,
+  requireAdmin,
+  equipmentController.updateOwner,
+);
 
+// PUT /api/equipment/:id
+// Full equipment update
+router.put(
+  '/:id',
+  authenticate,
+  requireAdmin,
+  auditActivity('equipment', 'update'),
+  equipmentController.update
+);
 
+// POST /api/equipment/action/unassign
+// Unassign equipment from owner
+router.post(
+  '/action/unassign',
+  authenticate,
+  requireAdmin,
+  auditActivity('equipment', 'unassign'),
+  equipmentController.unassign
+);
 
+// DELETE /api/equipment/:id
+// Delete equipment
+router.delete(
+  '/:id',
+  authenticate,
+  requireAdmin,
+  auditActivity('equipment', 'delete'),
+  equipmentController.remove
+);
 
 module.exports = router;

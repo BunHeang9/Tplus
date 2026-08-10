@@ -1,4 +1,5 @@
 const equipmentModel = require('../models/equipmentModel');
+const softwareLicenseModel = require("../models/softwareLicenseModel");
 const categoryModel = require('../models/categoryModel');
 const departmentModel = require('../models/departmentModel');
 const { sql, poolPromise } = require('../config/db');
@@ -20,6 +21,79 @@ async function getCategories(req, res, next) {
     next(err);
   }
 }
+
+// Get all software licenses for dropdown
+async function getLicenses(req, res, next) {
+  try {
+    const licenses = await softwareLicenseModel.getAllLicenses();
+    res.json(licenses);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Get license for specific equipment
+async function getEquipmentLicense(req, res, next) {
+  try {
+    const license = await softwareLicenseModel.getEquipmentLicense(req.params.id);
+    if (!license) {
+      return res.json({ license: null });
+    }
+    res.json({ license });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Assign software license to equipment
+async function assignLicense(req, res, next) {
+  try {
+    const { license_id } = req.body;
+    
+    if (!license_id) {
+      return res.status(400).json({ error: 'license_id is required' });
+    }
+
+    // Verify equipment exists
+    const equipment = await equipmentModel.findById(req.params.id);
+    if (!equipment) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+
+    const updated = await softwareLicenseModel.assignLicenseToEquipment(
+      req.params.id,
+      license_id
+    );
+
+    res.json({ 
+      message: 'License assigned successfully',
+      equipment: updated 
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Remove license from equipment
+async function removeLicense(req, res, next) {
+  try {
+    // Verify equipment exists
+    const equipment = await equipmentModel.findById(req.params.id);
+    if (!equipment) {
+      return res.status(404).json({ error: 'Equipment not found' });
+    }
+
+    const updated = await softwareLicenseModel.removeLicenseFromEquipment(req.params.id);
+
+    res.json({ 
+      message: 'License removed successfully',
+      equipment: updated 
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 //unssign
 async function unassign(req, res) {
   const { equipment_id, equipment_ids, owner_id, status } = req.body;
@@ -204,4 +278,8 @@ module.exports = {
   update,
   unassign,
   remove,
+  getLicenses,
+  getEquipmentLicense,
+  assignLicense,
+  removeLicense,
 };
