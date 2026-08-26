@@ -20,6 +20,7 @@ async function findAll(filters = {}) {
            emp.position   AS owner_position,
            emp.location   AS owner_location,
            emp.staff_code AS owner_staff_code,
+           emp.sex        AS owner_sex,
            empd.department_code AS owner_department,
            empd.department_name AS owner_department_name,
            loan.borrow_id            AS current_borrow_id,
@@ -76,10 +77,16 @@ async function findAll(filters = {}) {
     request.input('status_id', sql.Int, filters.status_id);
   }
   if (q) {
+    // device_name and serial_no matter as much as computer_name/service_tag -
+    // a server row typically has device_name set and computer_name null, the
+    // opposite of a laptop, so leaving either out silently misses whichever
+    // category relies on it.
     query += ` AND (
       e.computer_name  LIKE @q OR
+      e.device_name    LIKE @q OR
       e.device_model   LIKE @q OR
-      e.equipment_code LIKE @q OR
+      e.asset_code LIKE @q OR
+      e.serial_no      LIKE @q OR
       e.service_tag    LIKE @q OR
       e.mac_address    LIKE @q OR
       e.ip_address     LIKE @q OR
@@ -112,6 +119,7 @@ async function findById(id) {
              emp.position   AS owner_position,
              emp.location   AS owner_location,
              emp.staff_code AS owner_staff_code,
+             emp.sex        AS owner_sex,
              empd.department_code AS owner_department,
              empd.department_name AS owner_department_name,
              loan.borrow_id            AS current_borrow_id,
@@ -173,8 +181,10 @@ async function findByEquipmentCode(code) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('code', sql.VarChar, code)
-    .query('SELECT equipment_id, computer_name, device_model FROM dbo.equipment WHERE equipment_code = @code');
+    .input("code", sql.VarChar, code)
+    .query(
+      "SELECT equipment_id, computer_name, device_model FROM dbo.equipment WHERE asset_code = @code",
+    );
   return result.recordset[0] || null;
 }
 
@@ -196,7 +206,6 @@ async function createStock(d) {
     .input("device_type", sql.VarChar, d.device_type || null)
     .input("device_model", sql.VarChar, d.device_model || null)
     .input("manufacturer", sql.VarChar, d.manufacturer || null)
-    .input("equipment_code", sql.VarChar, d.equipment_code || null)
     .input("service_tag", sql.VarChar, d.service_tag || null)
     .input("serial_no", sql.VarChar, d.serial_no || null)
     .input("product_id", sql.VarChar, d.product_id || null)
@@ -214,10 +223,12 @@ async function createStock(d) {
     .input("location", sql.VarChar, d.location || null)
     .input("department_id", sql.Int, d.department_id || null)
     .input("status", sql.VarChar, d.status || "Working - IT Stock")
-    .input("remark", sql.VarChar, d.remark || null).query(`
+    .input("remark", sql.VarChar, d.remark || null)
+    .input("asset_code", sql.VarChar, d.asset_code || d.equipment_code || null)
+    .query(`
       INSERT INTO dbo.equipment (
         category_id, device_type, device_model, manufacturer,
-        equipment_code, service_tag, serial_no, product_id,
+        asset_code, service_tag, serial_no, product_id,
         mac_address, ip_address, os_type, os_version,
         cpu, ram, hd, windows_license, av_license,
         purchase_date, received_date,
@@ -226,7 +237,7 @@ async function createStock(d) {
       OUTPUT INSERTED.*
       VALUES (
         @category_id, @device_type, @device_model, @manufacturer,
-        @equipment_code, @service_tag, @serial_no, @product_id,
+        @asset_code, @service_tag, @serial_no, @product_id,
         @mac_address, @ip_address, @os_type, @os_version,
         @cpu, @ram, @hd, @windows_license, @av_license,
         @purchase_date, @received_date,
@@ -236,6 +247,25 @@ async function createStock(d) {
       )
     `);
   return result.recordset[0];
+}
+
+// Every device this employee owns, with raw equipment columns plus category
+// and status names attached. Used to build the per-category equipment cards
+// on an employee's page - one row per device, grouped by category downstream.
+async function findByOwner(ownerId) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('owner_id', sql.Int, ownerId)
+    .query(`
+      SELECT e.*, c.category_name, st.status_name
+      FROM dbo.equipment e
+      LEFT JOIN dbo.category c ON e.category_id = c.category_id
+      LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
+      WHERE e.owner_id = @owner_id
+      ORDER BY c.category_name, e.equipment_id
+    `);
+  return result.recordset;
 }
 
 async function findWithOwnerName(id) {
@@ -367,7 +397,7 @@ async function findAvailable(category, includeInstalled) {
   let query = `
     SELECT e.equipment_id, e.category_id, c.category_name AS category,
            e.device_type, e.computer_name, e.device_model,
-           e.manufacturer, e.equipment_code, e.service_tag, e.mac_address, e.ip_address,
+           e.manufacturer, e.asset_code, e.service_tag, e.mac_address, e.ip_address,
            e.cpu, e.ram, e.hd, e.purchase_date, e.received_date,
            e.location, e.department_id, d.department_code AS department,
            e.status, e.remark
@@ -400,12 +430,11 @@ async function findByDateRange(from, to) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('from', sql.Date, from)
-    .input('to', sql.Date, to)
-    .query(`
+    .input("from", sql.Date, from)
+    .input("to", sql.Date, to).query(`
       SELECT e.equipment_id, e.category_id, c.category_name AS category,
              e.device_type, e.computer_name, e.device_model,
-             e.manufacturer, e.equipment_code, e.service_tag,
+             e.manufacturer, e.asset_code, e.service_tag,
              e.purchase_date, e.received_date, e.assigned_date,
              e.location, e.status,
              emp.full_name AS owner_name,
@@ -427,33 +456,32 @@ async function update(id, d) {
   const pool = await poolPromise;
   const result = await pool
     .request()
-    .input('id', sql.Int, id)
-    .input('category_id', sql.Int, d.category_id)
-    .input('device_type', sql.VarChar, d.device_type)
-    .input('device_model', sql.VarChar, d.device_model)
-    .input('computer_name', sql.NVarChar, d.computer_name)
-    .input('manufacturer', sql.VarChar, d.manufacturer)
-    .input('serial_no', sql.VarChar, d.serial_no)
-    .input('service_tag', sql.VarChar, d.service_tag)
-    .input('product_id', sql.VarChar, d.product_id)
-    .input('equipment_code', sql.VarChar, d.equipment_code)
-    .input('mac_address', sql.VarChar, d.mac_address)
-    .input('ip_address', sql.VarChar, d.ip_address)
-    .input('os_type', sql.VarChar, d.os_type)
-    .input('os_version', sql.VarChar, d.os_version)
-    .input('cpu', sql.NVarChar, d.cpu)
-    .input('ram', sql.NVarChar, d.ram)
-    .input('hd', sql.NVarChar, d.hd)
-    .input('windows_license', sql.NVarChar, d.windows_license)
-    .input('av_license', sql.NVarChar, d.av_license)
-    .input('location', sql.VarChar, d.location)
-    .input('department_id', sql.Int, d.department_id)
-    .input('status', sql.VarChar, d.status)
-    .input('purchase_date', sql.Date, d.purchase_date)
-    .input('received_date', sql.Date, d.received_date)
-    .input('assigned_date', sql.Date, d.assigned_date)
-    .input('remark', sql.VarChar, d.remark)
-    .query(`
+    .input("id", sql.Int, id)
+    .input("category_id", sql.Int, d.category_id)
+    .input("device_type", sql.VarChar, d.device_type)
+    .input("device_model", sql.VarChar, d.device_model)
+    .input("computer_name", sql.NVarChar, d.computer_name)
+    .input("manufacturer", sql.VarChar, d.manufacturer)
+    .input("serial_no", sql.VarChar, d.serial_no)
+    .input("service_tag", sql.VarChar, d.service_tag)
+    .input("product_id", sql.VarChar, d.product_id)
+    .input("asset_code", sql.VarChar, d.asset_code ?? d.equipment_code)
+    .input("mac_address", sql.VarChar, d.mac_address)
+    .input("ip_address", sql.VarChar, d.ip_address)
+    .input("os_type", sql.VarChar, d.os_type)
+    .input("os_version", sql.VarChar, d.os_version)
+    .input("cpu", sql.NVarChar, d.cpu)
+    .input("ram", sql.NVarChar, d.ram)
+    .input("hd", sql.NVarChar, d.hd)
+    .input("windows_license", sql.NVarChar, d.windows_license)
+    .input("av_license", sql.NVarChar, d.av_license)
+    .input("location", sql.VarChar, d.location)
+    .input("department_id", sql.Int, d.department_id)
+    .input("status", sql.VarChar, d.status)
+    .input("purchase_date", sql.Date, d.purchase_date)
+    .input("received_date", sql.Date, d.received_date)
+    .input("assigned_date", sql.Date, d.assigned_date)
+    .input("remark", sql.VarChar, d.remark).query(`
       UPDATE dbo.equipment
       SET category_id     = COALESCE(@category_id, category_id),
           device_type     = COALESCE(@device_type, device_type),
@@ -463,7 +491,7 @@ async function update(id, d) {
           serial_no       = COALESCE(@serial_no, serial_no),
           service_tag     = COALESCE(@service_tag, service_tag),
           product_id      = COALESCE(@product_id, product_id),
-          equipment_code  = COALESCE(@equipment_code, equipment_code),
+          asset_code      = COALESCE(@asset_code, asset_code),
           mac_address     = COALESCE(@mac_address, mac_address),
           ip_address      = COALESCE(@ip_address, ip_address),
           os_type         = COALESCE(@os_type, os_type),
@@ -483,6 +511,7 @@ async function update(id, d) {
           received_date   = COALESCE(@received_date, received_date),
           assigned_date   = COALESCE(@assigned_date, assigned_date),
           remark          = COALESCE(@remark, remark)
+          
       OUTPUT INSERTED.*
       WHERE equipment_id = @id
     `);
@@ -583,6 +612,7 @@ module.exports = {
   findById,
   getCategorySummary,
   updateOwner,
+  findByOwner,
   findByEquipmentCode,
   findByServiceTag,
   createStock,

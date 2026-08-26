@@ -58,7 +58,7 @@ async function remove(req, res, next) {
       });
     }
 
-    const deleted = await departmentModel.remove(req.params.id);
+    const deleted = await departmentModel.remove(req.params.id, req.user);
     res.json({ message: 'Department deleted', department: deleted });
   } catch (err) {
     next(err);

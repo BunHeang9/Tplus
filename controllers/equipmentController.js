@@ -2,12 +2,41 @@ const equipmentModel = require('../models/equipmentModel');
 const softwareLicenseModel = require("../models/softwareLicenseModel");
 const categoryModel = require('../models/categoryModel');
 const departmentModel = require('../models/departmentModel');
+const customFieldModel = require('../models/customFieldModel');
 const { sql, poolPromise } = require('../config/db');
+
+// Custom fields (Bag Model, Mouse Model, Keyboard Model, and anything else an
+// admin has configured per category) live in equipment_custom_value, not on
+// dbo.equipment itself - GET /api/employees/:id/full already merges these in,
+// this brings the plain equipment list up to the same level rather than
+// leaving it as a second, thinner view of the same data.
+//
+// Not hardcoded to any particular field: whatever is configured for a row's
+// category comes back, so a newly added custom field (or a brand new
+// category) works without another code change here.
+async function attachCustomFields(rows) {
+  const equipmentIds = rows.map((r) => r.equipment_id);
+  const categoryIds = [...new Set(rows.map((r) => r.category_id).filter(Boolean))];
+  if (categoryIds.length === 0) return rows;
+
+  const fieldsByCategory = {};
+  for (const categoryId of categoryIds) {
+    fieldsByCategory[categoryId] = await customFieldModel.findByCategory(categoryId);
+  }
+  const valuesByEquipment = await customFieldModel.getValuesForMany(equipmentIds);
+
+  for (const row of rows) {
+    const fields = fieldsByCategory[row.category_id] || [];
+    const values = valuesByEquipment[row.equipment_id] || {};
+    for (const f of fields) row[f.field_key] = values[f.field_key] ?? null;
+  }
+  return rows;
+}
 
 async function getAll(req, res, next) {
   try {
     const equipment = await equipmentModel.findAll(req.query);
-    res.json(equipment);
+    res.json(await attachCustomFields(equipment));
   } catch (err) {
     next(err);
   }
@@ -32,62 +61,104 @@ async function getLicenses(req, res, next) {
   }
 }
 
-// Get license for specific equipment
-async function getEquipmentLicense(req, res, next) {
+// All licences on one device. Returns an array - a laptop may have Office,
+// Adobe and an antivirus product at once.
+async function getEquipmentLicenses(req, res, next) {
   try {
-    const license = await softwareLicenseModel.getEquipmentLicense(req.params.id);
-    if (!license) {
-      return res.json({ license: null });
-    }
-    res.json({ license });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// Assign software license to equipment
-async function assignLicense(req, res, next) {
-  try {
-    const { license_id } = req.body;
-    
-    if (!license_id) {
-      return res.status(400).json({ error: 'license_id is required' });
-    }
-
-    // Verify equipment exists
     const equipment = await equipmentModel.findById(req.params.id);
-    if (!equipment) {
-      return res.status(404).json({ error: 'Equipment not found' });
-    }
+    if (!equipment)
+      return res.status(404).json({ error: "Equipment not found" });
 
-    const updated = await softwareLicenseModel.assignLicenseToEquipment(
+    const licenses = await softwareLicenseModel.getEquipmentLicenses(
       req.params.id,
-      license_id
     );
-
-    res.json({ 
-      message: 'License assigned successfully',
-      equipment: updated 
+    res.json({
+      equipment_id: Number(req.params.id),
+      device_name: equipment.device_name || equipment.computer_name,
+      count: licenses.length,
+      licenses,
     });
   } catch (err) {
     next(err);
   }
 }
 
-// Remove license from equipment
-async function removeLicense(req, res, next) {
+// Adds a licence, leaving any others in place. Send license_ids instead to
+// replace the whole set - for a tick-box form that saves everything at once.
+async function assignLicense(req, res, next) {
+  const { license_id, license_ids } = req.body;
+
+  if (!license_id && !Array.isArray(license_ids)) {
+    return res.status(400).json({
+      error:
+        "Send license_id to add one, or license_ids to replace the whole set",
+      example: { license_id: 3 },
+    });
+  }
+
   try {
-    // Verify equipment exists
     const equipment = await equipmentModel.findById(req.params.id);
-    if (!equipment) {
-      return res.status(404).json({ error: 'Equipment not found' });
+    if (!equipment)
+      return res.status(404).json({ error: "Equipment not found" });
+
+    if (Array.isArray(license_ids)) {
+      for (const id of license_ids) {
+        const found = await softwareLicenseModel.findLicenseById(id);
+        if (!found)
+          return res.status(404).json({ error: `Licence ${id} not found` });
+      }
+      const licenses = await softwareLicenseModel.setEquipmentLicenses(
+        req.params.id,
+        license_ids,
+      );
+      return res.json({
+        message: `${licenses.length} licence(s) set on this device`,
+        equipment_id: Number(req.params.id),
+        licenses,
+      });
     }
 
-    const updated = await softwareLicenseModel.removeLicenseFromEquipment(req.params.id);
+    const license = await softwareLicenseModel.findLicenseById(license_id);
+    if (!license) return res.status(404).json({ error: "Licence not found" });
 
-    res.json({ 
-      message: 'License removed successfully',
-      equipment: updated 
+    const licenses = await softwareLicenseModel.assignLicenseToEquipment(
+      req.params.id,
+      license_id,
+      { installedDate: req.body.installed_date, remark: req.body.remark },
+    );
+
+    res.json({
+      message: `"${license.product_name}" assigned`,
+      equipment_id: Number(req.params.id),
+      licenses,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Removes one licence from one device - both ids are needed, since a device
+// may hold several.
+async function removeLicense(req, res, next) {
+  try {
+    const removed = await softwareLicenseModel.removeLicenseFromEquipment(
+      req.params.id,
+      req.params.licenseId,
+    );
+    if (!removed) {
+      return res
+        .status(404)
+        .json({ error: "That licence is not assigned to this device" });
+    }
+
+    const licenses = await softwareLicenseModel.getEquipmentLicenses(
+      req.params.id,
+    );
+    res.json({
+      message: "Licence removed from this device",
+      equipment_id: Number(req.params.id),
+      remaining: licenses.length,
+      licenses,
     });
   } catch (err) {
     next(err);
@@ -152,7 +223,8 @@ async function getById(req, res, next) {
     if (!equipment) {
       return res.status(404).json({ error: 'Equipment not found' });
     }
-    res.json(equipment);
+    const [withFields] = await attachCustomFields([equipment]);
+    res.json(withFields);
   } catch (err) {
     next(err);
   }
@@ -279,7 +351,7 @@ module.exports = {
   unassign,
   remove,
   getLicenses,
-  getEquipmentLicense,
+  getEquipmentLicenses,
   assignLicense,
   removeLicense,
 };

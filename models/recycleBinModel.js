@@ -128,42 +128,36 @@ async function restore(binId, restoredBy) {
   const transaction = new sql.Transaction(pool);
   await transaction.begin();
 
-  // Once SQL Server aborts a transaction, calling rollback() on it throws a
-  // second error that masks the first. Track state so the real cause survives.
-  let aborted = false;
-
   try {
     const columnList = columns.map((c) => `[${c}]`).join(", ");
     const valueList = columns.map((_, i) => `@p${i}`).join(", ");
 
-    // IDENTITY_INSERT is session state, so it has to be set, used and cleared
-    // as separate statements on the same transaction. Batching all three into
-    // one query() lets the driver run them out of context and the INSERT then
-    // fails for writing an explicit identity value.
-    await new sql.Request(transaction).query(
-      `SET IDENTITY_INSERT ${target.table} ON`,
-    );
+    // SET IDENTITY_INSERT only lasts for the dynamic-SQL scope it was set
+    // in - the mssql driver runs every parameterised .query() through its
+    // own sp_executesql call, so a SET issued in one .query() call does not
+    // carry over into the next one even on the same transaction/connection.
+    // It has to be set, used and cleared inside one single .query() call.
+    // TRY/CATCH inside that one batch guarantees the OFF still runs if the
+    // INSERT fails, since IDENTITY_INSERT is session state, not
+    // transactional - a rollback would not undo it, and SQL Server allows
+    // it on only one table per session, so leaving it on breaks the next
+    // restore that reuses this pooled connection.
+    const insertRequest = new sql.Request(transaction);
+    columns.forEach((col, i) => {
+      insertRequest.input(`p${i}`, data[col]);
+    });
 
-    try {
-      const insertRequest = new sql.Request(transaction);
-      columns.forEach((col, i) => {
-        insertRequest.input(`p${i}`, data[col]);
-      });
-
-      await insertRequest.query(
-        `INSERT INTO ${target.table} (${columnList}) VALUES (${valueList})`,
-      );
-    } finally {
-      // Clear it even if the insert failed - SQL Server permits IDENTITY_INSERT
-      // on only one table per session, so leaving it on breaks the next restore.
-      try {
-        await new sql.Request(transaction).query(
-          `SET IDENTITY_INSERT ${target.table} OFF`,
-        );
-      } catch {
-        aborted = true; // transaction already dead; nothing to clean up
-      }
-    }
+    await insertRequest.query(`
+      BEGIN TRY
+        SET IDENTITY_INSERT ${target.table} ON;
+        INSERT INTO ${target.table} (${columnList}) VALUES (${valueList});
+        SET IDENTITY_INSERT ${target.table} OFF;
+      END TRY
+      BEGIN CATCH
+        SET IDENTITY_INSERT ${target.table} OFF;
+        THROW;
+      END CATCH
+    `);
 
     await new sql.Request(transaction)
       .input("id", sql.Int, binId)
@@ -176,12 +170,10 @@ async function restore(binId, restoredBy) {
     await transaction.commit();
     return { restored: data, entry };
   } catch (err) {
-    if (!aborted) {
-      try {
-        await transaction.rollback();
-      } catch {
-        // Already rolled back by SQL Server - keep the original error.
-      }
+    try {
+      await transaction.rollback();
+    } catch {
+      // Already rolled back by SQL Server - keep the original error.
     }
     throw err;
   }

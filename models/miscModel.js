@@ -17,7 +17,7 @@ async function getSsdUpgrades() {
       su.equipment_id,
       e.computer_name,
       e.device_model,
-      e.equipment_code AS asset_code,
+      e.asset_code AS asset_code,
       su.charge_cable_needed,
       su.replace_status,
       su.ssd_capacity,
@@ -53,7 +53,6 @@ async function getLicenses() {
       date_start, 
       date_expire, 
       remark,
-      status,
       -- Calculated status based on license_type and dates
       CASE
         WHEN license_type IN ('Free', 'Perpetual') THEN 'active'
@@ -65,50 +64,168 @@ async function getLicenses() {
             ELSE 'active'
           END
         ELSE 'unknown'
-      END AS calculated_status
+      END AS status
     FROM dbo.software_license
     ORDER BY date_expire
   `);
   return result.recordset;
 }
 
+// The capacity-planning calculation sheet ("Plan optimize"): Total Capacity
+// vs Usage vs Reducing vs After Reducing, one row per server. This is
+// deliberately separate from "server" (dbo.equipment) - that stores what a
+// server is, this calculates what to do about its capacity. Name, IP, Owner
+// AND Total Capacity are not duplicated here; they come from dbo.equipment
+// (cpu/ram/hd is the same fact as Total Capacity, so there's no separate
+// column to keep in sync - editing either side edits the one real value).
+// TRY_CAST rather than CAST: a non-numeric cpu/ram/hd (free text like
+// "Core i5") should show up here as blank, not break the whole query.
 async function getServerUsage() {
   const pool = await poolPromise;
   const result = await pool.request().query(`
     SELECT
       su.usage_id,
       su.equipment_id,
-      e.computer_name,
-      e.device_model,
-      e.mac_address,
+      e.device_name,
       e.ip_address,
-      e.location AS device_location,
-      su.owner_id,
+      e.owner_id,
       emp.full_name AS owner_name,
-      su.cpu_core_total,
-      su.memory_gb_total,
-      su.hdd_gb_total,
+      su.plan_date,
+      su.due_date,
+      TRY_CAST(e.cpu AS INT) AS cpu_core_total,
+      TRY_CAST(e.ram AS INT) AS memory_gb_total,
+      TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
       su.cpu_usage_pct,
       su.memory_usage_pct,
       su.hdd_usage_gb,
-      su.antivirus_status,
-      su.os_type,
-      su.os_version,
-      su.windows_license_active,
-      su.sql_version,
-      su.sql_license_active,
-      su.platform,
-      su.service_date,
-      su.service_running,
-      su.status_check,
-      su.reinstall_antivirus,
+      su.reducing_cpu_core,
+      su.reducing_memory_gb,
+      su.after_reducing_cpu_core,
+      su.after_reducing_memory_gb,
       su.remark
     FROM dbo.server_usage su
-    LEFT JOIN dbo.equipment e ON su.equipment_id = e.equipment_id
-    LEFT JOIN dbo.employee emp ON su.owner_id = emp.employee_id
-    ORDER BY emp.full_name, su.usage_id
+    LEFT JOIN dbo.equipment e   ON su.equipment_id = e.equipment_id
+    LEFT JOIN dbo.employee emp  ON e.owner_id = emp.employee_id
+    ORDER BY e.device_name, su.usage_id
   `);
   return result.recordset;
+}
+
+// Sets the calculation fields for one equipment - MERGE so an
+// admin filling this in doesn't need to know whether a row already exists
+// for that server, the same way part_stock's increment() spares the caller
+// from that. COALESCE keeps a field already recorded when this update
+// leaves it out, rather than blanking it back to null.
+async function upsertServerUsage(equipmentId, d) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('equipment_id', sql.Int, equipmentId)
+    .input('plan_date', sql.Date, d.plan_date ?? null)
+    .input('due_date', sql.Date, d.due_date ?? null)
+    .input('cpu_usage_pct', sql.VarChar, d.cpu_usage_pct ?? null)
+    .input('memory_usage_pct', sql.VarChar, d.memory_usage_pct ?? null)
+    .input('hdd_usage_gb', sql.Decimal(10, 2), d.hdd_usage_gb ?? null)
+    .input('reducing_cpu_core', sql.Int, d.reducing_cpu_core ?? null)
+    .input('reducing_memory_gb', sql.Int, d.reducing_memory_gb ?? null)
+    .input('after_reducing_cpu_core', sql.Int, d.after_reducing_cpu_core ?? null)
+    .input('after_reducing_memory_gb', sql.Int, d.after_reducing_memory_gb ?? null)
+    .input('remark', sql.VarChar, d.remark ?? null)
+    .query(`
+      MERGE dbo.server_usage AS target
+      USING (SELECT @equipment_id AS equipment_id) AS source
+      ON target.equipment_id = source.equipment_id
+      WHEN MATCHED THEN UPDATE SET
+        plan_date = COALESCE(@plan_date, plan_date),
+        due_date = COALESCE(@due_date, due_date),
+        cpu_usage_pct = COALESCE(@cpu_usage_pct, cpu_usage_pct),
+        memory_usage_pct = COALESCE(@memory_usage_pct, memory_usage_pct),
+        hdd_usage_gb = COALESCE(@hdd_usage_gb, hdd_usage_gb),
+        reducing_cpu_core = COALESCE(@reducing_cpu_core, reducing_cpu_core),
+        reducing_memory_gb = COALESCE(@reducing_memory_gb, reducing_memory_gb),
+        after_reducing_cpu_core = COALESCE(@after_reducing_cpu_core, after_reducing_cpu_core),
+        after_reducing_memory_gb = COALESCE(@after_reducing_memory_gb, after_reducing_memory_gb),
+        remark = COALESCE(@remark, remark)
+      WHEN NOT MATCHED THEN INSERT (
+        equipment_id, plan_date, due_date,
+        cpu_usage_pct, memory_usage_pct, hdd_usage_gb,
+        reducing_cpu_core, reducing_memory_gb,
+        after_reducing_cpu_core, after_reducing_memory_gb, remark
+      ) VALUES (
+        @equipment_id, @plan_date, @due_date,
+        @cpu_usage_pct, @memory_usage_pct, @hdd_usage_gb,
+        @reducing_cpu_core, @reducing_memory_gb,
+        @after_reducing_cpu_core, @after_reducing_memory_gb, @remark
+      )
+      OUTPUT INSERTED.*;
+    `);
+  return result.recordset[0];
+}
+
+async function removeServerUsage(usageId) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('id', sql.Int, usageId)
+    .query('DELETE FROM dbo.server_usage OUTPUT DELETED.* WHERE usage_id = @id');
+  return result.recordset[0] || null;
+}
+
+// A device can be reinstalled more than once, so this always adds a new
+// row rather than merging into an existing one the way server_usage does -
+// each install attempt is its own record, not a single fact being corrected.
+async function createAntivirusInstall(d) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('equipment_id', sql.Int, d.equipment_id)
+    .input('antivirus_status', sql.VarChar, d.antivirus_status ?? null)
+    .input('windows_server_license', sql.Bit, d.windows_server_license ?? null)
+    .input('plan_date', sql.Date, d.plan_date ?? null)
+    .input('due_date', sql.Date, d.due_date ?? null)
+    .input('completed_date', sql.Date, d.completed_date ?? null)
+    .input('remark', sql.VarChar, d.remark ?? null)
+    .query(`
+      INSERT INTO dbo.antivirus_install
+        (equipment_id, antivirus_status, windows_server_license, plan_date, due_date, completed_date, remark)
+      OUTPUT INSERTED.*
+      VALUES (@equipment_id, @antivirus_status, @windows_server_license, @plan_date, @due_date, @completed_date, @remark)
+    `);
+  return result.recordset[0];
+}
+
+async function updateAntivirusInstall(installId, d) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('id', sql.Int, installId)
+    .input('antivirus_status', sql.VarChar, d.antivirus_status)
+    .input('windows_server_license', sql.Bit, d.windows_server_license === undefined ? null : d.windows_server_license)
+    .input('plan_date', sql.Date, d.plan_date)
+    .input('due_date', sql.Date, d.due_date)
+    .input('completed_date', sql.Date, d.completed_date)
+    .input('remark', sql.VarChar, d.remark)
+    .query(`
+      UPDATE dbo.antivirus_install
+      SET antivirus_status = COALESCE(@antivirus_status, antivirus_status),
+          windows_server_license = COALESCE(@windows_server_license, windows_server_license),
+          plan_date = COALESCE(@plan_date, plan_date),
+          due_date = COALESCE(@due_date, due_date),
+          completed_date = COALESCE(@completed_date, completed_date),
+          remark = COALESCE(@remark, remark)
+      OUTPUT INSERTED.*
+      WHERE install_id = @id
+    `);
+  return result.recordset[0] || null;
+}
+
+async function removeAntivirusInstall(installId) {
+  const pool = await poolPromise;
+  const result = await pool
+    .request()
+    .input('id', sql.Int, installId)
+    .query('DELETE FROM dbo.antivirus_install OUTPUT DELETED.* WHERE install_id = @id');
+  return result.recordset[0] || null;
 }
 
 async function getAntivirus() {
@@ -119,7 +236,7 @@ async function getAntivirus() {
       av.equipment_id,
       e.computer_name,
       e.device_model,
-      e.equipment_code AS asset_code,
+      e.asset_code AS asset_code,
       emp.full_name AS owner_name,
       av.antivirus_status,
       av.windows_server_license,
@@ -146,14 +263,14 @@ async function getReplacements() {
       old_eq.computer_name AS old_computer_name,
       old_eq.device_model AS old_device_model,
       old_eq.service_tag AS old_service_tag,
-      old_eq.equipment_code AS old_asset_code,
+      old_eq.asset_code AS old_asset_code,
       dr.old_device_status,
       dr.old_device_location,
       dr.old_bag, dr.old_mouse, dr.old_keyboard,
       new_eq.computer_name AS new_computer_name,
       new_eq.device_model AS new_device_model,
       new_eq.service_tag AS new_service_tag,
-      new_eq.equipment_code AS new_asset_code,
+      new_eq.asset_code new_asset_code,
       dr.new_bag, dr.new_mouse, dr.new_keyboard,
       dr.new_owner_location,
       dr.replacement_date
@@ -348,7 +465,12 @@ module.exports = {
   getSsdProcurement,
   getLicenses,
   getServerUsage,
+  upsertServerUsage,
+  removeServerUsage,
   getAntivirus,
+  createAntivirusInstall,
+  updateAntivirusInstall,
+  removeAntivirusInstall,
   getReplacements,
   getCloudRates,
   getCloudUsage,

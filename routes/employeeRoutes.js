@@ -9,7 +9,9 @@ const { auditActivity } = require('../middleware/auditActivity');
 router.get('/search', authenticate, employeeController.search);
 router.get('/', authenticate, employeeController.getAll);
 router.get('/:id', authenticate, employeeController.getById);
+router.get('/:id/full', authenticate, employeeController.getFull);
 router.get('/:id/replacements', authenticate, employeeController.getReplacements);
+router.get('/:id/part-replacements', authenticate, employeeController.getPartReplacements);
 
 router.post('/', authenticate, requireAdmin, employeeController.create);
 router.put('/:id', authenticate, auditActivity('employee'), employeeController.update);

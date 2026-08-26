@@ -16,10 +16,16 @@ const statusRoutes = require('./routes/statusRoutes');
 const userRoutes = require('./routes/userRoutes');
 const auditRoutes = require("./routes/auditRoutes");
 const recycleBinRoutes = require("./routes/recycleBinRoutes");
-
+const assignRoutes = require("./routes/assignRoutes");
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const viewColumnRoutes = require("./routes/viewColumnRoutes");
+const partRoutes = require("./routes/partRoutes");
+const partReplacementRoutes = require("./routes/partReplacementRoutes");
 const customFieldRoutes = require("./routes/customFieldRoutes");
+const partStockRoutes = require("./routes/partStockRoutes");
+const partCustomFieldRoutes = require("./routes/partCustomFieldRoutes");
+const partBorrowRoutes = require("./routes/partBorrowRoutes");
+const reportRoutes = require("./routes/reportRoutes");
 
 const app = express();
 
@@ -64,7 +70,9 @@ app.get('/', (req, res) => {
           "GET /api/employees/search?name=Fongmoua  - person plus all their devices",
         list: "GET /api/employees  - active staff only; add ?include_inactive=true for leavers too",
         one: "GET /api/employees/:id",
-        replacements: "GET /api/employees/:id/replacements",
+        full: "GET /api/employees/:id/full  - employee info plus one entry per owned device, each shaped by its category's configured columns/custom fields - built for a detail page with an info card and one card per device",
+        replacements: "GET /api/employees/:id/replacements  - historical whole-device swaps only (feature retired, old records kept)",
+        partReplacements: "GET /api/employees/:id/part-replacements  - every part swapped across all devices this employee currently owns",
         create: "POST /api/employees  (admin only)",
         update:
           'PUT /api/employees/:id  (admin only) - also how you deactivate a leaver: { "is_active": false, "left_date": "2026-07-30" }',
@@ -129,6 +137,16 @@ app.get('/', (req, res) => {
           "GET /api/search?q=anything  - searches employees AND equipment",
         filterOptions: "GET /api/filters  - dropdown values for the frontend",
       },
+      reports: {
+        equipment:
+          "GET /api/reports/equipment?format=xlsx|pdf  - exports the equipment list (same filters as GET /api/equipment)",
+        employees:
+          "GET /api/reports/employees?format=xlsx|pdf&include_inactive=true  - every employee with their owned equipment; no-equipment employees get one row",
+        borrowHistory:
+          "GET /api/reports/borrow-history?format=xlsx|pdf  (same filters as GET /api/borrow/history)",
+        partStock:
+          "GET /api/reports/part-stock?format=xlsx|pdf  (same filters as GET /api/part-stock)",
+      },
       other: {
         ssdUpgrades: "GET /api/ssd-upgrades",
         ssdProcurement: "GET /api/ssd-procurement",
@@ -136,7 +154,6 @@ app.get('/', (req, res) => {
         createLicense: "POST /api/licenses",
         serverUsage: "GET /api/server-usage",
         antivirus: "GET /api/antivirus",
-        replacements: "GET /api/replacements",
         cloudRates: "GET /api/cloud-rates",
         cloudUsage: "GET /api/cloud-usage",
       },
@@ -159,6 +176,13 @@ app.use("/api/audit", auditRoutes);
 app.use("/api/recycle-bin", recycleBinRoutes);
 app.use("/api/view-columns", viewColumnRoutes);
 app.use("/api/custom-fields", customFieldRoutes);
+app.use("/api/assign", assignRoutes);
+app.use("/api/part-types", partRoutes);
+app.use("/api/part-replacements", partReplacementRoutes);
+app.use("/api/part-stock", partStockRoutes);
+app.use("/api/part-custom-fields", partCustomFieldRoutes);
+app.use("/api/part-borrow", partBorrowRoutes);
+app.use("/api/reports", reportRoutes);
 // Mounted at /api, so this catch-all must come last or it swallows
 // every more specific route declared after it.
 app.use("/api", miscRoutes);

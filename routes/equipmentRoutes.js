@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
+const softwareLicenseController = require("../controllers/softwareLicenseController");
 const equipmentController = require('../controllers/equipmentController');
 const categoryViewController = require("../controllers/categoryViewController");
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { auditActivity } = require("../middleware/auditActivity");
-
+const partController = require("../controllers/partController");
 // Express matches routes in order, so fixed paths come before '/:id'.
 //
 // View keys used to be hardcoded in a regex here. Now that an admin can create
@@ -15,6 +16,7 @@ const { auditActivity } = require("../middleware/auditActivity");
 const numeric = '\\d+';
 
 router.get('/categories', authenticate, equipmentController.getCategories);
+router.get("/licenses", authenticate, softwareLicenseController.getAllLicenses);
 router.get("/views", authenticate, categoryViewController.getViews);
 
 router.post(
@@ -29,6 +31,33 @@ router.get("/", authenticate, equipmentController.getAll);
 // Numeric id routes, declared before the view routes so a real id is never
 // mistaken for a view key.
 router.get(`/:id(${numeric})`, authenticate, equipmentController.getById);
+
+// Software licences on a device. A device can hold several and a licence can
+// cover several devices, so these work with lists rather than a single value.
+router.get(
+  `/:id(${numeric})/licenses`,
+  authenticate,
+  equipmentController.getEquipmentLicenses,
+);
+router.post(
+  `/:id(${numeric})/licenses`,
+  authenticate,
+  requireAdmin,
+  auditActivity("equipment", "assign-license"),
+  equipmentController.assignLicense,
+);
+router.delete(
+  `/:id(${numeric})/licenses/:licenseId`,
+  authenticate,
+  requireAdmin,
+  auditActivity("equipment", "remove-license"),
+  equipmentController.removeLicense,
+);
+router.get(`/:id(${numeric})/part-replacements`, authenticate, partController.getByEquipment);
+router.post(`/:id(${numeric})/part-replacements`, authenticate, requireAdmin,
+  auditActivity('equipment', 'part-replacement'), partController.create);
+router.delete(`/:id(${numeric})/part-replacements/:replacementId`, authenticate, requireAdmin,
+  auditActivity('equipment', 'part-replacement-undo'), partController.removeReplacement);
 router.put(
   `/:id(${numeric})/owner`,
   authenticate,

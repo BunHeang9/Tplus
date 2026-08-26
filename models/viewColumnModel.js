@@ -19,30 +19,32 @@ const HIDDEN_FROM_PICKER = new Set([
 // Friendlier labels for the picker. Anything not listed falls back to the
 // column name with underscores replaced.
 const SUGGESTED_HEADERS = {
-  device_name: 'Devicename',
-  device_type: 'Device Type',
-  device_model: 'Model',
-  computer_name: 'Computer Name',
-  manufacturer: 'Manufacturer',
-  serial_no: 'Serial Number',
-  equipment_code: 'Asset Code',
-  service_tag: 'Service Tag',
-  product_id: 'Product ID',
-  mac_address: 'MAC Address',
-  ip_address: 'IP Address',
-  os_type: 'Type OS',
-  os_version: 'OS Version',
-  cpu: 'CPU',
-  ram: 'RAM',
-  hd: 'HD',
-  windows_license: 'Windows License',
-  av_license: 'Anti Virus License',
-  purchase_date: 'Period_date',
-  received_date: 'Good and receive Date',
-  assigned_date: 'Assigned Date',
-  location: 'Location',
-  status: 'Status',
-  remark: 'Remark',
+  device_name: "Devicename",
+  device_type: "Device Type",
+  device_model: "Model",
+  computer_name: "Computer Name",
+  manufacturer: "Manufacturer",
+  serial_no: "Serial Number",
+  asset_code: "Asset Code",
+  service_tag: "Service Tag",
+  product_id: "Product ID",
+  mac_address: "MAC Address",
+  ip_address: "IP Address",
+  os_type: "Type OS",
+  os_version: "OS Version",
+  platform: "Platform",
+  server_type: "Server Type",
+  cpu: "CPU",
+  ram: "RAM",
+  hd: "HD",
+  windows_license: "Windows License",
+  av_license: "Anti Virus License",
+  purchase_date: "Period_date",
+  received_date: "Good and receive Date",
+  assigned_date: "Assigned Date",
+  location: "Location",
+  status: "Status",
+  remark: "Remark",
 };
 
 // Joined columns the frontend can show but which are not on dbo.equipment.
@@ -50,10 +52,21 @@ const DERIVED_FIELDS = [
   { field: 'owner_name',       header: 'Owner name',  source: 'employee' },
   { field: 'owner_position',   header: 'Position',    source: 'employee' },
   { field: 'owner_department', header: 'Department',  source: 'employee' },
+  { field: 'owner_department_name', header: 'Department', source: 'employee' },
   { field: 'owner_location',   header: 'Owner Location', source: 'employee' },
+  { field: 'owner_sex',        header: 'Sex',         source: 'employee' },
   { field: 'category_name',    header: 'Category',    source: 'category' },
   { field: 'status_name',      header: 'Status',      source: 'equipment_status' },
 ];
+
+// server_usage is the capacity-planning calculation sheet, not part of any
+// equipment view - it has its own endpoint (GET /api/server-usage) and is
+// deliberately never merged into an equipment/category row, so its columns
+// (cpu_core_total, reducing_cpu_core, plan_date...) do not belong here.
+// platform/os_type/os_version used to live only in server_usage and were
+// listed here as derived fields for that reason; they are now real columns
+// on dbo.equipment, so getAvailableFields()'s live schema query picks them
+// up on its own - no entry needed.
 
 // Every field an admin can choose from, read live from the schema so a column
 // added later shows up without touching this file.

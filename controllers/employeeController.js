@@ -1,5 +1,22 @@
 const employeeModel = require('../models/employeeModel');
 const departmentModel = require('../models/departmentModel');
+const equipmentModel = require('../models/equipmentModel');
+const viewColumnModel = require('../models/viewColumnModel');
+const customFieldModel = require('../models/customFieldModel');
+const softwareLicenseModel = require('../models/softwareLicenseModel');
+const partModel = require('../models/partModel');
+
+// A fixed pair rather than free text - locking it down here is what lets the
+// frontend safely use a dropdown instead of a text box.
+const SEX_OPTIONS = ['Male', 'Female'];
+
+function validateSex(value) {
+  if (value === undefined || value === null || value === '') return { ok: true };
+  if (!SEX_OPTIONS.includes(value)) {
+    return { ok: false, error: `sex must be one of: ${SEX_OPTIONS.join(', ')}` };
+  }
+  return { ok: true };
+}
 
 // Accepts either department_id or a department code, so callers can use
 // whichever they have without a separate lookup first.
@@ -53,6 +70,103 @@ async function getById(req, res, next) {
   }
 }
 
+// Columns that describe the *owner*, not the device. They exist so the
+// general equipment list can show "who owns this laptop" - useful there, but
+// redundant (and a source of blank fields) on an employee's own page, where
+// the owner is already known: it's the page you're on. Stripped out below so
+// device cards only carry fields that are actually about the device.
+const OWNER_DERIVED_FIELDS = new Set([
+  "owner_name",
+  "owner_position",
+  "owner_department",
+  "owner_department_name",
+  "owner_location",
+  "owner_staff_code",
+]);
+
+// The employee detail page: their own info plus one entry per device they
+// own, each shaped by that device's category - the same column/custom-field
+// configuration the per-category equipment views use (categoryViewController),
+// so a Computer shows cpu/ram/hd while a Printer shows only what applies to
+// printers, instead of one flat row with every field from every category.
+async function getFull(req, res, next) {
+  try {
+    const employee = await employeeModel.findById(req.params.id);
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const devices = await equipmentModel.findByOwner(req.params.id);
+    const equipmentIds = devices.map((d) => d.equipment_id);
+
+    const [licensesByEquipment, customValuesByEquipment] = await Promise.all([
+      equipmentIds.length ? softwareLicenseModel.getLicensesForMany(equipmentIds) : {},
+      equipmentIds.length ? customFieldModel.getValuesForMany(equipmentIds) : {},
+    ]);
+
+    // Column config is per category, not per device - fetch it once for each
+    // category actually present rather than once per device.
+    const columnsByCategory = {};
+    const customFieldsByCategory = {};
+    for (const categoryId of new Set(devices.map((d) => d.category_id))) {
+      columnsByCategory[categoryId] = await viewColumnModel.findByCategory(categoryId);
+      customFieldsByCategory[categoryId] = await customFieldModel.findByCategory(categoryId);
+    }
+
+    const equipment = devices.map((device) => {
+      const columns = (columnsByCategory[device.category_id] || []).filter(
+        (c) => !OWNER_DERIVED_FIELDS.has(c.field_name),
+      );
+      const customFields = customFieldsByCategory[device.category_id] || [];
+      const customValues = customValuesByEquipment[device.equipment_id] || {};
+
+      const item = { equipment_id: device.equipment_id };
+      for (const col of columns) item[col.field_name] = device[col.field_name] ?? null;
+      for (const f of customFields) item[f.field_key] = customValues[f.field_key] ?? null;
+
+      return {
+        equipment_id: device.equipment_id,
+        category: device.category_name,
+        // Travels with the data so the frontend renders each card generically
+        // (loop columns, print header: item[field]) instead of hardcoding
+        // which fields belong to which category.
+        columns: [
+          ...columns.map((c) => ({ field: c.field_name, header: c.header_text })),
+          ...customFields.map((f) => ({ field: f.field_key, header: f.field_label, custom: true })),
+        ],
+        item,
+        licenses: licensesByEquipment[device.equipment_id] || [],
+      };
+    });
+
+    res.json({ employee, equipment });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/employees/:id/part-replacements
+// Every part swapped across every device this employee currently owns - the
+// part-level equivalent of the (now retired) whole-device replacement history.
+async function getPartReplacements(req, res, next) {
+  try {
+    const employee = await employeeModel.findById(req.params.id);
+    if (!employee) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    const replacements = await partModel.findByEmployee(req.params.id);
+    res.json({
+      employee_id: Number(req.params.id),
+      full_name: employee.full_name,
+      count: replacements.length,
+      replacements,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function getReplacements(req, res, next) {
   try {
     const history = await employeeModel.findReplacementHistory(req.params.id);
@@ -66,6 +180,9 @@ async function create(req, res, next) {
   if (!req.body.full_name) {
     return res.status(400).json({ error: 'full_name is required' });
   }
+  const sexCheck = validateSex(req.body.sex);
+  if (!sexCheck.ok) return res.status(400).json({ error: sexCheck.error });
+
   try {
     const resolved = await resolveDepartmentId(req.body);
     if (resolved.error) return res.status(400).json({ error: resolved.error });
@@ -78,6 +195,9 @@ async function create(req, res, next) {
 }
 
 async function update(req, res, next) {
+  const sexCheck = validateSex(req.body.sex);
+  if (!sexCheck.ok) return res.status(400).json({ error: sexCheck.error });
+
   try {
     const resolved = await resolveDepartmentId(req.body);
     if (resolved.error) return res.status(400).json({ error: resolved.error });
@@ -145,4 +265,7 @@ async function remove(req, res, next) {
   }
 }
 
-module.exports = { getAll, search, getById, getReplacements, create, update, remove };
+module.exports = {
+  getAll, search, getById, getFull, getReplacements, getPartReplacements,
+  create, update, remove, SEX_OPTIONS,
+};

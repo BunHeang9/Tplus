@@ -27,6 +27,35 @@ async function findAll(includeInactive = false) {
   return result.recordset;
 }
 
+// One row per employee per device they own (owner_id, not borrowing) - via
+// LEFT JOIN so an employee with nothing owned still gets one row, with the
+// equipment columns null. That is what lets a report show "no equipment"
+// employees alongside everyone else instead of silently dropping them.
+async function findAllWithEquipment(includeInactive = false) {
+  const pool = await poolPromise;
+  let query = `
+    SELECT emp.employee_id, emp.full_name, emp.staff_code, emp.position,
+           emp.location AS employee_location,
+           d.department_code, d.department_name,
+           emp.is_active,
+           e.equipment_id,
+           c.category_name,
+           e.computer_name, e.device_model, e.manufacturer,
+           e.asset_code, e.service_tag,
+           e.status AS device_status,
+           e.location AS device_location
+    FROM dbo.employee emp
+    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
+    LEFT JOIN dbo.equipment e  ON e.owner_id = emp.employee_id
+    LEFT JOIN dbo.category c   ON e.category_id = c.category_id
+  `;
+  if (!includeInactive) query += ' WHERE emp.is_active = 1';
+  query += ' ORDER BY emp.full_name, c.category_name, e.computer_name';
+
+  const result = await pool.request().query(query);
+  return result.recordset;
+}
+
 async function findById(id) {
   const pool = await poolPromise;
   const result = await pool
@@ -45,9 +74,7 @@ async function findById(id) {
 // server details and antivirus status into one flat result set.
 async function searchWithEquipment(name) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('name', sql.NVarChar, `%${name}%`)
+  const result = await pool.request().input("name", sql.NVarChar, `%${name}%`)
     .query(`
       SELECT
         emp.employee_id,
@@ -66,7 +93,7 @@ async function searchWithEquipment(name) {
         e.device_type,
         e.computer_name,
         e.device_model,
-        e.equipment_code AS asset_code,
+        e.asset_code,
         e.service_tag,
         e.mac_address,
         e.ip_address,
@@ -86,7 +113,16 @@ async function searchWithEquipment(name) {
         su.os_version AS server_os_version,
         av.antivirus_status,
         av.plan_date AS antivirus_plan_date,
-        av.due_date AS antivirus_due_date
+        av.due_date AS antivirus_due_date,
+        -- Software licences on this device. Gathered into one row rather than
+        -- joined directly, which would repeat the whole device row once per
+        -- licence and show duplicates in the table.
+        lic.license_names,
+        -- Dates only make sense for a single licence; with two, one expiry
+        -- cannot stand for both, so they are left null and the names shown.
+        CASE WHEN lic.license_count = 1 THEN lic.single_start  END AS license_date_start,
+        CASE WHEN lic.license_count = 1 THEN lic.single_expire END AS license_date_expire,
+        CASE WHEN lic.license_count = 1 THEN lic.single_status END AS license_status
       FROM dbo.employee emp
       LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
       LEFT JOIN dbo.equipment e ON e.owner_id = emp.employee_id
@@ -94,6 +130,23 @@ async function searchWithEquipment(name) {
       LEFT JOIN dbo.department eqd ON e.department_id = eqd.department_id
       LEFT JOIN dbo.server_usage su ON su.equipment_id = e.equipment_id
       LEFT JOIN dbo.antivirus_install av ON av.equipment_id = e.equipment_id
+      OUTER APPLY (
+        SELECT
+          STRING_AGG(sl.product_name, ', ') AS license_names,
+          COUNT(*)            AS license_count,
+          MIN(sl.date_start)  AS single_start,
+          MIN(sl.date_expire) AS single_expire,
+          MIN(CASE
+                WHEN sl.license_type IN ('Free', 'Perpetual') THEN 'active'
+                WHEN sl.date_expire IS NULL THEN 'unknown'
+                WHEN sl.date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
+                WHEN sl.date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
+                ELSE 'active'
+              END) AS single_status
+        FROM dbo.equipment_software_license l
+        JOIN dbo.software_license sl ON l.license_id = sl.license_id
+        WHERE l.equipment_id = e.equipment_id
+      ) lic
       WHERE emp.full_name LIKE @name
       ORDER BY emp.full_name, c.category_name, e.computer_name
     `);
@@ -114,15 +167,12 @@ async function findByName(fullName) {
 
 async function findReplacementHistory(employeeId) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, employeeId)
-    .query(`
+  const result = await pool.request().input("id", sql.Int, employeeId).query(`
       SELECT
         dr.replacement_id,
         old_eq.device_model AS old_device_model,
         old_eq.service_tag AS old_service_tag,
-        old_eq.equipment_code AS old_asset_code,
+        old_eq.asset_code AS old_asset_code,
         dr.old_device_status,
         dr.old_device_location AS location_of_old,
         dr.old_bag, dr.old_mouse, dr.old_keyboard,
@@ -130,7 +180,7 @@ async function findReplacementHistory(employeeId) {
         new_eq.device_model AS new_device_model,
         new_eq.service_tag AS new_service_tag,
         new_eq.product_id AS new_product_id,
-        new_eq.equipment_code AS new_asset_code,
+        new_eq.asset_code AS new_asset_code,
         dr.new_bag, dr.new_mouse, dr.new_keyboard,
         dr.replacement_date,
         dr.new_owner_location
@@ -275,6 +325,7 @@ async function remove(id, fullName, actor) {
 
 module.exports = {
   findAll,
+  findAllWithEquipment,
   countReferences,
   remove,
   findById,

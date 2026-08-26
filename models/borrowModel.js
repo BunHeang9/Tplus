@@ -15,13 +15,10 @@ const BORROWED_STATUS   = 'Borrowed';
 // Everything needed to decide whether this item can be lent out.
 async function findEquipmentForBorrow(equipmentId) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, equipmentId)
-    .query(`
+  const result = await pool.request().input("id", sql.Int, equipmentId).query(`
       SELECT e.equipment_id, e.owner_id, e.status,
              st.is_borrowable,
-             e.computer_name, e.device_model, e.equipment_code,
+             e.computer_name, e.device_model, e.asset_code,
              c.category_name,
              owner.full_name    AS current_owner,
              open_loan.borrow_id   AS open_borrow_id,
@@ -53,15 +50,14 @@ async function create(d) {
 
   try {
     const insert = await new sql.Request(transaction)
-      .input('equipment_id', sql.Int, d.equipment_id)
-      .input('borrower_id', sql.Int, d.borrower_id)
-      .input('borrow_date', sql.Date, d.borrow_date)
-      .input('expected_return_date', sql.Date, d.expected_return_date || null)
-      .input('condition_on_borrow', sql.NVarChar, d.condition_on_borrow || null)
-      .input('issued_by_id', sql.Int, d.issued_by_id || null)
-      .input('purpose', sql.NVarChar, d.purpose || null)
-      .input('remark', sql.NVarChar, d.remark || null)
-      .query(`
+      .input("equipment_id", sql.Int, d.equipment_id)
+      .input("borrower_id", sql.Int, d.borrower_id)
+      .input("borrow_date", sql.Date, d.borrow_date)
+      .input("expected_return_date", sql.Date, d.expected_return_date || null)
+      .input("condition_on_borrow", sql.NVarChar, d.condition_on_borrow || null)
+      .input("issued_by_id", sql.Int, d.issued_by_id || null)
+      .input("purpose", sql.NVarChar, d.purpose || null)
+      .input("remark", sql.NVarChar, d.remark || null).query(`
         INSERT INTO dbo.borrow_record (
           equipment_id, borrower_id, borrow_date, expected_return_date,
           condition_on_borrow, issued_by_id, purpose, remark
@@ -74,9 +70,8 @@ async function create(d) {
       `);
 
     await new sql.Request(transaction)
-      .input('equipment_id', sql.Int, d.equipment_id)
-      .input('status', sql.VarChar, BORROWED_STATUS)
-      .query(`
+      .input("equipment_id", sql.Int, d.equipment_id)
+      .input("status", sql.VarChar, BORROWED_STATUS).query(`
         UPDATE dbo.equipment
         SET status    = @status,
             status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = @status)
@@ -93,12 +88,9 @@ async function create(d) {
 
 async function findById(borrowId) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, borrowId)
-    .query(`
+  const result = await pool.request().input("id", sql.Int, borrowId).query(`
       SELECT b.*,
-             e.computer_name, e.device_model, e.equipment_code,
+             e.computer_name, e.device_model, e.asset_code,
              c.category_name,
              emp.full_name AS borrower_name
       FROM dbo.borrow_record b
@@ -113,10 +105,7 @@ async function findById(borrowId) {
 // Lets the caller return an item by equipment_id without knowing the borrow_id.
 async function findOpenLoanByEquipment(equipmentId) {
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, equipmentId)
-    .query(`
+  const result = await pool.request().input("id", sql.Int, equipmentId).query(`
       SELECT TOP 1 * FROM dbo.borrow_record
       WHERE equipment_id = @id AND return_date IS NULL
       ORDER BY borrow_date DESC
@@ -134,12 +123,11 @@ async function markReturned(borrowId, d) {
 
   try {
     const update = await new sql.Request(transaction)
-      .input('id', sql.Int, borrowId)
-      .input('return_date', sql.Date, d.return_date)
-      .input('condition_on_return', sql.NVarChar, d.condition_on_return || null)
-      .input('received_by_id', sql.Int, d.received_by_id || null)
-      .input('remark', sql.NVarChar, d.remark || null)
-      .query(`
+      .input("id", sql.Int, borrowId)
+      .input("return_date", sql.Date, d.return_date)
+      .input("condition_on_return", sql.NVarChar, d.condition_on_return || null)
+      .input("received_by_id", sql.Int, d.received_by_id || null)
+      .input("remark", sql.NVarChar, d.remark || null).query(`
         UPDATE dbo.borrow_record
         SET return_date         = @return_date,
             condition_on_return = @condition_on_return,
@@ -152,8 +140,8 @@ async function markReturned(borrowId, d) {
     const returned = update.recordset[0];
     if (returned) {
       await new sql.Request(transaction)
-        .input('equipment_id', sql.Int, returned.equipment_id)
-        .input('status', sql.VarChar, d.return_status || BORROWABLE_STATUS)
+        .input("equipment_id", sql.Int, returned.equipment_id)
+        .input("status", sql.VarChar, d.return_status || BORROWABLE_STATUS)
         .query(`
           UPDATE dbo.equipment
           SET status    = @status,
@@ -172,9 +160,9 @@ async function markReturned(borrowId, d) {
 
 async function findCurrentlyBorrowed(overdueOnly) {
   const pool = await poolPromise;
-  let query = 'SELECT * FROM dbo.vw_currently_borrowed';
-  if (overdueOnly === 'true') query += ' WHERE is_overdue = 1';
-  query += ' ORDER BY is_overdue DESC, borrow_date';
+  let query = "SELECT * FROM dbo.vw_currently_borrowed";
+  if (overdueOnly === "true") query += " WHERE is_overdue = 1";
+  query += " ORDER BY is_overdue DESC, borrow_date";
   const result = await pool.request().query(query);
   return result.recordset;
 }
@@ -186,7 +174,7 @@ async function findHistory(filters = {}) {
 
   let query = `
     SELECT b.borrow_id, b.equipment_id,
-           c.category_name, e.computer_name, e.device_model, e.equipment_code,
+           c.category_name, e.computer_name, e.device_model, e.asset_code,
            b.borrower_id, emp.full_name AS borrower_name,
            d.department_code AS borrower_department,
            b.borrow_date, b.expected_return_date, b.return_date,
@@ -206,23 +194,23 @@ async function findHistory(filters = {}) {
   `;
 
   if (equipment_id) {
-    query += ' AND b.equipment_id = @equipment_id';
-    request.input('equipment_id', sql.Int, equipment_id);
+    query += " AND b.equipment_id = @equipment_id";
+    request.input("equipment_id", sql.Int, equipment_id);
   }
   if (borrower_id) {
-    query += ' AND b.borrower_id = @borrower_id';
-    request.input('borrower_id', sql.Int, borrower_id);
+    query += " AND b.borrower_id = @borrower_id";
+    request.input("borrower_id", sql.Int, borrower_id);
   }
   if (from) {
-    query += ' AND b.borrow_date >= @from';
-    request.input('from', sql.Date, from);
+    query += " AND b.borrow_date >= @from";
+    request.input("from", sql.Date, from);
   }
   if (to) {
-    query += ' AND b.borrow_date <= @to';
-    request.input('to', sql.Date, to);
+    query += " AND b.borrow_date <= @to";
+    request.input("to", sql.Date, to);
   }
 
-  query += ' ORDER BY b.borrow_date DESC, b.borrow_id DESC';
+  query += " ORDER BY b.borrow_date DESC, b.borrow_id DESC";
 
   const result = await request.query(query);
   return result.recordset;
@@ -241,7 +229,7 @@ async function findReturns(filters = {}) {
            c.category_name,
            e.computer_name,
            e.device_model,
-           e.equipment_code,
+           e.asset_code,
            e.service_tag,
            b.borrower_id,
            emp.full_name        AS borrower_name,
@@ -281,26 +269,27 @@ async function findReturns(filters = {}) {
   `;
 
   if (equipment_id) {
-    query += ' AND b.equipment_id = @equipment_id';
-    request.input('equipment_id', sql.Int, equipment_id);
+    query += " AND b.equipment_id = @equipment_id";
+    request.input("equipment_id", sql.Int, equipment_id);
   }
   if (borrower_id) {
-    query += ' AND b.borrower_id = @borrower_id';
-    request.input('borrower_id', sql.Int, borrower_id);
+    query += " AND b.borrower_id = @borrower_id";
+    request.input("borrower_id", sql.Int, borrower_id);
   }
   if (from) {
-    query += ' AND b.return_date >= @from';
-    request.input('from', sql.Date, from);
+    query += " AND b.return_date >= @from";
+    request.input("from", sql.Date, from);
   }
   if (to) {
-    query += ' AND b.return_date <= @to';
-    request.input('to', sql.Date, to);
+    query += " AND b.return_date <= @to";
+    request.input("to", sql.Date, to);
   }
-  if (late_only === 'true') {
-    query += ' AND b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date';
+  if (late_only === "true") {
+    query +=
+      " AND b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date";
   }
 
-  query += ' ORDER BY b.return_date DESC, b.borrow_id DESC';
+  query += " ORDER BY b.return_date DESC, b.borrow_id DESC";
 
   const result = await request.query(query);
   return result.recordset;
@@ -316,7 +305,7 @@ async function findAvailableToBorrow(category) {
   let query = `
     SELECT e.equipment_id, e.category_id, c.category_name,
            e.device_type, e.computer_name, e.device_model, e.manufacturer,
-           e.equipment_code, e.service_tag, e.location, e.status
+           e.asset_code, e.service_tag, e.location, e.status
     FROM dbo.equipment e
     LEFT JOIN dbo.category c ON e.category_id = c.category_id
     JOIN dbo.equipment_status st ON e.status_id = st.status_id
@@ -328,11 +317,11 @@ async function findAvailableToBorrow(category) {
   `;
 
   if (category) {
-    query += ' AND c.category_name = @category';
-    request.input('category', sql.VarChar, category);
+    query += " AND c.category_name = @category";
+    request.input("category", sql.VarChar, category);
   }
 
-  query += ' ORDER BY c.category_name, e.equipment_id';
+  query += " ORDER BY c.category_name, e.equipment_id";
 
   const result = await request.query(query);
   return result.recordset;
@@ -340,11 +329,11 @@ async function findAvailableToBorrow(category) {
 
 async function findByBorrower(borrowerId, openOnly) {
   const pool = await poolPromise;
-  const request = pool.request().input('id', sql.Int, borrowerId);
+  const request = pool.request().input("id", sql.Int, borrowerId);
 
   let query = `
     SELECT b.borrow_id, b.equipment_id,
-           c.category_name, e.computer_name, e.device_model, e.equipment_code,
+           c.category_name, e.computer_name, e.device_model, e.asset_code,
            b.borrow_date, b.expected_return_date, b.return_date,
            CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status,
            b.condition_on_borrow, b.condition_on_return, b.purpose, b.remark
@@ -353,8 +342,8 @@ async function findByBorrower(borrowerId, openOnly) {
     LEFT JOIN dbo.category c ON e.category_id = c.category_id
     WHERE b.borrower_id = @id
   `;
-  if (openOnly === 'true') query += ' AND b.return_date IS NULL';
-  query += ' ORDER BY b.borrow_date DESC';
+  if (openOnly === "true") query += " AND b.return_date IS NULL";
+  query += " ORDER BY b.borrow_date DESC";
 
   const result = await request.query(query);
   return result.recordset;

@@ -82,13 +82,52 @@ async function countUsage(id) {
   return result.recordset[0];
 }
 
-async function remove(id) {
+// Captures the row into the recycle bin before removing it, both in one
+// transaction - so a failed delete cannot leave an orphaned bin entry, and a
+// failed bin write cannot lose the department. Mirrors equipmentModel.remove
+// one level down; no dependent rows to clean up here since the controller
+// already refuses to delete a department still referenced by an employee or
+// piece of equipment.
+async function remove(id, actor) {
+  const recycleBinModel = require('./recycleBinModel');
+
   const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query('DELETE FROM dbo.department OUTPUT DELETED.* WHERE department_id = @id');
-  return result.recordset[0] || null;
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin();
+
+  try {
+    const row = await new sql.Request(transaction)
+      .input('id', sql.Int, id)
+      .query('SELECT * FROM dbo.department WHERE department_id = @id');
+
+    const department = row.recordset[0];
+    if (!department) {
+      await transaction.rollback();
+      return null;
+    }
+
+    await recycleBinModel.create(
+      {
+        entityType: 'department',
+        entityId: id,
+        entityLabel: department.department_name || department.department_code,
+        entityData: department,
+        actor,
+        reason: 'Department deleted',
+      },
+      transaction,
+    );
+
+    await new sql.Request(transaction)
+      .input('id', sql.Int, id)
+      .query('DELETE FROM dbo.department WHERE department_id = @id');
+
+    await transaction.commit();
+    return department;
+  } catch (err) {
+    await transaction.rollback();
+    throw err;
+  }
 }
 
 module.exports = { findAll, findById, findByCode, create, update, countUsage, remove };

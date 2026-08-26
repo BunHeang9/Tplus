@@ -17,7 +17,7 @@ async function searchAll(term) {
         e.computer_name,
         e.device_model,
         e.manufacturer,
-        e.equipment_code AS asset_code,
+        e.asset_code
         e.service_tag,
         e.mac_address,
         e.ip_address,
@@ -39,7 +39,7 @@ async function searchAll(term) {
       WHERE e.device_name      LIKE @term
          OR e.computer_name    LIKE @term
          OR e.device_model     LIKE @term
-         OR e.equipment_code   LIKE @term
+         OR e.asset_code  LIKE @term
          OR e.service_tag      LIKE @term
          OR e.mac_address      LIKE @term
          OR e.ip_address       LIKE @term
