@@ -49,4 +49,37 @@ async function getAllFilterOptions() {
   };
 }
 
-module.exports = { getAllFilterOptions };
+// Everything the assign page needs on load, in one call rather than four -
+// deliberately separate from getAllFilterOptions() above: these carry counts
+// (how many people hold each position, how many of each category are still
+// available) that a generic filter dropdown has no use for, and locations
+// here means unowned equipment locations only, not every device's. Moved
+// here from assignController.js, which used to run these queries itself.
+async function getAssignFormData() {
+  const q = (sql) => sequelize.query(sql, { type: QueryTypes.SELECT });
+
+  const [positions, statuses, categories, locations] = await Promise.all([
+    q(`SELECT position, COUNT(*) AS employee_count
+       FROM dbo.employee
+       WHERE position IS NOT NULL AND LTRIM(RTRIM(position)) <> '' AND is_active = 1
+       GROUP BY position ORDER BY position`),
+    q(`SELECT status_id, status_name, description, is_assignable
+       FROM dbo.equipment_status
+       WHERE is_active = 1 ORDER BY sort_order`),
+    q(`SELECT c.category_id, c.category_name,
+              (SELECT COUNT(*) FROM dbo.equipment e
+                WHERE e.category_id = c.category_id AND e.owner_id IS NULL) AS available_count
+       FROM dbo.category c WHERE c.is_active = 1 ORDER BY c.category_name`),
+    q(`SELECT DISTINCT location FROM dbo.equipment
+       WHERE location IS NOT NULL AND owner_id IS NULL ORDER BY location`),
+  ]);
+
+  return {
+    positions,
+    statuses,
+    categories,
+    locations: locations.map((r) => r.location),
+  };
+}
+
+module.exports = { getAllFilterOptions, getAssignFormData };

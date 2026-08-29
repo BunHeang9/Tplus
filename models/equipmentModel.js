@@ -1,4 +1,3 @@
-const { sql } = require('../config/db');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 
@@ -276,6 +275,39 @@ async function findWithOwnerName(id) {
   return rows[0] || null;
 }
 
+// Assigns a device to an employee, inheriting department and location from
+// them rather than asking the caller to supply matching values - so the
+// device and the person can never disagree about where they are. One atomic
+// UPDATE with correlated subqueries rather than a read-then-write, so the
+// employee's department/location can't change between reading and writing.
+// Moved here from assignController.js, which used to run this query itself.
+async function assignToEmployee(id, employeeId, { status, assignedDate } = {}) {
+  const [row] = await sequelize.query(`
+      UPDATE dbo.equipment
+      SET owner_id      = :employee_id,
+          status        = :status,
+          status_id     = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
+          assigned_date = :assigned_date,
+          -- Both follow the owner. Asking for them separately invites the
+          -- device and the person to disagree about where they are.
+          department_id = (SELECT department_id FROM dbo.employee WHERE employee_id = :employee_id),
+          location      = COALESCE(
+                            (SELECT location FROM dbo.employee WHERE employee_id = :employee_id),
+                            location)
+      OUTPUT INSERTED.*
+      WHERE equipment_id = :id
+    `, {
+    replacements: {
+      id,
+      employee_id: employeeId,
+      status: status || 'Working/Using',
+      assigned_date: assignedDate || new Date(),
+    },
+    type: QueryTypes.SELECT,
+  });
+  return fixDates(row) || null;
+}
+
 async function assign(id, d) {
   const [row] = await sequelize.query(`
       UPDATE dbo.equipment
@@ -310,79 +342,67 @@ async function assign(id, d) {
 //Unassign
 // name=models/equipmentModel.js
 //
-// Still raw mssql, not Sequelize: these three take an external request built
-// from equipmentController.js's own sql.Transaction (a single transaction
-// covering "one, several, or all-by-owner" in one call), and the controller
-// reads back result.recordset directly - the raw mssql result shape.
+// All three take an optional external Sequelize transaction - equipmentController.js's
+// unassign() opens one transaction covering "one, several, or all-by-owner"
+// in a single call, and rolls back if nothing matched.
 async function unassignById(
-  request,
   equipmentId,
   status = "Working - IT Stock",
+  transaction,
 ) {
-  request.input("id", sql.Int, equipmentId);
-  request.input("status", sql.VarChar, status);
-
-  return request.query(`
+  const rows = await sequelize.query(`
     UPDATE dbo.equipment
     SET owner_id = NULL,
-        status = @status,
+        status = :status,
         status_id = (
           SELECT status_id
           FROM dbo.equipment_status
-          WHERE status_name = @status
+          WHERE status_name = :status
         )
     OUTPUT INSERTED.*
-    WHERE equipment_id = @id
-  `);
+    WHERE equipment_id = :id
+  `, { replacements: { id: equipmentId, status }, type: QueryTypes.SELECT, transaction });
+  return rows.map(fixDates);
 }
 
 async function unassignByIds(
-  request,
   equipmentIds,
   status = "Working - IT Stock",
+  transaction,
 ) {
-  equipmentIds.forEach((id, index) => {
-    request.input(`id${index}`, sql.Int, id);
-  });
-
-  const placeholders = equipmentIds.map((_, index) => `@id${index}`).join(", ");
-
-  request.input("status", sql.VarChar, status);
-
-  return request.query(`
+  const rows = await sequelize.query(`
     UPDATE dbo.equipment
     SET owner_id = NULL,
-        status = @status,
+        status = :status,
         status_id = (
           SELECT status_id
           FROM dbo.equipment_status
-          WHERE status_name = @status
+          WHERE status_name = :status
         )
     OUTPUT INSERTED.*
-    WHERE equipment_id IN (${placeholders})
-  `);
+    WHERE equipment_id IN (:ids)
+  `, { replacements: { ids: equipmentIds, status }, type: QueryTypes.SELECT, transaction });
+  return rows.map(fixDates);
 }
 
 async function unassignByOwnerId(
-  request,
   ownerId,
   status = "Working - IT Stock",
+  transaction,
 ) {
-  request.input("owner_id", sql.Int, ownerId);
-  request.input("status", sql.VarChar, status);
-
-  return request.query(`
+  const rows = await sequelize.query(`
     UPDATE dbo.equipment
     SET owner_id = NULL,
-        status = @status,
+        status = :status,
         status_id = (
           SELECT status_id
           FROM dbo.equipment_status
-          WHERE status_name = @status
+          WHERE status_name = :status
         )
     OUTPUT INSERTED.*
-    WHERE owner_id = @owner_id
-  `);
+    WHERE owner_id = :owner_id
+  `, { replacements: { owner_id: ownerId, status }, type: QueryTypes.SELECT, transaction });
+  return rows.map(fixDates);
 }
 
 // What can actually be handed to an employee.
@@ -419,6 +439,66 @@ async function findAvailable(category, includeInstalled) {
     replacements.category = category;
   }
   query += ' ORDER BY e.received_date DESC, e.equipment_id DESC';
+
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
+}
+
+// What can be picked from the assign page's device dropdown: unowned,
+// assignable, optionally narrowed by search text/category/status/location.
+// Distinct from findAvailable() above - that one is a plain unowned+
+// assignable list; this carries a display_name fallback chain and a wider
+// filter set the assign form actually uses. Moved here from
+// assignController.js, which used to run this query itself.
+async function findAvailableForAssign({ q, category, status, location } = {}) {
+  let query = `
+    SELECT e.*,
+           c.category_name,
+           s.status_name,
+           -- Always null for stock, but present so the column set matches
+           -- the replacement page and one table component serves both.
+           CAST(NULL AS NVARCHAR(100)) AS owner_name,
+           CAST(NULL AS NVARCHAR(100)) AS owner_position,
+           CAST(NULL AS VARCHAR(20))   AS owner_department,
+           -- What the dropdown shows. Falls through name, hostname, model
+           -- and asset code so a device is never an unlabelled row.
+           COALESCE(e.computer_name, e.device_name, e.device_model, e.asset_code,
+                    CONCAT('Equipment ', e.equipment_id)) AS display_name
+    FROM dbo.equipment e
+    LEFT JOIN dbo.category c ON e.category_id = c.category_id
+    LEFT JOIN dbo.equipment_status s ON e.status_id = s.status_id
+    -- No owner is not enough: a wall-mounted camera has no owner either.
+    -- is_assignable marks what can actually be handed to a person.
+    WHERE e.owner_id IS NULL
+      AND s.is_assignable = 1
+  `;
+  const replacements = {};
+
+  if (q) {
+    query += ` AND (
+      e.computer_name LIKE :q OR
+      e.device_name   LIKE :q OR
+      e.asset_code    LIKE :q OR
+      e.service_tag   LIKE :q OR
+      e.serial_no     LIKE :q OR
+      e.device_model  LIKE :q
+    )`;
+    replacements.q = `%${q}%`;
+  }
+  if (category) {
+    query += ' AND c.category_name = :category';
+    replacements.category = category;
+  }
+  if (status) {
+    query += ' AND e.status = :status';
+    replacements.status = status;
+  }
+  if (location) {
+    query += ' AND e.location = :location';
+    replacements.location = location;
+  }
+
+  query += ' ORDER BY c.category_name, display_name';
 
   const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
   return rows.map(fixDates);
@@ -600,9 +680,11 @@ module.exports = {
   createStock,
   findWithOwnerName,
   assign,
+  assignToEmployee,
   unassignById,
   unassignByIds,
   unassignByOwnerId,
   findAvailable,
+  findAvailableForAssign,
   findByDateRange,
 };

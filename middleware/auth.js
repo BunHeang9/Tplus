@@ -1,5 +1,5 @@
 const bcrypt = require('bcryptjs');
-const { sql, poolPromise } = require('../config/db');
+const userModel = require('../models/userModel');
 
 // Checks username + password on EVERY request.
 //
@@ -39,13 +39,7 @@ async function authenticate(req, res, next) {
   }
 
   try {
-    const pool = await poolPromise;
-    const result = await pool
-      .request()
-      .input('username', sql.VarChar, username)
-      .query('SELECT user_id, username, password_hash, full_name, role, is_active FROM dbo.api_user WHERE username = @username');
-
-    const user = result.recordset[0];
+    const user = await userModel.findByUsername(username);
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });

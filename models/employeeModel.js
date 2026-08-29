@@ -154,6 +154,47 @@ async function findByName(fullName) {
   return rows[0] || null;
 }
 
+// The assign page's employee dropdown: active employees, optionally narrowed
+// by position/department/search text, each with a live count of what they
+// already hold - so an admin can see "already has 3 devices" before handing
+// over a 4th. Moved here from assignController.js, which used to run this
+// query itself.
+async function findForAssign({ position, department, q } = {}) {
+  let query = `
+    SELECT emp.employee_id,
+           emp.full_name,
+           emp.position,
+           emp.staff_code,
+           emp.location,
+           emp.department_id,
+           d.department_code,
+           d.department_name,
+           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.owner_id = emp.employee_id)
+             AS current_equipment_count
+    FROM dbo.employee emp
+    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
+    WHERE emp.is_active = 1
+  `;
+  const replacements = {};
+
+  if (position) {
+    query += ' AND emp.position = :position';
+    replacements.position = position;
+  }
+  if (department) {
+    query += ' AND d.department_code = :department';
+    replacements.department = department;
+  }
+  if (q) {
+    query += ' AND (emp.full_name LIKE :q OR emp.staff_code LIKE :q)';
+    replacements.q = `%${q}%`;
+  }
+
+  query += ' ORDER BY emp.full_name';
+
+  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+}
+
 async function findReplacementHistory(employeeId) {
   return sequelize.query(`
       SELECT
@@ -300,6 +341,7 @@ module.exports = {
   remove,
   findById,
   findByName,
+  findForAssign,
   searchWithEquipment,
   findReplacementHistory,
   create,

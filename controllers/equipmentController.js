@@ -2,7 +2,7 @@ const equipmentModel = require('../models/equipmentModel');
 const categoryModel = require('../models/categoryModel');
 const departmentModel = require('../models/departmentModel');
 const customFieldModel = require('../models/customFieldModel');
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
 
 // Custom fields (Bag Model, Mouse Model, Keyboard Model, and anything else an
 // admin has configured per category) live in equipment_custom_value, not on
@@ -66,37 +66,24 @@ async function unassign(req, res) {
     });
   }
 
-  let pool;
-  let transaction;
   try {
-    pool = await poolPromise;
-    transaction = new sql.Transaction(pool);
-    await transaction.begin();
-    const request = transaction.request();
+    const rows = await sequelize.transaction(async (transaction) => {
+      if (equipment_id) {
+        return equipmentModel.unassignById(equipment_id, status, transaction);
+      }
+      if (Array.isArray(equipment_ids) && equipment_ids.length) {
+        return equipmentModel.unassignByIds(equipment_ids, status, transaction);
+      }
+      return equipmentModel.unassignByOwnerId(owner_id, status, transaction);
+    });
 
-    let result;
-    if (equipment_id) {
-      result = await equipmentModel.unassignById(request, equipment_id, status);
-    } else if (Array.isArray(equipment_ids) && equipment_ids.length) {
-      result = await equipmentModel.unassignByIds(request, equipment_ids, status);
-    } else {
-      result = await equipmentModel.unassignByOwnerId(request, owner_id, status);
-    }
-
-    if (!result || !result.recordset || result.recordset.length === 0) {
-      await transaction.rollback();
+    if (!rows || rows.length === 0) {
       return res.status(404).json({ error: 'No matching equipment found' });
     }
 
-    await transaction.commit();
     // return single object for single id, otherwise array
-    return res.json(result.recordset.length === 1 ? result.recordset[0] : result.recordset);
+    return res.json(rows.length === 1 ? rows[0] : rows);
   } catch (err) {
-    try {
-      if (transaction) await transaction.rollback();
-    } catch (rbErr) {
-      console.error('Rollback failed', rbErr);
-    }
     console.error('unassign error', err);
     return res.status(500).json({ error: err.message });
   }
