@@ -1,5 +1,4 @@
 const equipmentModel = require('../models/equipmentModel');
-const softwareLicenseModel = require("../models/softwareLicenseModel");
 const categoryModel = require('../models/categoryModel');
 const departmentModel = require('../models/departmentModel');
 const customFieldModel = require('../models/customFieldModel');
@@ -46,120 +45,6 @@ async function getCategories(req, res, next) {
   try {
     const summary = await equipmentModel.getCategorySummary();
     res.json(summary);
-  } catch (err) {
-    next(err);
-  }
-}
-
-// Get all software licenses for dropdown
-async function getLicenses(req, res, next) {
-  try {
-    const licenses = await softwareLicenseModel.getAllLicenses();
-    res.json(licenses);
-  } catch (err) {
-    next(err);
-  }
-}
-
-// All licences on one device. Returns an array - a laptop may have Office,
-// Adobe and an antivirus product at once.
-async function getEquipmentLicenses(req, res, next) {
-  try {
-    const equipment = await equipmentModel.findById(req.params.id);
-    if (!equipment)
-      return res.status(404).json({ error: "Equipment not found" });
-
-    const licenses = await softwareLicenseModel.getEquipmentLicenses(
-      req.params.id,
-    );
-    res.json({
-      equipment_id: Number(req.params.id),
-      device_name: equipment.device_name || equipment.computer_name,
-      count: licenses.length,
-      licenses,
-    });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// Adds a licence, leaving any others in place. Send license_ids instead to
-// replace the whole set - for a tick-box form that saves everything at once.
-async function assignLicense(req, res, next) {
-  const { license_id, license_ids } = req.body;
-
-  if (!license_id && !Array.isArray(license_ids)) {
-    return res.status(400).json({
-      error:
-        "Send license_id to add one, or license_ids to replace the whole set",
-      example: { license_id: 3 },
-    });
-  }
-
-  try {
-    const equipment = await equipmentModel.findById(req.params.id);
-    if (!equipment)
-      return res.status(404).json({ error: "Equipment not found" });
-
-    if (Array.isArray(license_ids)) {
-      for (const id of license_ids) {
-        const found = await softwareLicenseModel.findLicenseById(id);
-        if (!found)
-          return res.status(404).json({ error: `Licence ${id} not found` });
-      }
-      const licenses = await softwareLicenseModel.setEquipmentLicenses(
-        req.params.id,
-        license_ids,
-      );
-      return res.json({
-        message: `${licenses.length} licence(s) set on this device`,
-        equipment_id: Number(req.params.id),
-        licenses,
-      });
-    }
-
-    const license = await softwareLicenseModel.findLicenseById(license_id);
-    if (!license) return res.status(404).json({ error: "Licence not found" });
-
-    const licenses = await softwareLicenseModel.assignLicenseToEquipment(
-      req.params.id,
-      license_id,
-      { installedDate: req.body.installed_date, remark: req.body.remark },
-    );
-
-    res.json({
-      message: `"${license.product_name}" assigned`,
-      equipment_id: Number(req.params.id),
-      licenses,
-    });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// Removes one licence from one device - both ids are needed, since a device
-// may hold several.
-async function removeLicense(req, res, next) {
-  try {
-    const removed = await softwareLicenseModel.removeLicenseFromEquipment(
-      req.params.id,
-      req.params.licenseId,
-    );
-    if (!removed) {
-      return res
-        .status(404)
-        .json({ error: "That licence is not assigned to this device" });
-    }
-
-    const licenses = await softwareLicenseModel.getEquipmentLicenses(
-      req.params.id,
-    );
-    res.json({
-      message: "Licence removed from this device",
-      equipment_id: Number(req.params.id),
-      remaining: licenses.length,
-      licenses,
-    });
   } catch (err) {
     next(err);
   }
@@ -350,8 +235,4 @@ module.exports = {
   update,
   unassign,
   remove,
-  getLicenses,
-  getEquipmentLicenses,
-  assignLicense,
-  removeLicense,
 };

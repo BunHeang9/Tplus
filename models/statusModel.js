@@ -1,4 +1,6 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
+const EquipmentStatus = require('./sequelize/equipmentStatusModel');
 
 // Equipment statuses (dbo.equipment_status).
 //
@@ -6,8 +8,8 @@ const { sql, poolPromise } = require('../config/db');
 // stock and borrow features allow. Changing those flags changes behaviour, so
 // they are worth understanding before editing a status.
 
+// Correlated subquery for equipment_count - raw query through Sequelize.
 async function findAll(includeInactive = false) {
-  const pool = await poolPromise;
   let query = `
     SELECT s.status_id, s.status_name, s.description,
            s.has_owner, s.is_assignable, s.is_borrowable,
@@ -15,149 +17,98 @@ async function findAll(includeInactive = false) {
            (SELECT COUNT(*) FROM dbo.equipment e WHERE e.status_id = s.status_id) AS equipment_count
     FROM dbo.equipment_status s
   `;
-  if (!includeInactive) query += " WHERE s.is_active = 1";
-  query += " ORDER BY s.sort_order, s.status_id";
-
-  const result = await pool.request().query(query);
-  return result.recordset;
+  if (!includeInactive) query += ' WHERE s.is_active = 1';
+  query += ' ORDER BY s.sort_order, s.status_id';
+  return sequelize.query(query, { type: QueryTypes.SELECT });
 }
 
 async function findById(id) {
-  const pool = await poolPromise;
-  const result = await pool.request().input("id", sql.Int, id).query(`
-      SELECT s.*,
-             (SELECT COUNT(*) FROM dbo.equipment e WHERE e.status_id = s.status_id) AS equipment_count
-      FROM dbo.equipment_status s WHERE s.status_id = @id
-    `);
-  return result.recordset[0] || null;
+  const [row] = await sequelize.query(`
+    SELECT s.*,
+           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.status_id = s.status_id) AS equipment_count
+    FROM dbo.equipment_status s WHERE s.status_id = :id
+  `, { replacements: { id }, type: QueryTypes.SELECT });
+  return row || null;
 }
 
 async function findByName(name) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('name', sql.VarChar, name)
-    .query('SELECT * FROM dbo.equipment_status WHERE status_name = @name');
-  return result.recordset[0] || null;
+  return EquipmentStatus.findOne({ where: { status_name: name }, raw: true });
 }
 
 async function create(d) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("status_name", sql.VarChar, d.status_name)
-    .input("description", sql.NVarChar, d.description || null)
-    .input("has_owner", sql.Bit, d.has_owner ? 1 : 0)
-    .input("is_assignable", sql.Bit, d.is_assignable ? 1 : 0)
-    .input("is_borrowable", sql.Bit, d.is_borrowable ? 1 : 0)
-    .input("sort_order", sql.Int, d.sort_order ?? 99).query(`
-      INSERT INTO dbo.equipment_status
-        (status_name, description, has_owner, is_assignable, is_borrowable, sort_order)
-      OUTPUT INSERTED.*
-      VALUES (@status_name, @description, @has_owner, @is_assignable, @is_borrowable, @sort_order)
-    `);
-  return result.recordset[0];
+  const row = await EquipmentStatus.create({
+    status_name: d.status_name,
+    description: d.description || null,
+    has_owner: !!d.has_owner,
+    is_assignable: !!d.is_assignable,
+    is_borrowable: !!d.is_borrowable,
+    sort_order: d.sort_order ?? 99,
+  });
+  return row.get({ plain: true });
 }
 
 // Renaming a status has to update dbo.equipment too - that table keeps a text
 // copy of the name alongside status_id, and leaving it stale would make the
 // two disagree. Both happen in one transaction.
+//
+// The boolean fields (has_owner/is_assignable/is_borrowable/is_active) and
+// the plain fields (status_name/description/sort_order) skip differently
+// here, matching the original COALESCE-vs-ternary split exactly: undefined
+// skips every field, but an explicit null only skips the plain fields - for
+// a boolean field, null ? 1 : 0 evaluates to 0, so an explicit null there
+// actually sets it to false rather than leaving it alone. Preserved as-is
+// rather than "fixed", since this is a faithful migration, not a rewrite.
 async function update(id, d) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
+  return sequelize.transaction(async (transaction) => {
+    const existing = await EquipmentStatus.findByPk(id, { transaction, raw: true });
+    if (!existing) return null;
+    const oldName = existing.status_name;
 
-  try {
-    const before = await new sql.Request(transaction)
-      .input("id", sql.Int, id)
-      .query(
-        "SELECT status_name FROM dbo.equipment_status WHERE status_id = @id",
-      );
+    const values = {};
+    if (d.status_name !== undefined && d.status_name !== null) values.status_name = d.status_name;
+    if (d.description !== undefined && d.description !== null) values.description = d.description;
+    if (d.sort_order !== undefined && d.sort_order !== null) values.sort_order = d.sort_order;
+    if (d.has_owner !== undefined) values.has_owner = !!d.has_owner;
+    if (d.is_assignable !== undefined) values.is_assignable = !!d.is_assignable;
+    if (d.is_borrowable !== undefined) values.is_borrowable = !!d.is_borrowable;
+    if (d.is_active !== undefined) values.is_active = !!d.is_active;
 
-    const oldName = before.recordset[0]?.status_name;
-    if (!oldName) {
-      await transaction.rollback();
-      return null;
+    let row = existing;
+    if (Object.keys(values).length > 0) {
+      const [, [updated]] = await EquipmentStatus.update(values, {
+        where: { status_id: id },
+        returning: true,
+        transaction,
+      });
+      row = updated.get({ plain: true });
     }
-
-    const updated = await new sql.Request(transaction)
-      .input("id", sql.Int, id)
-      .input("status_name", sql.VarChar, d.status_name)
-      .input("description", sql.NVarChar, d.description)
-      .input(
-        "has_owner",
-        sql.Bit,
-        d.has_owner === undefined ? null : d.has_owner ? 1 : 0,
-      )
-      .input(
-        "is_assignable",
-        sql.Bit,
-        d.is_assignable === undefined ? null : d.is_assignable ? 1 : 0,
-      )
-      .input(
-        "is_borrowable",
-        sql.Bit,
-        d.is_borrowable === undefined ? null : d.is_borrowable ? 1 : 0,
-      )
-      .input("sort_order", sql.Int, d.sort_order)
-      .input(
-        "is_active",
-        sql.Bit,
-        d.is_active === undefined ? null : d.is_active ? 1 : 0,
-      ).query(`
-        UPDATE dbo.equipment_status
-        SET status_name   = COALESCE(@status_name, status_name),
-            description   = COALESCE(@description, description),
-            has_owner     = COALESCE(@has_owner, has_owner),
-            is_assignable = COALESCE(@is_assignable, is_assignable),
-            is_borrowable = COALESCE(@is_borrowable, is_borrowable),
-            sort_order    = COALESCE(@sort_order, sort_order),
-            is_active     = COALESCE(@is_active, is_active)
-        OUTPUT INSERTED.*
-        WHERE status_id = @id
-      `);
-
-    const row = updated.recordset[0];
 
     if (d.status_name && d.status_name !== oldName) {
-      await new sql.Request(transaction)
-        .input("id", sql.Int, id)
-        .input("new_name", sql.VarChar, d.status_name)
-        .query(
-          "UPDATE dbo.equipment SET status = @new_name WHERE status_id = @id",
-        );
+      await sequelize.query(
+        'UPDATE dbo.equipment SET status = :new_name WHERE status_id = :id',
+        { replacements: { id, new_name: d.status_name }, transaction },
+      );
     }
 
-    await transaction.commit();
     return row;
-  } catch (err) {
-    try {
-      await transaction.rollback();
-    } catch {
-      /* already rolled back */
-    }
-    throw err;
-  }
+  });
 }
 
 async function countUsage(id) {
-  const pool = await poolPromise;
-  const result = await pool.request().input("id", sql.Int, id).query(`
-      SELECT COUNT(*) AS equipment_count
-      FROM dbo.equipment WHERE status_id = @id
-    `);
-  return result.recordset[0].equipment_count;
+  const [row] = await sequelize.query(
+    'SELECT COUNT(*) AS equipment_count FROM dbo.equipment WHERE status_id = :id',
+    { replacements: { id }, type: QueryTypes.SELECT },
+  );
+  return row.equipment_count;
 }
 
+// Sequelize's destroy() doesn't return the deleted row - fetch first so the
+// caller still gets back what was removed.
 async function remove(id) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("id", sql.Int, id)
-    .query(
-      "DELETE FROM dbo.equipment_status OUTPUT DELETED.* WHERE status_id = @id",
-    );
-  return result.recordset[0] || null;
+  const row = await EquipmentStatus.findByPk(id, { raw: true });
+  if (!row) return null;
+  await EquipmentStatus.destroy({ where: { status_id: id } });
+  return row;
 }
 
 module.exports = {

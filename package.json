@@ -14,7 +14,9 @@
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "mssql": "^11.0.1",
-    "pdfkit": "^0.19.1"
+    "pdfkit": "^0.19.1",
+    "sequelize": "^6.37.8",
+    "tedious": "^20.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.4"

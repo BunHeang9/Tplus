@@ -86,7 +86,7 @@ const OWNER_DERIVED_FIELDS = new Set([
 
 // The employee detail page: their own info plus one entry per device they
 // own, each shaped by that device's category - the same column/custom-field
-// configuration the per-category equipment views use (categoryViewController),
+// configuration the per-category equipment views use (equipmentViewController),
 // so a Computer shows cpu/ram/hd while a Printer shows only what applies to
 // printers, instead of one flat row with every field from every category.
 async function getFull(req, res, next) {

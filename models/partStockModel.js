@@ -1,4 +1,5 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
 
 // Spare parts held in stock.
 //
@@ -13,6 +14,16 @@ const { sql, poolPromise } = require('../config/db');
 // (Installed, Borrowed, Working/Using...) because a device is in active
 // service; a loose part sitting in a box either still works or it doesn't.
 const STATUSES = ['Working - IT Stock', 'Broken - IT Stock'];
+
+// Raw queries with no model attribute definition return a plain string for a
+// DATETIME column; the driver this replaces returned a Date object for the
+// same column. Converting back keeps every response identical to before
+// this migration.
+function fixDates(row) {
+  if (!row) return row;
+  if (row.updated_at) row.updated_at = new Date(row.updated_at);
+  return row;
+}
 
 // "16", "16GB", "16gb", " 16 GB " all become "16 GB" - so the same real
 // value never fragments into different stock lines just because of how it
@@ -39,8 +50,6 @@ function parseNumericPartValue(value) {
 
 async function findAll(filters = {}) {
   const { part_type_id, status, in_stock_only } = filters;
-  const pool = await poolPromise;
-  const request = pool.request();
 
   let query = `
     SELECT s.stock_id, s.part_type_id, pt.part_name, pt.is_countable,
@@ -56,14 +65,15 @@ async function findAll(filters = {}) {
     JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
     WHERE 1=1
   `;
+  const replacements = {};
 
   if (part_type_id) {
-    query += ' AND s.part_type_id = @part_type_id';
-    request.input('part_type_id', sql.Int, part_type_id);
+    query += ' AND s.part_type_id = :part_type_id';
+    replacements.part_type_id = part_type_id;
   }
   if (status) {
-    query += ' AND s.status = @status';
-    request.input('status', sql.VarChar, status);
+    query += ' AND s.status = :status';
+    replacements.status = status;
   }
   // A line that has dropped to zero is history, not stock - the form should
   // not offer it.
@@ -73,15 +83,12 @@ async function findAll(filters = {}) {
   // ordering on it alone would group them unpredictably.
   query += ' ORDER BY pt.sort_order, COALESCE(s.part_value, s.model_name), s.status';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 // What can actually be fitted right now: working, and more than zero.
 async function findAvailable(partTypeId) {
-  const pool = await poolPromise;
-  const request = pool.request();
-
   let query = `
     SELECT s.stock_id, s.part_type_id, pt.part_name, pt.tracks_value,
            s.part_value, s.model_name, s.model_number,
@@ -96,129 +103,119 @@ async function findAvailable(partTypeId) {
       -- something sitting on a shelf.
       AND s.status = 'Working - IT Stock'
   `;
+  const replacements = {};
   if (partTypeId) {
-    query += ' AND s.part_type_id = @part_type_id';
-    request.input('part_type_id', sql.Int, partTypeId);
+    query += ' AND s.part_type_id = :part_type_id';
+    replacements.part_type_id = partTypeId;
   }
   query += ' ORDER BY pt.sort_order, COALESCE(s.part_value, s.model_name)';
 
-  const result = await request.query(query);
-  return result.recordset;
+  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
 }
 
 async function findById(stockId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, stockId)
-    .query(`
+  const rows = await sequelize.query(`
       SELECT s.*, pt.part_name, pt.is_countable
       FROM dbo.part_stock s
       JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-      WHERE s.stock_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE s.stock_id = :id
+    `, { replacements: { id: stockId }, type: QueryTypes.SELECT });
+  return fixDates(rows[0]) || null;
 }
 
 // Adds to stock, creating the line if this part, value and condition have not
 // been seen before. MERGE rather than insert-or-update in code, so two
 // simultaneous returns cannot both decide the row is missing.
+//
+// Accepts an optional external Sequelize transaction from callers that
+// already have one open (partBorrowModel.js's markReturned(), partModel.js's
+// create()/removeReplacement()), so the stock write commits or rolls back
+// with everything else that transaction touched.
 async function increment(partTypeId, partValue, status, qty, transaction, extra = {}) {
-  const pool = await poolPromise;
-  const request = transaction ? new sql.Request(transaction) : pool.request();
-
-  const result = await request
-    .input('part_type_id', sql.Int, partTypeId)
-    .input('part_value', sql.NVarChar, normalizePartValue(partValue) || null)
-    .input('model_name', sql.NVarChar, extra.model_name || null)
-    .input('model_number', sql.NVarChar, extra.model_number || null)
-    .input('disk_type', sql.VarChar, extra.disk_type || null)
-    .input('disk_interface', sql.VarChar, extra.disk_interface || null)
-    .input('ram_type', sql.VarChar, extra.ram_type || null)
-    .input('status', sql.VarChar, status || 'Working - IT Stock')
-    .input('qty', sql.Int, qty ?? 1)
-    .input('location', sql.VarChar, extra.location || null)
-    .input('remark', sql.NVarChar, extra.remark || null)
-    .query(`
+  const [row] = await sequelize.query(`
       MERGE dbo.part_stock AS target
-      USING (SELECT @part_type_id AS part_type_id) AS source
+      USING (SELECT :part_type_id AS part_type_id) AS source
       ON target.part_type_id = source.part_type_id
-         AND ISNULL(target.part_value, '')   = ISNULL(@part_value, '')
-         AND ISNULL(target.model_name, '')   = ISNULL(@model_name, '')
-         AND ISNULL(target.model_number, '') = ISNULL(@model_number, '')
-         AND ISNULL(target.disk_type, '')      = ISNULL(@disk_type, '')
-         AND ISNULL(target.disk_interface, '') = ISNULL(@disk_interface, '')
-        AND ISNULL(target.ram_type, '')       = ISNULL(@ram_type, '')
-         AND target.status = @status
+         AND ISNULL(target.part_value, '')   = ISNULL(:part_value, '')
+         AND ISNULL(target.model_name, '')   = ISNULL(:model_name, '')
+         AND ISNULL(target.model_number, '') = ISNULL(:model_number, '')
+         AND ISNULL(target.disk_type, '')      = ISNULL(:disk_type, '')
+         AND ISNULL(target.disk_interface, '') = ISNULL(:disk_interface, '')
+        AND ISNULL(target.ram_type, '')       = ISNULL(:ram_type, '')
+         AND target.status = :status
       WHEN MATCHED THEN
-        UPDATE SET quantity = target.quantity + @qty,
+        UPDATE SET quantity = target.quantity + :qty,
                    updated_at = GETDATE(),
-                   location = COALESCE(@location, target.location)
+                   location = COALESCE(:location, target.location)
       WHEN NOT MATCHED THEN
         INSERT (part_type_id, part_value, model_name, model_number,
                 disk_type, disk_interface, ram_type,
                 status, quantity, location, remark)
-        VALUES (@part_type_id, @part_value, @model_name, @model_number,
-                @disk_type, @disk_interface, @ram_type,
-                @status, @qty, @location, @remark)
+        VALUES (:part_type_id, :part_value, :model_name, :model_number,
+                :disk_type, :disk_interface, :ram_type,
+                :status, :qty, :location, :remark)
       OUTPUT INSERTED.*;
-    `);
-  return result.recordset[0];
+    `, {
+    replacements: {
+      part_type_id: partTypeId,
+      part_value: normalizePartValue(partValue) || null,
+      model_name: extra.model_name || null,
+      model_number: extra.model_number || null,
+      disk_type: extra.disk_type || null,
+      disk_interface: extra.disk_interface || null,
+      ram_type: extra.ram_type || null,
+      status: status || 'Working - IT Stock',
+      qty: qty ?? 1,
+      location: extra.location || null,
+      remark: extra.remark || null,
+    },
+    type: QueryTypes.SELECT,
+    transaction,
+  });
+  return fixDates(row);
 }
 
 // Takes from stock. Returns null when the line does not exist or is short,
 // rather than letting the quantity go negative - the caller turns that into a
-// clear message.
+// clear message. Same external-transaction interop as increment() above
+// (partBorrowModel.js's create(), partModel.js's create()).
 async function decrement(stockId, qty, transaction) {
-  const pool = await poolPromise;
-  const request = transaction ? new sql.Request(transaction) : pool.request();
-
-  const result = await request
-    .input('id', sql.Int, stockId)
-    .input('qty', sql.Int, qty ?? 1)
-    .query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.part_stock
-      SET quantity = quantity - @qty, updated_at = GETDATE()
+      SET quantity = quantity - :qty, updated_at = GETDATE()
       OUTPUT INSERTED.*
-      WHERE stock_id = @id AND quantity >= @qty
-    `);
-  return result.recordset[0] || null;
+      WHERE stock_id = :id AND quantity >= :qty
+    `, { replacements: { id: stockId, qty: qty ?? 1 }, type: QueryTypes.SELECT, transaction });
+  return fixDates(row) || null;
 }
 
 // Puts quantity back on a specific line by id - a return, where the part is
 // going back to exactly where it came from rather than being matched by
-// attributes the way increment() does for newly bought-in stock.
+// attributes the way increment() does for newly bought-in stock. Same
+// external-transaction interop as increment() above (partBorrowModel.js's
+// markReturned()/remove(), partModel.js's removeReplacement()).
 async function incrementById(stockId, qty, transaction) {
-  const pool = await poolPromise;
-  const request = transaction ? new sql.Request(transaction) : pool.request();
-
-  const result = await request
-    .input('id', sql.Int, stockId)
-    .input('qty', sql.Int, qty ?? 1)
-    .query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.part_stock
-      SET quantity = quantity + @qty, updated_at = GETDATE()
+      SET quantity = quantity + :qty, updated_at = GETDATE()
       OUTPUT INSERTED.*
-      WHERE stock_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE stock_id = :id
+    `, { replacements: { id: stockId, qty: qty ?? 1 }, type: QueryTypes.SELECT, transaction });
+  return fixDates(row) || null;
 }
 
-// Manual correction - a stock take, or parts bought in.
+// Manual correction - a stock take, or parts bought in. Self-contained, no
+// external transaction, so this one moved to a plain raw sequelize.query().
 async function setQuantity(stockId, quantity) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, stockId)
-    .input('quantity', sql.Int, quantity)
-    .query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.part_stock
-      SET quantity = @quantity, updated_at = GETDATE()
+      SET quantity = :quantity, updated_at = GETDATE()
       OUTPUT INSERTED.*
-      WHERE stock_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE stock_id = :id
+    `, { replacements: { id: stockId, quantity }, type: QueryTypes.SELECT });
+  return fixDates(row) || null;
 }
+
 // Edits a line: quantity, model details, status, remark or the active flag.
 //
 // Editing identifying fields (value, model, type, status) can turn a line
@@ -228,21 +225,20 @@ async function setQuantity(stockId, quantity) {
 // so rather than let the raw SQL error surface, the edit is merged into the
 // matching line instead: its quantity moves over and this row is removed.
 // Same behaviour increment() already uses when adding stock.
+//
+// Self-contained transaction (no external caller passes one in), so this
+// uses sequelize.transaction() - the individual statements stay raw
+// sequelize.query() calls since the clash-detection/merge logic doesn't map
+// onto plain ORM methods.
 async function updateLine(stockId, d) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
   const normalizedPartValue = d.part_value === undefined ? undefined : normalizePartValue(d.part_value);
 
-  try {
-    const current = await new sql.Request(transaction)
-      .input('id', sql.Int, stockId)
-      .query('SELECT * FROM dbo.part_stock WHERE stock_id = @id');
-    const existing = current.recordset[0];
-    if (!existing) {
-      await transaction.rollback();
-      return null;
-    }
+  return sequelize.transaction(async (transaction) => {
+    const [existing] = await sequelize.query(
+      'SELECT * FROM dbo.part_stock WHERE stock_id = :id',
+      { replacements: { id: stockId }, type: QueryTypes.SELECT, transaction },
+    );
+    if (!existing) return null;
 
     const resulting = {
       part_value: normalizedPartValue ?? existing.part_value,
@@ -254,116 +250,115 @@ async function updateLine(stockId, d) {
       status: d.status ?? existing.status,
     };
 
-    const clash = await new sql.Request(transaction)
-      .input('id', sql.Int, stockId)
-      .input('part_type_id', sql.Int, existing.part_type_id)
-      .input('part_value', sql.NVarChar, resulting.part_value)
-      .input('model_name', sql.NVarChar, resulting.model_name)
-      .input('model_number', sql.NVarChar, resulting.model_number)
-      .input('disk_type', sql.VarChar, resulting.disk_type)
-      .input('disk_interface', sql.VarChar, resulting.disk_interface)
-      .input('ram_type', sql.VarChar, resulting.ram_type)
-      .input('status', sql.VarChar, resulting.status)
-      .query(`
+    const [clashRow] = await sequelize.query(`
         SELECT TOP 1 stock_id FROM dbo.part_stock
-        WHERE stock_id <> @id
-          AND part_type_id = @part_type_id
-          AND ISNULL(part_value, '') = ISNULL(@part_value, '')
-          AND ISNULL(model_name, '') = ISNULL(@model_name, '')
-          AND ISNULL(model_number, '') = ISNULL(@model_number, '')
-          AND ISNULL(disk_type, '') = ISNULL(@disk_type, '')
-          AND ISNULL(disk_interface, '') = ISNULL(@disk_interface, '')
-          AND ISNULL(ram_type, '') = ISNULL(@ram_type, '')
-          AND status = @status
-      `);
-    const clashRow = clash.recordset[0];
+        WHERE stock_id <> :id
+          AND part_type_id = :part_type_id
+          AND ISNULL(part_value, '') = ISNULL(:part_value, '')
+          AND ISNULL(model_name, '') = ISNULL(:model_name, '')
+          AND ISNULL(model_number, '') = ISNULL(:model_number, '')
+          AND ISNULL(disk_type, '') = ISNULL(:disk_type, '')
+          AND ISNULL(disk_interface, '') = ISNULL(:disk_interface, '')
+          AND ISNULL(ram_type, '') = ISNULL(:ram_type, '')
+          AND status = :status
+      `, {
+      replacements: {
+        id: stockId,
+        part_type_id: existing.part_type_id,
+        part_value: resulting.part_value,
+        model_name: resulting.model_name,
+        model_number: resulting.model_number,
+        disk_type: resulting.disk_type,
+        disk_interface: resulting.disk_interface,
+        ram_type: resulting.ram_type,
+        status: resulting.status,
+      },
+      type: QueryTypes.SELECT,
+      transaction,
+    });
 
     let result;
     if (clashRow) {
-      const merged = await new sql.Request(transaction)
-        .input('id', sql.Int, clashRow.stock_id)
-        .input('qty', sql.Int, existing.quantity)
-        .query(`
+      const [merged] = await sequelize.query(`
           UPDATE dbo.part_stock
-          SET quantity = quantity + @qty, updated_at = GETDATE()
+          SET quantity = quantity + :qty, updated_at = GETDATE()
           OUTPUT INSERTED.*
-          WHERE stock_id = @id
-        `);
-      await new sql.Request(transaction)
-        .input('id', sql.Int, stockId)
-        .query('DELETE FROM dbo.part_stock WHERE stock_id = @id');
-      result = { ...merged.recordset[0], merged_from: stockId };
+          WHERE stock_id = :id
+        `, {
+        replacements: { id: clashRow.stock_id, qty: existing.quantity },
+        type: QueryTypes.SELECT,
+        transaction,
+      });
+      await sequelize.query(
+        'DELETE FROM dbo.part_stock WHERE stock_id = :id',
+        { replacements: { id: stockId }, transaction },
+      );
+      result = { ...fixDates(merged), merged_from: stockId };
     } else {
-      const updated = await new sql.Request(transaction)
-        .input('id', sql.Int, stockId)
-        .input('quantity', sql.Int, d.quantity)
-        .input('model_name', sql.NVarChar, d.model_name)
-        .input('model_number', sql.NVarChar, d.model_number)
-        .input('part_value', sql.NVarChar, normalizedPartValue)
-        .input('disk_type', sql.VarChar, d.disk_type)
-        .input('disk_interface', sql.VarChar, d.disk_interface)
-        .input('ram_type', sql.VarChar, d.ram_type)
-        .input('status', sql.VarChar, d.status)
-        .input('location', sql.VarChar, d.location)
-        .input('remark', sql.NVarChar, d.remark)
-        .input('is_active', sql.Bit, d.is_active === undefined ? null : (d.is_active ? 1 : 0))
-        .query(`
+      const [updated] = await sequelize.query(`
           UPDATE dbo.part_stock
-          SET quantity     = COALESCE(@quantity, quantity),
-              part_value   = COALESCE(@part_value, part_value),
-              model_name   = COALESCE(@model_name, model_name),
-              model_number = COALESCE(@model_number, model_number),
-              disk_type      = COALESCE(@disk_type, disk_type),
-              disk_interface = COALESCE(@disk_interface, disk_interface),
-              ram_type       = COALESCE(@ram_type, ram_type),
-              status       = COALESCE(@status, status),
-              location     = COALESCE(@location, location),
-              remark       = COALESCE(@remark, remark),
-              is_active    = COALESCE(@is_active, is_active),
+          SET quantity     = COALESCE(:quantity, quantity),
+              part_value   = COALESCE(:part_value, part_value),
+              model_name   = COALESCE(:model_name, model_name),
+              model_number = COALESCE(:model_number, model_number),
+              disk_type      = COALESCE(:disk_type, disk_type),
+              disk_interface = COALESCE(:disk_interface, disk_interface),
+              ram_type       = COALESCE(:ram_type, ram_type),
+              status       = COALESCE(:status, status),
+              location     = COALESCE(:location, location),
+              remark       = COALESCE(:remark, remark),
+              is_active    = COALESCE(:is_active, is_active),
               updated_at   = GETDATE()
           OUTPUT INSERTED.*
-          WHERE stock_id = @id
-        `);
-      result = updated.recordset[0] || null;
+          WHERE stock_id = :id
+        `, {
+        replacements: {
+          id: stockId,
+          quantity: d.quantity ?? null,
+          model_name: d.model_name ?? null,
+          model_number: d.model_number ?? null,
+          part_value: normalizedPartValue ?? null,
+          disk_type: d.disk_type ?? null,
+          disk_interface: d.disk_interface ?? null,
+          ram_type: d.ram_type ?? null,
+          status: d.status ?? null,
+          location: d.location ?? null,
+          remark: d.remark ?? null,
+          is_active: d.is_active === undefined ? null : (d.is_active ? 1 : 0),
+        },
+        type: QueryTypes.SELECT,
+        transaction,
+      });
+      result = fixDates(updated) || null;
     }
 
-    await transaction.commit();
     return result;
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+  });
 }
+
 // Clears part_stock_custom_value first - it references stock_id with no
 // cascade, so leaving it behind blocks the delete with a raw FK error
 // instead of succeeding cleanly. Same fix as partModel.removeType() needed
-// for part_type_custom_field.
+// for part_type_custom_field. Self-contained transaction, so this one uses
+// sequelize.transaction().
 async function remove(stockId) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
+  return sequelize.transaction(async (transaction) => {
+    await sequelize.query(
+      'DELETE FROM dbo.part_stock_custom_value WHERE stock_id = :id',
+      { replacements: { id: stockId }, transaction },
+    );
 
-  try {
-    await new sql.Request(transaction)
-      .input('id', sql.Int, stockId)
-      .query('DELETE FROM dbo.part_stock_custom_value WHERE stock_id = @id');
-
-    const result = await new sql.Request(transaction)
-      .input('id', sql.Int, stockId)
-      .query('DELETE FROM dbo.part_stock OUTPUT DELETED.* WHERE stock_id = @id');
-
-    await transaction.commit();
-    return result.recordset[0] || null;
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+    const [row] = await sequelize.query(
+      'DELETE FROM dbo.part_stock OUTPUT DELETED.* WHERE stock_id = :id',
+      { replacements: { id: stockId }, type: QueryTypes.SELECT, transaction },
+    );
+    return fixDates(row) || null;
+  });
 }
 
 // Totals for a dashboard tile.
 async function getSummary() {
-  const pool = await poolPromise;
-  const result = await pool.request().query(`
+  return sequelize.query(`
     SELECT pt.part_name,
            SUM(CASE WHEN s.status NOT LIKE '%Broken%' AND s.status NOT LIKE '%Retired%'
                     THEN s.quantity ELSE 0 END) AS working,
@@ -373,8 +368,7 @@ async function getSummary() {
     JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
     GROUP BY pt.part_name, pt.sort_order
     ORDER BY pt.sort_order
-  `);
-  return result.recordset;
+  `, { type: QueryTypes.SELECT });
 }
 
 module.exports = {

@@ -1,12 +1,26 @@
-const { sql, poolPromise } = require('../config/db');
+const { sql } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
+
+// Raw queries with no model attribute definition return a plain string for a
+// DATE column; the driver this replaces returned a Date object for the same
+// column. Converting back keeps every response identical to before this
+// migration. borrowed_on/due_back are the OUTER APPLY's borrow_date/
+// expected_return_date, same underlying DATE type.
+const DATE_FIELDS = ['purchase_date', 'received_date', 'assigned_date', 'borrowed_on', 'due_back'];
+function fixDates(row) {
+  if (!row) return row;
+  for (const f of DATE_FIELDS) {
+    if (row[f]) row[f] = new Date(row[f]);
+  }
+  return row;
+}
 
 // Builds the WHERE clause dynamically from whichever filters were supplied.
-// Every value goes through .input() so nothing is ever string-concatenated
-// into the SQL - that's what keeps this safe from injection.
+// Every value goes through a named replacement so nothing is ever string-
+// concatenated into the SQL - that's what keeps this safe from injection.
 async function findAll(filters = {}) {
   const { category, unowned, location, department, status, q } = filters;
-  const pool = await poolPromise;
-  const request = pool.request();
 
   let query = `
     SELECT e.*,
@@ -42,39 +56,40 @@ async function findAll(filters = {}) {
     LEFT JOIN dbo.employee br ON loan.borrower_id = br.employee_id
     WHERE 1=1
   `;
+  const replacements = {};
 
   // Accepts either ?category=Laptop (name) or ?category_id=5
   if (category) {
-    query += ' AND c.category_name = @category';
-    request.input('category', sql.VarChar, category);
+    query += ' AND c.category_name = :category';
+    replacements.category = category;
   }
   if (filters.category_id) {
-    query += ' AND e.category_id = @category_id';
-    request.input('category_id', sql.Int, filters.category_id);
+    query += ' AND e.category_id = :category_id';
+    replacements.category_id = filters.category_id;
   }
   if (unowned === 'true') {
     query += ' AND e.owner_id IS NULL';
   }
   if (location) {
-    query += ' AND e.location = @location';
-    request.input('location', sql.VarChar, location);
+    query += ' AND e.location = :location';
+    replacements.location = location;
   }
   if (department) {
-    query += ' AND d.department_code = @department';
-    request.input('department', sql.VarChar, department);
+    query += ' AND d.department_code = :department';
+    replacements.department = department;
   }
   if (filters.department_id) {
-    query += ' AND e.department_id = @department_id';
-    request.input('department_id', sql.Int, filters.department_id);
+    query += ' AND e.department_id = :department_id';
+    replacements.department_id = filters.department_id;
   }
   // Accepts either ?status=Working - IT Stock (name) or ?status_id=2
   if (status) {
-    query += ' AND st.status_name = @status';
-    request.input('status', sql.VarChar, status);
+    query += ' AND st.status_name = :status';
+    replacements.status = status;
   }
   if (filters.status_id) {
-    query += ' AND e.status_id = @status_id';
-    request.input('status_id', sql.Int, filters.status_id);
+    query += ' AND e.status_id = :status_id';
+    replacements.status_id = filters.status_id;
   }
   if (q) {
     // device_name and serial_no matter as much as computer_name/service_tag -
@@ -82,32 +97,28 @@ async function findAll(filters = {}) {
     // opposite of a laptop, so leaving either out silently misses whichever
     // category relies on it.
     query += ` AND (
-      e.computer_name  LIKE @q OR
-      e.device_name    LIKE @q OR
-      e.device_model   LIKE @q OR
-      e.asset_code LIKE @q OR
-      e.serial_no      LIKE @q OR
-      e.service_tag    LIKE @q OR
-      e.mac_address    LIKE @q OR
-      e.ip_address     LIKE @q OR
-      e.manufacturer   LIKE @q OR
-      emp.full_name    LIKE @q
+      e.computer_name  LIKE :q OR
+      e.device_name    LIKE :q OR
+      e.device_model   LIKE :q OR
+      e.asset_code LIKE :q OR
+      e.serial_no      LIKE :q OR
+      e.service_tag    LIKE :q OR
+      e.mac_address    LIKE :q OR
+      e.ip_address     LIKE :q OR
+      e.manufacturer   LIKE :q OR
+      emp.full_name    LIKE :q
     )`;
-    request.input('q', sql.NVarChar, `%${q}%`);
+    replacements.q = `%${q}%`;
   }
 
   query += ' ORDER BY c.category_name, e.equipment_id';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 async function findById(id) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query(`
+  const rows = await sequelize.query(`
       SELECT e.*,
              c.category_name,
              d.department_code,
@@ -139,14 +150,13 @@ async function findById(id) {
         ORDER BY b.borrow_date DESC
       ) AS loan
       LEFT JOIN dbo.employee br ON loan.borrower_id = br.employee_id
-      WHERE e.equipment_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE e.equipment_id = :id
+    `, { replacements: { id }, type: QueryTypes.SELECT });
+  return fixDates(rows[0]) || null;
 }
 
 async function getCategorySummary() {
-  const pool = await poolPromise;
-  const result = await pool.request().query(`
+  return sequelize.query(`
     SELECT c.category_id,
            c.category_name AS category,
            COUNT(e.equipment_id) AS total_items,
@@ -156,76 +166,40 @@ async function getCategorySummary() {
     LEFT JOIN dbo.equipment e ON e.category_id = c.category_id
     GROUP BY c.category_id, c.category_name
     ORDER BY c.category_name
-  `);
-  return result.recordset;
+  `, { type: QueryTypes.SELECT });
 }
 
 async function updateOwner(id, ownerId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .input('owner_id', sql.Int, ownerId || null)
-    .query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.equipment
-      SET owner_id = @owner_id
+      SET owner_id = :owner_id
       OUTPUT INSERTED.*
-      WHERE equipment_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE equipment_id = :id
+    `, { replacements: { id, owner_id: ownerId || null }, type: QueryTypes.SELECT });
+  return fixDates(row) || null;
 }
 
 // --- Stock workflow ---
 
 async function findByEquipmentCode(code) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("code", sql.VarChar, code)
-    .query(
-      "SELECT equipment_id, computer_name, device_model FROM dbo.equipment WHERE asset_code = @code",
-    );
-  return result.recordset[0] || null;
+  const rows = await sequelize.query(
+    'SELECT equipment_id, computer_name, device_model FROM dbo.equipment WHERE asset_code = :code',
+    { replacements: { code }, type: QueryTypes.SELECT },
+  );
+  return rows[0] || null;
 }
 
 async function findByServiceTag(tag) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('tag', sql.VarChar, tag)
-    .query('SELECT equipment_id, computer_name FROM dbo.equipment WHERE service_tag = @tag');
-  return result.recordset[0] || null;
+  const rows = await sequelize.query(
+    'SELECT equipment_id, computer_name FROM dbo.equipment WHERE service_tag = :tag',
+    { replacements: { tag }, type: QueryTypes.SELECT },
+  );
+  return rows[0] || null;
 }
 
 // New stock always starts with owner_id NULL - assignment is a separate step.
 async function createStock(d) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("category_id", sql.Int, d.category_id)
-    .input("device_type", sql.VarChar, d.device_type || null)
-    .input("device_model", sql.VarChar, d.device_model || null)
-    .input("manufacturer", sql.VarChar, d.manufacturer || null)
-    .input("service_tag", sql.VarChar, d.service_tag || null)
-    .input("serial_no", sql.VarChar, d.serial_no || null)
-    .input("product_id", sql.VarChar, d.product_id || null)
-    .input("mac_address", sql.VarChar, d.mac_address || null)
-    .input("ip_address", sql.VarChar, d.ip_address || null)
-    .input("os_type", sql.VarChar, d.os_type || null)
-    .input("os_version", sql.VarChar, d.os_version || null)
-    .input("cpu", sql.NVarChar, d.cpu || null)
-    .input("ram", sql.NVarChar, d.ram || null)
-    .input("hd", sql.NVarChar, d.hd || null)
-    .input("windows_license", sql.NVarChar, d.windows_license || null)
-    .input("av_license", sql.NVarChar, d.av_license || null)
-    .input("purchase_date", sql.Date, d.purchase_date || null)
-    .input("received_date", sql.Date, d.received_date || null)
-    .input("location", sql.VarChar, d.location || null)
-    .input("department_id", sql.Int, d.department_id || null)
-    .input("status", sql.VarChar, d.status || "Working - IT Stock")
-    .input("remark", sql.VarChar, d.remark || null)
-    .input("asset_code", sql.VarChar, d.asset_code || d.equipment_code || null)
-    .query(`
+  const [row] = await sequelize.query(`
       INSERT INTO dbo.equipment (
         category_id, device_type, device_model, manufacturer,
         asset_code, service_tag, serial_no, product_id,
@@ -236,84 +210,110 @@ async function createStock(d) {
       )
       OUTPUT INSERTED.*
       VALUES (
-        @category_id, @device_type, @device_model, @manufacturer,
-        @asset_code, @service_tag, @serial_no, @product_id,
-        @mac_address, @ip_address, @os_type, @os_version,
-        @cpu, @ram, @hd, @windows_license, @av_license,
-        @purchase_date, @received_date,
-        @location, @department_id, @status,
-        (SELECT status_id FROM dbo.equipment_status WHERE status_name = @status),
-        @remark, NULL
+        :category_id, :device_type, :device_model, :manufacturer,
+        :asset_code, :service_tag, :serial_no, :product_id,
+        :mac_address, :ip_address, :os_type, :os_version,
+        :cpu, :ram, :hd, :windows_license, :av_license,
+        :purchase_date, :received_date,
+        :location, :department_id, :status,
+        (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
+        :remark, NULL
       )
-    `);
-  return result.recordset[0];
+    `, {
+    replacements: {
+      category_id: d.category_id,
+      device_type: d.device_type || null,
+      device_model: d.device_model || null,
+      manufacturer: d.manufacturer || null,
+      service_tag: d.service_tag || null,
+      serial_no: d.serial_no || null,
+      product_id: d.product_id || null,
+      mac_address: d.mac_address || null,
+      ip_address: d.ip_address || null,
+      os_type: d.os_type || null,
+      os_version: d.os_version || null,
+      cpu: d.cpu || null,
+      ram: d.ram || null,
+      hd: d.hd || null,
+      windows_license: d.windows_license || null,
+      av_license: d.av_license || null,
+      purchase_date: d.purchase_date || null,
+      received_date: d.received_date || null,
+      location: d.location || null,
+      department_id: d.department_id || null,
+      status: d.status || 'Working - IT Stock',
+      remark: d.remark || null,
+      asset_code: d.asset_code || d.equipment_code || null,
+    },
+    type: QueryTypes.SELECT,
+  });
+  return fixDates(row);
 }
 
 // Every device this employee owns, with raw equipment columns plus category
 // and status names attached. Used to build the per-category equipment cards
 // on an employee's page - one row per device, grouped by category downstream.
 async function findByOwner(ownerId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('owner_id', sql.Int, ownerId)
-    .query(`
+  const rows = await sequelize.query(`
       SELECT e.*, c.category_name, st.status_name
       FROM dbo.equipment e
       LEFT JOIN dbo.category c ON e.category_id = c.category_id
       LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-      WHERE e.owner_id = @owner_id
+      WHERE e.owner_id = :owner_id
       ORDER BY c.category_name, e.equipment_id
-    `);
-  return result.recordset;
+    `, { replacements: { owner_id: ownerId }, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 async function findWithOwnerName(id) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query(`
+  const rows = await sequelize.query(`
       SELECT e.equipment_id, e.owner_id, e.computer_name, e.device_model,
              emp.full_name AS current_owner
       FROM dbo.equipment e
       LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      WHERE e.equipment_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE e.equipment_id = :id
+    `, { replacements: { id }, type: QueryTypes.SELECT });
+  return rows[0] || null;
 }
 
 async function assign(id, d) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .input('owner_id', sql.Int, d.owner_id)
-    .input('assigned_date', sql.Date, d.assigned_date || null)
-    .input('computer_name', sql.NVarChar, d.computer_name || null)
-    .input('ip_address', sql.VarChar, d.ip_address || null)
-    .input('location', sql.VarChar, d.location || null)
-    .input('department_id', sql.Int, d.department_id || null)
-    .input('status', sql.VarChar, d.status || null)
-    .query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.equipment
-      SET owner_id      = @owner_id,
-          assigned_date = COALESCE(@assigned_date, assigned_date),
-          computer_name = COALESCE(@computer_name, computer_name),
-          ip_address    = COALESCE(@ip_address, ip_address),
-          location      = COALESCE(@location, location),
-          department_id = COALESCE(@department_id, department_id),
-          status        = COALESCE(@status, status),
+      SET owner_id      = :owner_id,
+          assigned_date = COALESCE(:assigned_date, assigned_date),
+          computer_name = COALESCE(:computer_name, computer_name),
+          ip_address    = COALESCE(:ip_address, ip_address),
+          location      = COALESCE(:location, location),
+          department_id = COALESCE(:department_id, department_id),
+          status        = COALESCE(:status, status),
           status_id     = COALESCE(
-                              (SELECT status_id FROM dbo.equipment_status WHERE status_name = @status),
+                              (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
                               status_id)
       OUTPUT INSERTED.*
-      WHERE equipment_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE equipment_id = :id
+    `, {
+    replacements: {
+      id,
+      owner_id: d.owner_id,
+      assigned_date: d.assigned_date || null,
+      computer_name: d.computer_name || null,
+      ip_address: d.ip_address || null,
+      location: d.location || null,
+      department_id: d.department_id || null,
+      status: d.status || null,
+    },
+    type: QueryTypes.SELECT,
+  });
+  return fixDates(row) || null;
 }
+
 //Unassign
 // name=models/equipmentModel.js
+//
+// Still raw mssql, not Sequelize: these three take an external request built
+// from equipmentController.js's own sql.Transaction (a single transaction
+// covering "one, several, or all-by-owner" in one call), and the controller
+// reads back result.recordset directly - the raw mssql result shape.
 async function unassignById(
   request,
   equipmentId,
@@ -392,8 +392,6 @@ async function unassignByOwnerId(
 // Those carry status 'Installed' and are excluded, so the assign dropdown
 // only offers real stock.
 async function findAvailable(category, includeInstalled) {
-  const pool = await poolPromise;
-  const request = pool.request();
   let query = `
     SELECT e.equipment_id, e.category_id, c.category_name AS category,
            e.device_type, e.computer_name, e.device_model,
@@ -407,6 +405,7 @@ async function findAvailable(category, includeInstalled) {
     LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
     WHERE e.owner_id IS NULL
   `;
+  const replacements = {};
 
   // Driven by the is_assignable flag on dbo.equipment_status rather than a
   // hardcoded list, so changing the rule is a data change, not a code change.
@@ -416,22 +415,18 @@ async function findAvailable(category, includeInstalled) {
     query += ' AND st.is_assignable = 1';
   }
   if (category) {
-    query += ' AND c.category_name = @category';
-    request.input('category', sql.VarChar, category);
+    query += ' AND c.category_name = :category';
+    replacements.category = category;
   }
   query += ' ORDER BY e.received_date DESC, e.equipment_id DESC';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 // Falls back to purchase_date where received_date was never recorded.
 async function findByDateRange(from, to) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("from", sql.Date, from)
-    .input("to", sql.Date, to).query(`
+  const rows = await sequelize.query(`
       SELECT e.equipment_id, e.category_id, c.category_name AS category,
              e.device_type, e.computer_name, e.device_model,
              e.manufacturer, e.asset_code, e.service_tag,
@@ -444,98 +439,96 @@ async function findByDateRange(from, to) {
       LEFT JOIN dbo.category c ON e.category_id = c.category_id
       LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
       LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      WHERE COALESCE(e.received_date, e.purchase_date) BETWEEN @from AND @to
+      WHERE COALESCE(e.received_date, e.purchase_date) BETWEEN :from AND :to
       ORDER BY COALESCE(e.received_date, e.purchase_date), e.equipment_id
-    `);
-  return result.recordset;
+    `, { replacements: { from, to }, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 // Full detail update. COALESCE means only the fields actually supplied
 // change - omitting a field leaves it alone rather than nulling it.
 async function update(id, d) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("id", sql.Int, id)
-    .input("category_id", sql.Int, d.category_id)
-    .input("device_type", sql.VarChar, d.device_type)
-    .input("device_model", sql.VarChar, d.device_model)
-    .input("computer_name", sql.NVarChar, d.computer_name)
-    .input("manufacturer", sql.VarChar, d.manufacturer)
-    .input("serial_no", sql.VarChar, d.serial_no)
-    .input("service_tag", sql.VarChar, d.service_tag)
-    .input("product_id", sql.VarChar, d.product_id)
-    .input("asset_code", sql.VarChar, d.asset_code ?? d.equipment_code)
-    .input("mac_address", sql.VarChar, d.mac_address)
-    .input("ip_address", sql.VarChar, d.ip_address)
-    .input("os_type", sql.VarChar, d.os_type)
-    .input("os_version", sql.VarChar, d.os_version)
-    .input("cpu", sql.NVarChar, d.cpu)
-    .input("ram", sql.NVarChar, d.ram)
-    .input("hd", sql.NVarChar, d.hd)
-    .input("windows_license", sql.NVarChar, d.windows_license)
-    .input("av_license", sql.NVarChar, d.av_license)
-    .input("location", sql.VarChar, d.location)
-    .input("department_id", sql.Int, d.department_id)
-    .input("status", sql.VarChar, d.status)
-    .input("purchase_date", sql.Date, d.purchase_date)
-    .input("received_date", sql.Date, d.received_date)
-    .input("assigned_date", sql.Date, d.assigned_date)
-    .input("remark", sql.VarChar, d.remark).query(`
+  const [row] = await sequelize.query(`
       UPDATE dbo.equipment
-      SET category_id     = COALESCE(@category_id, category_id),
-          device_type     = COALESCE(@device_type, device_type),
-          device_model    = COALESCE(@device_model, device_model),
-          computer_name   = COALESCE(@computer_name, computer_name),
-          manufacturer    = COALESCE(@manufacturer, manufacturer),
-          serial_no       = COALESCE(@serial_no, serial_no),
-          service_tag     = COALESCE(@service_tag, service_tag),
-          product_id      = COALESCE(@product_id, product_id),
-          asset_code      = COALESCE(@asset_code, asset_code),
-          mac_address     = COALESCE(@mac_address, mac_address),
-          ip_address      = COALESCE(@ip_address, ip_address),
-          os_type         = COALESCE(@os_type, os_type),
-          os_version      = COALESCE(@os_version, os_version),
-          cpu             = COALESCE(@cpu, cpu),
-          ram             = COALESCE(@ram, ram),
-          hd              = COALESCE(@hd, hd),
-          windows_license = COALESCE(@windows_license, windows_license),
-          av_license      = COALESCE(@av_license, av_license),
-          location        = COALESCE(@location, location),
-          department_id   = COALESCE(@department_id, department_id),
-          status          = COALESCE(@status, status),
+      SET category_id     = COALESCE(:category_id, category_id),
+          device_type     = COALESCE(:device_type, device_type),
+          device_model    = COALESCE(:device_model, device_model),
+          computer_name   = COALESCE(:computer_name, computer_name),
+          manufacturer    = COALESCE(:manufacturer, manufacturer),
+          serial_no       = COALESCE(:serial_no, serial_no),
+          service_tag     = COALESCE(:service_tag, service_tag),
+          product_id      = COALESCE(:product_id, product_id),
+          asset_code      = COALESCE(:asset_code, asset_code),
+          mac_address     = COALESCE(:mac_address, mac_address),
+          ip_address      = COALESCE(:ip_address, ip_address),
+          os_type         = COALESCE(:os_type, os_type),
+          os_version      = COALESCE(:os_version, os_version),
+          cpu             = COALESCE(:cpu, cpu),
+          ram             = COALESCE(:ram, ram),
+          hd              = COALESCE(:hd, hd),
+          windows_license = COALESCE(:windows_license, windows_license),
+          av_license      = COALESCE(:av_license, av_license),
+          location        = COALESCE(:location, location),
+          department_id   = COALESCE(:department_id, department_id),
+          status          = COALESCE(:status, status),
           status_id       = COALESCE(
-                                (SELECT status_id FROM dbo.equipment_status WHERE status_name = @status),
+                                (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
                                 status_id),
-          purchase_date   = COALESCE(@purchase_date, purchase_date),
-          received_date   = COALESCE(@received_date, received_date),
-          assigned_date   = COALESCE(@assigned_date, assigned_date),
-          remark          = COALESCE(@remark, remark)
-          
+          purchase_date   = COALESCE(:purchase_date, purchase_date),
+          received_date   = COALESCE(:received_date, received_date),
+          assigned_date   = COALESCE(:assigned_date, assigned_date),
+          remark          = COALESCE(:remark, remark)
+
       OUTPUT INSERTED.*
-      WHERE equipment_id = @id
-    `);
-  return result.recordset[0] || null;
+      WHERE equipment_id = :id
+    `, {
+    replacements: {
+      id,
+      category_id: d.category_id ?? null,
+      device_type: d.device_type ?? null,
+      device_model: d.device_model ?? null,
+      computer_name: d.computer_name ?? null,
+      manufacturer: d.manufacturer ?? null,
+      serial_no: d.serial_no ?? null,
+      service_tag: d.service_tag ?? null,
+      product_id: d.product_id ?? null,
+      asset_code: d.asset_code ?? d.equipment_code ?? null,
+      mac_address: d.mac_address ?? null,
+      ip_address: d.ip_address ?? null,
+      os_type: d.os_type ?? null,
+      os_version: d.os_version ?? null,
+      cpu: d.cpu ?? null,
+      ram: d.ram ?? null,
+      hd: d.hd ?? null,
+      windows_license: d.windows_license ?? null,
+      av_license: d.av_license ?? null,
+      location: d.location ?? null,
+      department_id: d.department_id ?? null,
+      status: d.status ?? null,
+      purchase_date: d.purchase_date ?? null,
+      received_date: d.received_date ?? null,
+      assigned_date: d.assigned_date ?? null,
+      remark: d.remark ?? null,
+    },
+    type: QueryTypes.SELECT,
+  });
+  return fixDates(row) || null;
 }
 
 // Counts everything pointing at this equipment. Delete is refused while any
 // of these exist, otherwise we would orphan borrow history, antivirus records
 // and replacement history.
 async function countReferences(id) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, id)
-    .query(`
+  const [row] = await sequelize.query(`
       SELECT
-        (SELECT COUNT(*) FROM dbo.borrow_record      WHERE equipment_id = @id) AS borrow_records,
-        (SELECT COUNT(*) FROM dbo.antivirus_install  WHERE equipment_id = @id) AS antivirus_records,
-        (SELECT COUNT(*) FROM dbo.server_usage       WHERE equipment_id = @id) AS server_usage_records,
-        (SELECT COUNT(*) FROM dbo.ssd_upgrade        WHERE equipment_id = @id) AS ssd_upgrade_records,
-        (SELECT COUNT(*) FROM dbo.device_replacement WHERE old_equipment_id = @id
-                                                        OR new_equipment_id = @id) AS replacement_records
-    `);
-  return result.recordset[0];
+        (SELECT COUNT(*) FROM dbo.borrow_record      WHERE equipment_id = :id) AS borrow_records,
+        (SELECT COUNT(*) FROM dbo.antivirus_install  WHERE equipment_id = :id) AS antivirus_records,
+        (SELECT COUNT(*) FROM dbo.server_usage       WHERE equipment_id = :id) AS server_usage_records,
+        (SELECT COUNT(*) FROM dbo.ssd_upgrade        WHERE equipment_id = :id) AS ssd_upgrade_records,
+        (SELECT COUNT(*) FROM dbo.device_replacement WHERE old_equipment_id = :id
+                                                        OR new_equipment_id = :id) AS replacement_records
+    `, { replacements: { id }, type: QueryTypes.SELECT });
+  return row;
 }
 
 // Captures the row into the recycle bin before removing it, both in one
@@ -544,24 +537,20 @@ async function countReferences(id) {
 //
 // Custom field values go into the snapshot too, otherwise restoring would
 // bring back the device without whatever an admin had recorded against it.
+//
+// Self-contained now that recycleBinModel.create() itself takes a Sequelize
+// transaction. customFieldModel.getValues() runs on its own connection,
+// outside this transaction, exactly as it did before this migration.
 async function remove(id, actor) {
   const recycleBinModel = require('./recycleBinModel');
   const customFieldModel = require('./customFieldModel');
 
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
-
-  try {
-    const row = await new sql.Request(transaction)
-      .input("id", sql.Int, id)
-      .query("SELECT * FROM dbo.equipment WHERE equipment_id = @id");
-
-    const equipment = row.recordset[0];
-    if (!equipment) {
-      await transaction.rollback();
-      return null;
-    }
+  return sequelize.transaction(async (transaction) => {
+    const [equipment] = await sequelize.query(
+      'SELECT * FROM dbo.equipment WHERE equipment_id = :id',
+      { replacements: { id }, type: QueryTypes.SELECT, transaction },
+    );
+    if (!equipment) return null;
 
     let customValues = [];
     try {
@@ -578,30 +567,23 @@ async function remove(id, actor) {
 
     await recycleBinModel.create(
       {
-        entityType: "equipment",
+        entityType: 'equipment',
         entityId: id,
         entityLabel: label,
         entityData: { ...equipment, _custom_values: customValues },
         actor,
-        reason: "Equipment deleted",
+        reason: 'Equipment deleted',
       },
       transaction,
     );
 
-    await new sql.Request(transaction)
-      .input("id", sql.Int, id)
-      .query("DELETE FROM dbo.equipment WHERE equipment_id = @id");
+    await sequelize.query(
+      'DELETE FROM dbo.equipment WHERE equipment_id = :id',
+      { replacements: { id }, transaction },
+    );
 
-    await transaction.commit();
     return equipment;
-  } catch (err) {
-    try {
-      await transaction.rollback();
-    } catch {
-      /* already rolled back */
-    }
-    throw err;
-  }
+  });
 }
 
 module.exports = {

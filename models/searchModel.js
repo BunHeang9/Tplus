@@ -1,13 +1,15 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
 
 // Universal search across employees AND equipment.
 // Returns one flat array so the frontend can render a single results table;
 // each row carries a match_type so the UI can badge them differently.
+//
+// A hand-built UNION ALL with NULL-padding to align column counts between
+// two very different entity shapes - raw query through Sequelize, not
+// something that maps onto ORM syntax at all.
 async function searchAll(term) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input("term", sql.NVarChar, `%${term.trim()}%`).query(`
+  return sequelize.query(`
       SELECT
         'Equipment' AS match_type,
         e.equipment_id,
@@ -17,7 +19,7 @@ async function searchAll(term) {
         e.computer_name,
         e.device_model,
         e.manufacturer,
-        e.asset_code
+        e.asset_code,
         e.service_tag,
         e.mac_address,
         e.ip_address,
@@ -36,22 +38,22 @@ async function searchAll(term) {
       LEFT JOIN dbo.department eqd ON e.department_id = eqd.department_id
       LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
       LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      WHERE e.device_name      LIKE @term
-         OR e.computer_name    LIKE @term
-         OR e.device_model     LIKE @term
-         OR e.asset_code  LIKE @term
-         OR e.service_tag      LIKE @term
-         OR e.mac_address      LIKE @term
-         OR e.ip_address       LIKE @term
-         OR e.manufacturer     LIKE @term
-         OR c.category_name    LIKE @term
-         OR e.device_type      LIKE @term
-         OR e.location         LIKE @term
-         OR eqd.department_code LIKE @term
-         OR e.status           LIKE @term
-         OR e.remark           LIKE @term
-         OR e.cpu              LIKE @term
-         OR emp.full_name      LIKE @term
+      WHERE e.device_name      LIKE :term
+         OR e.computer_name    LIKE :term
+         OR e.device_model     LIKE :term
+         OR e.asset_code  LIKE :term
+         OR e.service_tag      LIKE :term
+         OR e.mac_address      LIKE :term
+         OR e.ip_address       LIKE :term
+         OR e.manufacturer     LIKE :term
+         OR c.category_name    LIKE :term
+         OR e.device_type      LIKE :term
+         OR e.location         LIKE :term
+         OR eqd.department_code LIKE :term
+         OR e.status           LIKE :term
+         OR e.remark           LIKE :term
+         OR e.cpu              LIKE :term
+         OR emp.full_name      LIKE :term
 
       UNION ALL
 
@@ -67,16 +69,18 @@ async function searchAll(term) {
         emp.location AS owner_location
       FROM dbo.employee emp
       LEFT JOIN dbo.department empd2 ON emp.department_id = empd2.department_id
-      WHERE (emp.full_name        LIKE @term
-          OR emp.position         LIKE @term
-          OR empd2.department_code LIKE @term
-          OR emp.location         LIKE @term
-          OR emp.staff_code       LIKE @term)
+      WHERE (emp.full_name        LIKE :term
+          OR emp.position         LIKE :term
+          OR empd2.department_code LIKE :term
+          OR emp.location         LIKE :term
+          OR emp.staff_code       LIKE :term)
         AND NOT EXISTS (SELECT 1 FROM dbo.equipment eq WHERE eq.owner_id = emp.employee_id)
 
       ORDER BY match_type, owner_name, computer_name;
-    `);
-  return result.recordset;
+  `, {
+    replacements: { term: `%${term.trim()}%` },
+    type: QueryTypes.SELECT,
+  });
 }
 
 module.exports = { searchAll };

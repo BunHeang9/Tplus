@@ -1,4 +1,7 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
+const CategoryViewColumn = require('./sequelize/categoryViewColumnModel');
+const Category = require('./sequelize/categoryModel');
 
 // Which columns each category's view shows (dbo.category_view_column).
 //
@@ -69,17 +72,17 @@ const DERIVED_FIELDS = [
 // up on its own - no entry needed.
 
 // Every field an admin can choose from, read live from the schema so a column
-// added later shows up without touching this file.
+// added later shows up without touching this file. INFORMATION_SCHEMA
+// introspection - raw query, not something an ORM model represents.
 async function getAvailableFields() {
-  const pool = await poolPromise;
-  const result = await pool.request().query(`
+  const cols = await sequelize.query(`
     SELECT COLUMN_NAME, DATA_TYPE
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo'
     ORDER BY ORDINAL_POSITION
-  `);
+  `, { type: QueryTypes.SELECT });
 
-  const direct = result.recordset
+  const direct = cols
     .filter((c) => !HIDDEN_FROM_PICKER.has(c.COLUMN_NAME))
     .map((c) => ({
       field: c.COLUMN_NAME,
@@ -97,50 +100,38 @@ async function getAvailableFields() {
 async function isValidField(fieldName) {
   if (DERIVED_FIELDS.some((f) => f.field === fieldName)) return true;
 
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('field', sql.VarChar, fieldName)
-    .query(`
-      SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME = @field
-    `);
-  return result.recordset.length > 0;
+  const [row] = await sequelize.query(`
+    SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME = :field
+  `, { replacements: { field: fieldName }, type: QueryTypes.SELECT });
+  return !!row;
 }
 
 async function findByCategory(categoryId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('category_id', sql.Int, categoryId)
-    .query(`
-      SELECT view_column_id, category_id, field_name, header_text, sort_order, is_editable
-      FROM dbo.category_view_column
-      WHERE category_id = @category_id
-      ORDER BY sort_order, view_column_id
-    `);
-  return result.recordset;
+  return CategoryViewColumn.findAll({
+    attributes: ['view_column_id', 'category_id', 'field_name', 'header_text', 'sort_order', 'is_editable'],
+    where: { category_id: categoryId },
+    order: [['sort_order', 'ASC'], ['view_column_id', 'ASC']],
+    raw: true,
+  });
 }
 
+// A LEFT JOIN from category to its columns - raw query, since a category
+// with none configured still needs to come back (with an empty column set),
+// not be silently dropped the way an INNER-JOIN-shaped association would.
 async function findByViewKey(viewKey) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('view_key', sql.VarChar, viewKey)
-    .query(`
-      SELECT c.category_id, c.category_name, c.view_key,
-             v.field_name, v.header_text, v.sort_order, v.is_editable
-      FROM dbo.category c
-      LEFT JOIN dbo.category_view_column v ON c.category_id = v.category_id
-      WHERE c.view_key = @view_key
-      ORDER BY v.sort_order, v.view_column_id
-    `);
-  return result.recordset;
+  return sequelize.query(`
+    SELECT c.category_id, c.category_name, c.view_key,
+           v.field_name, v.header_text, v.sort_order, v.is_editable
+    FROM dbo.category c
+    LEFT JOIN dbo.category_view_column v ON c.category_id = v.category_id
+    WHERE c.view_key = :view_key
+    ORDER BY v.sort_order, v.view_column_id
+  `, { replacements: { view_key: viewKey }, type: QueryTypes.SELECT });
 }
 
 async function listViews() {
-  const pool = await poolPromise;
-  const result = await pool.request().query(`
+  return sequelize.query(`
     SELECT c.category_id, c.view_key, c.category_name,
            COUNT(v.view_column_id) AS column_count,
            (SELECT COUNT(*) FROM dbo.equipment e WHERE e.category_id = c.category_id) AS item_count
@@ -149,52 +140,33 @@ async function listViews() {
     WHERE c.is_active = 1
     GROUP BY c.category_id, c.view_key, c.category_name
     ORDER BY c.category_name
-  `);
-  return result.recordset;
+  `, { type: QueryTypes.SELECT });
 }
 
 // Replaces the whole set for a category in one transaction. Saving a partial
 // list would leave a view half-configured if something failed midway.
 async function replaceColumns(categoryId, columns) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
+  await sequelize.transaction(async (transaction) => {
+    await CategoryViewColumn.destroy({ where: { category_id: categoryId }, transaction });
 
-  try {
-    await new sql.Request(transaction)
-      .input('category_id', sql.Int, categoryId)
-      .query('DELETE FROM dbo.category_view_column WHERE category_id = @category_id');
-
-    for (let i = 0; i < columns.length; i += 1) {
-      const col = columns[i];
-      await new sql.Request(transaction)
-        .input('category_id', sql.Int, categoryId)
-        .input('field_name', sql.VarChar, col.field)
-        .input('header_text', sql.NVarChar, col.header)
-        .input('sort_order', sql.Int, i + 1)
-        .input('is_editable', sql.Bit, col.editable === false ? 0 : 1)
-        .query(`
-          INSERT INTO dbo.category_view_column
-            (category_id, field_name, header_text, sort_order, is_editable)
-          VALUES (@category_id, @field_name, @header_text, @sort_order, @is_editable)
-        `);
+    if (columns.length > 0) {
+      await CategoryViewColumn.bulkCreate(
+        columns.map((col, i) => ({
+          category_id: categoryId,
+          field_name: col.field,
+          header_text: col.header,
+          sort_order: i + 1,
+          is_editable: col.editable !== false,
+        })),
+        { transaction },
+      );
     }
-
-    await transaction.commit();
-    return await findByCategory(categoryId);
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+  });
+  return findByCategory(categoryId);
 }
 
 async function findCategoryByViewKey(viewKey) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('view_key', sql.VarChar, viewKey)
-    .query('SELECT * FROM dbo.category WHERE view_key = @view_key AND is_active = 1');
-  return result.recordset[0] || null;
+  return Category.findOne({ where: { view_key: viewKey, is_active: true }, raw: true });
 }
 
 module.exports = {

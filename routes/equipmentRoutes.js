@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const softwareLicenseController = require("../controllers/softwareLicenseController");
 const equipmentController = require('../controllers/equipmentController');
-const categoryViewController = require("../controllers/categoryViewController");
+const equipmentViewController = require("../controllers/equipmentViewController");
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { auditActivity } = require("../middleware/auditActivity");
 const partController = require("../controllers/partController");
@@ -17,7 +17,11 @@ const numeric = '\\d+';
 
 router.get('/categories', authenticate, equipmentController.getCategories);
 router.get("/licenses", authenticate, softwareLicenseController.getAllLicenses);
-router.get("/views", authenticate, categoryViewController.getViews);
+// Reverse lookup: which devices use this licence - /licenses/:id/equipment,
+// declared here (before the numeric /:id routes below) since "licenses" is a
+// fixed path, not a device id.
+router.get("/licenses/:id/equipment", authenticate, softwareLicenseController.getLicenseEquipment);
+router.get("/views", authenticate, equipmentViewController.getViews);
 
 router.post(
   "/unassign",
@@ -37,21 +41,21 @@ router.get(`/:id(${numeric})`, authenticate, equipmentController.getById);
 router.get(
   `/:id(${numeric})/licenses`,
   authenticate,
-  equipmentController.getEquipmentLicenses,
+  softwareLicenseController.getEquipmentLicenses,
 );
 router.post(
   `/:id(${numeric})/licenses`,
   authenticate,
   requireAdmin,
   auditActivity("equipment", "assign-license"),
-  equipmentController.assignLicense,
+  softwareLicenseController.assignLicense,
 );
 router.delete(
   `/:id(${numeric})/licenses/:licenseId`,
   authenticate,
   requireAdmin,
   auditActivity("equipment", "remove-license"),
-  equipmentController.removeLicense,
+  softwareLicenseController.unassignLicense,
 );
 router.get(`/:id(${numeric})/part-replacements`, authenticate, partController.getByEquipment);
 router.post(`/:id(${numeric})/part-replacements`, authenticate, requireAdmin,
@@ -83,19 +87,19 @@ router.delete(
 // Per-category views: /api/equipment/cctv, /laptop, /printer and any category
 // added later. The handler returns 404 with the valid list if the key is
 // unknown, so a typo gives a useful message rather than a confusing one.
-router.get("/:view", authenticate, categoryViewController.getByView);
+router.get("/:view", authenticate, equipmentViewController.getByView);
 router.post(
   "/:view",
   authenticate,
   requireAdmin,
   auditActivity("equipment", "create"),
-  categoryViewController.createInView,
+  equipmentViewController.createInView,
 );
 router.put(
   "/:view/:id",
   authenticate,
   auditActivity("equipment"),
-  categoryViewController.updateInView,
+  equipmentViewController.updateInView,
 );
 
 module.exports = router;

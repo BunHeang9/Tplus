@@ -1,7 +1,7 @@
 const { sql, poolPromise } = require('../config/db');
 const equipmentModel = require('../models/equipmentModel');
 const employeeModel = require('../models/employeeModel');
-const categoryColumns = require('../models/columnLayout');
+const categoryColumns = require('../utils/categoryColumns');
 
 // The assign page: pick an unowned device, pick a position, pick someone in
 // that position, choose a status.
@@ -109,29 +109,6 @@ async function getAvailableEquipment(req, res, next) {
         display_name: r.display_name,
       })),
     });
-  } catch (err) {
-    next(err);
-  }
-}
-
-// GET /api/assign/positions
-//
-// Every position held by an active employee, with a headcount - so the
-// dropdown can read "IT Developer (5)" and an empty pick is impossible.
-async function getPositions(req, res, next) {
-  try {
-    const pool = await poolPromise;
-    const result = await pool.request().query(`
-      SELECT emp.position,
-             COUNT(*) AS employee_count
-      FROM dbo.employee emp
-      WHERE emp.position IS NOT NULL
-        AND LTRIM(RTRIM(emp.position)) <> ''
-        AND emp.is_active = 1
-      GROUP BY emp.position
-      ORDER BY emp.position
-    `);
-    res.json({ count: result.recordset.length, positions: result.recordset });
   } catch (err) {
     next(err);
   }
@@ -298,7 +275,6 @@ async function assign(req, res, next) {
 
 module.exports = {
   getAvailableEquipment,
-  getPositions,
   getEmployees,
   getFormData,
   assign,

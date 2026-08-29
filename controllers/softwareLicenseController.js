@@ -14,6 +14,17 @@ async function getAllLicenses(req, res, next) {
   }
 }
 
+// GET /api/licenses - the license admin list. A bare array, unlike
+// getAllLicenses above - different callers, different shape, both already
+// relied on by whatever's consuming them today.
+async function getLicenses(req, res, next) {
+  try {
+    res.json(await softwareLicenseModel.getAllLicenses());
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/equipment/:id/licenses
 async function getEquipmentLicenses(req, res, next) {
   try {
@@ -104,7 +115,9 @@ async function assignLicense(req, res, next) {
 }
 
 // DELETE /api/equipment/:id/licenses/:licenseId
-async function removeLicense(req, res, next) {
+// Named unassignLicense, not removeLicense - that name is for deleting the
+// license definition itself, below, a different and much bigger operation.
+async function unassignLicense(req, res, next) {
   try {
     const removed = await softwareLicenseModel.removeLicenseFromEquipment(
       req.params.id, req.params.licenseId
@@ -125,10 +138,92 @@ async function removeLicense(req, res, next) {
   }
 }
 
+// --- license definitions ---
+
+// POST /api/licenses  (admin)
+async function createLicense(req, res, next) {
+  const { product_name, license_type } = req.body;
+
+  if (!product_name) {
+    return res.status(400).json({ error: 'product_name is required' });
+  }
+  if (!license_type) {
+    return res.status(400).json({
+      error: 'license_type is required',
+      validValues: ['Free', 'Annual Subscription', 'Perpetual'],
+    });
+  }
+  if (!['Free', 'Annual Subscription', 'Perpetual'].includes(license_type)) {
+    return res.status(400).json({
+      error: 'license_type must be one of: Free, Annual Subscription, or Perpetual',
+    });
+  }
+  if (license_type === 'Annual Subscription' && !req.body.date_expire) {
+    return res.status(400).json({
+      error: 'date_expire is required for Annual Subscription licenses',
+      hint: 'For Free and Perpetual licenses, date_expire can be null',
+    });
+  }
+  if (req.body.status) {
+    return res.status(400).json({
+      error: 'status cannot be set manually',
+      hint: 'Status is automatically calculated from license_type: Free/Perpetual = active, Annual Subscription = based on dates (pending, active, near expire, expired)',
+    });
+  }
+
+  try {
+    const license = await softwareLicenseModel.createLicense(req.body);
+    res.status(201).json({ message: 'Software license created', license });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PUT /api/licenses/:id  (admin)
+async function updateLicense(req, res, next) {
+  if (req.body.status) {
+    return res.status(400).json({
+      error: 'status cannot be set manually',
+      hint: 'Status is automatically recalculated based on license_type and dates',
+    });
+  }
+  if (req.body.license_type && !['Free', 'Annual Subscription', 'Perpetual'].includes(req.body.license_type)) {
+    return res.status(400).json({
+      error: 'license_type must be one of: Free, Annual Subscription, or Perpetual',
+    });
+  }
+
+  try {
+    const license = await softwareLicenseModel.updateLicense(req.params.id, req.body);
+    if (!license) return res.status(404).json({ error: 'Software license not found' });
+    res.json({ message: 'Software license updated', license });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/licenses/:id  (admin) - the definition, not one device's use of it
+async function removeLicense(req, res, next) {
+  try {
+    const license = await softwareLicenseModel.removeLicense(req.params.id, req.user);
+    if (!license) return res.status(404).json({ error: 'Software license not found' });
+    res.json({
+      message: `Software license "${license.product_name}" moved to the recycle bin`,
+      license,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   getAllLicenses,
+  getLicenses,
   getEquipmentLicenses,
   getLicenseEquipment,
   assignLicense,
+  unassignLicense,
+  createLicense,
+  updateLicense,
   removeLicense,
 };

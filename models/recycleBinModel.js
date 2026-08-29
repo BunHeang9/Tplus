@@ -1,4 +1,5 @@
 const { sql, poolPromise } = require('../config/db');
+const { RecycleBin, RecycleBinView } = require('./sequelize/recycleBinModel');
 
 // Deleted records held for admin review.
 //
@@ -17,62 +18,37 @@ const RESTORE_TARGETS = {
 };
 
 // Pass a transaction when the caller already has one open - the bin write
-// must succeed or fail together with the delete it belongs to.
+// must succeed or fail together with the delete it belongs to. Now that
+// every caller has itself been migrated, that transaction is a Sequelize
+// one (from sequelize.transaction()), not a raw sql.Transaction.
 async function create({ entityType, entityId, entityLabel, entityData, actor, reason }, transaction) {
-  const request = transaction
-    ? new sql.Request(transaction)
-    : (await poolPromise).request();
+  const row = await RecycleBin.create({
+    entity_type: entityType,
+    entity_id: entityId,
+    entity_label: entityLabel || null,
+    entity_data: JSON.stringify(entityData),
+    deleted_by_id: actor?.user_id || null,
+    deleted_by: actor?.username || null,
+    deleted_by_role: actor?.role || null,
+    reason: reason || null,
+  }, { transaction });
 
-  request
-    .input('entity_type', sql.VarChar, entityType)
-    .input('entity_id', sql.Int, entityId)
-    .input('entity_label', sql.NVarChar, entityLabel || null)
-    .input('entity_data', sql.NVarChar(sql.MAX), JSON.stringify(entityData))
-    .input('deleted_by_id', sql.Int, actor?.user_id || null)
-    .input('deleted_by', sql.NVarChar, actor?.username || null)
-    .input('deleted_by_role', sql.VarChar, actor?.role || null)
-    .input('reason', sql.NVarChar, reason || null);
-
-  const result = await request.query(`
-    INSERT INTO dbo.recycle_bin (
-      entity_type, entity_id, entity_label, entity_data,
-      deleted_by_id, deleted_by, deleted_by_role, reason
-    )
-    OUTPUT INSERTED.bin_id
-    VALUES (
-      @entity_type, @entity_id, @entity_label, @entity_data,
-      @deleted_by_id, @deleted_by, @deleted_by_role, @reason
-    )
-  `);
-
-  return result.recordset[0];
+  return { bin_id: row.bin_id };
 }
 
 // Items still in the bin. Reads the view, which already excludes restored ones.
 async function findAll(entityType) {
-  const pool = await poolPromise;
-  const request = pool.request();
-
-  let query = 'SELECT * FROM dbo.vw_recycle_bin';
-  if (entityType) {
-    query += ' WHERE entity_type = @entity_type';
-    request.input('entity_type', sql.VarChar, entityType);
-  }
-  query += ' ORDER BY deleted_at DESC';
-
-  const result = await request.query(query);
-  return result.recordset;
+  return RecycleBinView.findAll({
+    where: entityType ? { entity_type: entityType } : {},
+    order: [['deleted_at', 'DESC']],
+    raw: true,
+  });
 }
 
 // Reads the base table rather than the view, so a restored item can still be
 // looked up and entity_data is included.
 async function findById(binId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, binId)
-    .query('SELECT * FROM dbo.recycle_bin WHERE bin_id = @id');
-  return result.recordset[0] || null;
+  return RecycleBin.findByPk(binId, { raw: true });
 }
 
 // Checks whether the original id is free before attempting a restore.
@@ -180,28 +156,20 @@ async function restore(binId, restoredBy) {
 }
 
 // Permanent removal from the bin. There is no recovery after this.
+// Sequelize's destroy() doesn't return the deleted row - fetch first so the
+// caller still gets back what was removed.
 async function purge(binId) {
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, binId)
-    .query('DELETE FROM dbo.recycle_bin OUTPUT DELETED.* WHERE bin_id = @id');
-  return result.recordset[0] || null;
+  const row = await RecycleBin.findByPk(binId, { raw: true });
+  if (!row) return null;
+  await RecycleBin.destroy({ where: { bin_id: binId } });
+  return row;
 }
 
 // Empties everything not yet restored, optionally limited to one entity type.
 async function purgeAll(entityType) {
-  const pool = await poolPromise;
-  const request = pool.request();
-
-  let query = 'DELETE FROM dbo.recycle_bin OUTPUT DELETED.bin_id WHERE restored_at IS NULL';
-  if (entityType) {
-    query += ' AND entity_type = @entity_type';
-    request.input('entity_type', sql.VarChar, entityType);
-  }
-
-  const result = await request.query(query);
-  return result.recordset.length;
+  const where = { restored_at: null };
+  if (entityType) where.entity_type = entityType;
+  return RecycleBin.destroy({ where });
 }
 
 module.exports = {

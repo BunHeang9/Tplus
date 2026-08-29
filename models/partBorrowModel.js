@@ -1,4 +1,5 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
 const partStockModel = require('../models/partStockModel');
 
 // Temporary loans of individual parts out of part_stock (dbo.part_borrow_record).
@@ -14,6 +15,19 @@ const partStockModel = require('../models/partStockModel');
 // query implicitly assuming 1 anyway.
 
 const AVAILABLE_STATUS = 'Working - IT Stock';
+
+// Raw queries with no model attribute definition return a plain string for a
+// DATE/DATETIME column; the driver this replaces returned a Date object for
+// the same column. Converting back keeps every response identical to before
+// this migration.
+const DATE_FIELDS = ['borrow_date', 'expected_return_date', 'return_date', 'created_at'];
+function fixDates(row) {
+  if (!row) return row;
+  for (const f of DATE_FIELDS) {
+    if (row[f]) row[f] = new Date(row[f]);
+  }
+  return row;
+}
 
 function selectFields(alias = 'b') {
   return `
@@ -43,74 +57,66 @@ function joins(alias = 'b') {
 
 // Everything needed to decide whether this line has enough to lend out.
 async function findStockForBorrow(stockId) {
-  const pool = await poolPromise;
-  const result = await pool.request().input('id', sql.Int, stockId).query(`
+  const rows = await sequelize.query(`
     SELECT s.stock_id, s.part_type_id, s.quantity, s.status,
            pt.part_name, s.part_value, s.model_name, s.model_number,
            (SELECT ISNULL(SUM(quantity), 0) FROM dbo.part_borrow_record
              WHERE stock_id = s.stock_id AND return_date IS NULL) AS currently_borrowed
     FROM dbo.part_stock s
     JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-    WHERE s.stock_id = @id
-  `);
-  return result.recordset[0] || null;
+    WHERE s.stock_id = :id
+  `, { replacements: { id: stockId }, type: QueryTypes.SELECT });
+  return rows[0] || null;
 }
 
 // Creating the loan and taking the quantity off the shelf happen together in
 // a transaction - if either fails, neither is applied. decrement() already
 // refuses to go below zero, so an over-ask surfaces as null here rather than
-// a negative quantity slipping through.
+// a negative quantity slipping through. Self-contained now that
+// partStockModel.decrement() itself takes a Sequelize transaction.
 async function create(d) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
-
-  try {
+  return sequelize.transaction(async (transaction) => {
     const decremented = await partStockModel.decrement(d.stock_id, d.quantity, transaction);
-    if (!decremented) {
-      await transaction.rollback();
-      return { error: 'insufficient_stock' };
-    }
+    if (!decremented) return { error: 'insufficient_stock' };
 
-    const insert = await new sql.Request(transaction)
-      .input('stock_id', sql.Int, d.stock_id)
-      .input('quantity', sql.Int, d.quantity)
-      .input('borrower_id', sql.Int, d.borrower_id)
-      .input('borrow_date', sql.Date, d.borrow_date)
-      .input('expected_return_date', sql.Date, d.expected_return_date || null)
-      .input('condition_on_borrow', sql.NVarChar, d.condition_on_borrow || null)
-      .input('issued_by_id', sql.Int, d.issued_by_id || null)
-      .input('purpose', sql.NVarChar, d.purpose || null)
-      .input('remark', sql.NVarChar, d.remark || null)
-      .query(`
+    const [row] = await sequelize.query(`
         INSERT INTO dbo.part_borrow_record (
           stock_id, quantity, borrower_id, borrow_date, expected_return_date,
           condition_on_borrow, issued_by_id, purpose, remark
         )
         OUTPUT INSERTED.*
         VALUES (
-          @stock_id, @quantity, @borrower_id, @borrow_date, @expected_return_date,
-          @condition_on_borrow, @issued_by_id, @purpose, @remark
+          :stock_id, :quantity, :borrower_id, :borrow_date, :expected_return_date,
+          :condition_on_borrow, :issued_by_id, :purpose, :remark
         )
-      `);
+      `, {
+      replacements: {
+        stock_id: d.stock_id,
+        quantity: d.quantity,
+        borrower_id: d.borrower_id,
+        borrow_date: d.borrow_date,
+        expected_return_date: d.expected_return_date || null,
+        condition_on_borrow: d.condition_on_borrow || null,
+        issued_by_id: d.issued_by_id || null,
+        purpose: d.purpose || null,
+        remark: d.remark || null,
+      },
+      type: QueryTypes.SELECT,
+      transaction,
+    });
 
-    await transaction.commit();
-    return insert.recordset[0];
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+    return fixDates(row);
+  });
 }
 
 async function findById(borrowId) {
-  const pool = await poolPromise;
-  const result = await pool.request().input('id', sql.Int, borrowId).query(`
+  const rows = await sequelize.query(`
     SELECT ${selectFields()}
     FROM dbo.part_borrow_record b
     ${joins()}
-    WHERE b.borrow_id = @id
-  `);
-  return result.recordset[0] || null;
+    WHERE b.borrow_id = :id
+  `, { replacements: { id: borrowId }, type: QueryTypes.SELECT });
+  return fixDates(rows[0]) || null;
 }
 
 // Closing the loan and putting the quantity back, in one transaction. If it
@@ -119,38 +125,36 @@ async function findById(borrowId) {
 // going straight back to this line - the same merge-or-create-a-line
 // behaviour used everywhere else stock is added, so "3 Working out, 1 came
 // back Broken" ends up on the Broken line rather than corrupting this one.
+// Self-contained now that partStockModel.increment()/incrementById() take a
+// Sequelize transaction.
 async function markReturned(borrowId, d) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
-
-  try {
-    const update = await new sql.Request(transaction)
-      .input('id', sql.Int, borrowId)
-      .input('return_date', sql.Date, d.return_date)
-      .input('condition_on_return', sql.NVarChar, d.condition_on_return || null)
-      .input('received_by_id', sql.Int, d.received_by_id || null)
-      .input('remark', sql.NVarChar, d.remark || null)
-      .query(`
+  return sequelize.transaction(async (transaction) => {
+    const [loan] = await sequelize.query(`
         UPDATE dbo.part_borrow_record
-        SET return_date         = @return_date,
-            condition_on_return = @condition_on_return,
-            received_by_id      = COALESCE(@received_by_id, received_by_id),
-            remark              = COALESCE(@remark, remark)
+        SET return_date         = :return_date,
+            condition_on_return = :condition_on_return,
+            received_by_id      = COALESCE(:received_by_id, received_by_id),
+            remark              = COALESCE(:remark, remark)
         OUTPUT INSERTED.*
-        WHERE borrow_id = @id AND return_date IS NULL
-      `);
+        WHERE borrow_id = :id AND return_date IS NULL
+      `, {
+      replacements: {
+        id: borrowId,
+        return_date: d.return_date,
+        condition_on_return: d.condition_on_return || null,
+        received_by_id: d.received_by_id || null,
+        remark: d.remark || null,
+      },
+      type: QueryTypes.SELECT,
+      transaction,
+    });
 
-    const loan = update.recordset[0];
-    if (!loan) {
-      await transaction.rollback();
-      return null;
-    }
+    if (!loan) return null;
 
-    const stockRow = await new sql.Request(transaction)
-      .input('id', sql.Int, loan.stock_id)
-      .query('SELECT * FROM dbo.part_stock WHERE stock_id = @id');
-    const stock = stockRow.recordset[0];
+    const [stock] = await sequelize.query(
+      'SELECT * FROM dbo.part_stock WHERE stock_id = :id',
+      { replacements: { id: loan.stock_id }, type: QueryTypes.SELECT, transaction },
+    );
 
     if (d.return_status && d.return_status !== stock.status) {
       await partStockModel.increment(
@@ -165,16 +169,11 @@ async function markReturned(borrowId, d) {
       await partStockModel.incrementById(loan.stock_id, loan.quantity, transaction);
     }
 
-    await transaction.commit();
-    return loan;
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+    return fixDates(loan);
+  });
 }
 
 async function findCurrentlyBorrowed(overdueOnly) {
-  const pool = await poolPromise;
   let query = `
     SELECT ${selectFields()},
            CASE
@@ -190,14 +189,12 @@ async function findCurrentlyBorrowed(overdueOnly) {
   }
   query += ' ORDER BY is_overdue DESC, b.borrow_date';
 
-  const result = await pool.request().query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 async function findHistory(filters = {}) {
   const { stock_id, borrower_id, from, to } = filters;
-  const pool = await poolPromise;
-  const request = pool.request();
 
   let query = `
     SELECT ${selectFields()},
@@ -206,36 +203,35 @@ async function findHistory(filters = {}) {
     ${joins()}
     WHERE 1=1
   `;
+  const replacements = {};
 
   if (stock_id) {
-    query += ' AND b.stock_id = @stock_id';
-    request.input('stock_id', sql.Int, stock_id);
+    query += ' AND b.stock_id = :stock_id';
+    replacements.stock_id = stock_id;
   }
   if (borrower_id) {
-    query += ' AND b.borrower_id = @borrower_id';
-    request.input('borrower_id', sql.Int, borrower_id);
+    query += ' AND b.borrower_id = :borrower_id';
+    replacements.borrower_id = borrower_id;
   }
   if (from) {
-    query += ' AND b.borrow_date >= @from';
-    request.input('from', sql.Date, from);
+    query += ' AND b.borrow_date >= :from';
+    replacements.from = from;
   }
   if (to) {
-    query += ' AND b.borrow_date <= @to';
-    request.input('to', sql.Date, to);
+    query += ' AND b.borrow_date <= :to';
+    replacements.to = to;
   }
 
   query += ' ORDER BY b.borrow_date DESC, b.borrow_id DESC';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 // Returned loans only, with days_kept/was_late worked out here rather than
 // making the frontend calculate them - same pattern as borrowModel.findReturns.
 async function findReturns(filters = {}) {
   const { stock_id, borrower_id, from, to, late_only } = filters;
-  const pool = await poolPromise;
-  const request = pool.request();
 
   let query = `
     SELECT ${selectFields()},
@@ -253,22 +249,23 @@ async function findReturns(filters = {}) {
     ${joins()}
     WHERE b.return_date IS NOT NULL
   `;
+  const replacements = {};
 
   if (stock_id) {
-    query += ' AND b.stock_id = @stock_id';
-    request.input('stock_id', sql.Int, stock_id);
+    query += ' AND b.stock_id = :stock_id';
+    replacements.stock_id = stock_id;
   }
   if (borrower_id) {
-    query += ' AND b.borrower_id = @borrower_id';
-    request.input('borrower_id', sql.Int, borrower_id);
+    query += ' AND b.borrower_id = :borrower_id';
+    replacements.borrower_id = borrower_id;
   }
   if (from) {
-    query += ' AND b.return_date >= @from';
-    request.input('from', sql.Date, from);
+    query += ' AND b.return_date >= :from';
+    replacements.from = from;
   }
   if (to) {
-    query += ' AND b.return_date <= @to';
-    request.input('to', sql.Date, to);
+    query += ' AND b.return_date <= :to';
+    replacements.to = to;
   }
   if (late_only === 'true') {
     query += ' AND b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date';
@@ -276,61 +273,49 @@ async function findReturns(filters = {}) {
 
   query += ' ORDER BY b.return_date DESC, b.borrow_id DESC';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 async function findByBorrower(borrowerId, openOnly) {
-  const pool = await poolPromise;
-  const request = pool.request().input('id', sql.Int, borrowerId);
-
   let query = `
     SELECT ${selectFields()},
            CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status
     FROM dbo.part_borrow_record b
     ${joins()}
-    WHERE b.borrower_id = @id
+    WHERE b.borrower_id = :id
   `;
   if (openOnly === 'true') query += ' AND b.return_date IS NULL';
   query += ' ORDER BY b.borrow_date DESC';
 
-  const result = await request.query(query);
-  return result.recordset;
+  const rows = await sequelize.query(query, { replacements: { id: borrowerId }, type: QueryTypes.SELECT });
+  return rows.map(fixDates);
 }
 
 // Deleting a loan record is for correcting a mistaken entry, not erasing
 // history. If it is still open the quantity has to go back on the shelf,
-// otherwise it stays counted as out with nothing holding it.
+// otherwise it stays counted as out with nothing holding it. Self-contained
+// now that partStockModel.incrementById() itself takes a Sequelize
+// transaction.
 async function remove(borrowId) {
-  const pool = await poolPromise;
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
+  return sequelize.transaction(async (transaction) => {
+    const [loan] = await sequelize.query(
+      'SELECT * FROM dbo.part_borrow_record WHERE borrow_id = :id',
+      { replacements: { id: borrowId }, type: QueryTypes.SELECT, transaction },
+    );
+    if (!loan) return null;
 
-  try {
-    const found = await new sql.Request(transaction)
-      .input('id', sql.Int, borrowId)
-      .query('SELECT * FROM dbo.part_borrow_record WHERE borrow_id = @id');
-
-    const loan = found.recordset[0];
-    if (!loan) {
-      await transaction.rollback();
-      return null;
-    }
-
-    await new sql.Request(transaction)
-      .input('id', sql.Int, borrowId)
-      .query('DELETE FROM dbo.part_borrow_record WHERE borrow_id = @id');
+    await sequelize.query(
+      'DELETE FROM dbo.part_borrow_record WHERE borrow_id = :id',
+      { replacements: { id: borrowId }, transaction },
+    );
 
     if (!loan.return_date) {
       await partStockModel.incrementById(loan.stock_id, loan.quantity, transaction);
     }
 
-    await transaction.commit();
-    return loan;
-  } catch (err) {
-    try { await transaction.rollback(); } catch { /* already rolled back */ }
-    throw err;
-  }
+    return fixDates(loan);
+  });
 }
 
 module.exports = {

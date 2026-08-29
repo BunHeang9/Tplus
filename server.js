@@ -8,7 +8,6 @@ const equipmentRoutes = require('./routes/equipmentRoutes');
 const searchRoutes = require('./routes/searchRoutes');
 const filterRoutes = require('./routes/filterRoutes');
 const stockRoutes = require('./routes/stockRoutes');
-const miscRoutes = require('./routes/miscRoutes');
 const departmentRoutes = require('./routes/departmentRoutes');
 const categoryRoutes = require('./routes/categoryRoutes');
 const borrowRoutes = require('./routes/borrowRoutes');
@@ -26,6 +25,12 @@ const partStockRoutes = require("./routes/partStockRoutes");
 const partCustomFieldRoutes = require("./routes/partCustomFieldRoutes");
 const partBorrowRoutes = require("./routes/partBorrowRoutes");
 const reportRoutes = require("./routes/reportRoutes");
+const licenseRoutes = require("./routes/licenseRoutes");
+const ssdRoutes = require("./routes/ssdRoutes");
+const serverUsageRoutes = require("./routes/serverUsageRoutes");
+const antivirusInstallRoutes = require("./routes/antivirusInstallRoutes");
+const deviceReplacementRoutes = require("./routes/deviceReplacementRoutes");
+const cloudCostRoutes = require("./routes/cloudCostRoutes");
 
 const app = express();
 
@@ -183,9 +188,16 @@ app.use("/api/part-stock", partStockRoutes);
 app.use("/api/part-custom-fields", partCustomFieldRoutes);
 app.use("/api/part-borrow", partBorrowRoutes);
 app.use("/api/reports", reportRoutes);
-// Mounted at /api, so this catch-all must come last or it swallows
-// every more specific route declared after it.
-app.use("/api", miscRoutes);
+app.use("/api/licenses", licenseRoutes);
+app.use("/api/server-usage", serverUsageRoutes);
+app.use("/api/antivirus", antivirusInstallRoutes);
+app.use("/api/replacements", deviceReplacementRoutes);
+// Mounted at /api directly (not a single dedicated prefix), so these two
+// come last among the /api-rooted mounts - each still only matches its own
+// specific path (/ssd-upgrades, /ssd-procurement, /cloud-rates,
+// /cloud-usage), so order only matters relative to any other /api catch-all.
+app.use("/api", ssdRoutes);
+app.use("/api", cloudCostRoutes);
 app.use(notFound);
 app.use(errorHandler);
 
