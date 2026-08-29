@@ -1,4 +1,5 @@
-const { sql, poolPromise } = require('../config/db');
+const sequelize = require('../config/sequelize');
+const { QueryTypes } = require('sequelize');
 const { RecycleBin, RecycleBinView } = require('./sequelize/recycleBinModel');
 
 // Deleted records held for admin review.
@@ -56,12 +57,11 @@ async function idIsTaken(entityType, entityId) {
   const target = RESTORE_TARGETS[entityType];
   if (!target) return false;
 
-  const pool = await poolPromise;
-  const result = await pool
-    .request()
-    .input('id', sql.Int, entityId)
-    .query(`SELECT 1 AS found FROM ${target.table} WHERE ${target.idColumn} = @id`);
-  return result.recordset.length > 0;
+  const rows = await sequelize.query(
+    `SELECT 1 AS found FROM ${target.table} WHERE ${target.idColumn} = :id`,
+    { replacements: { id: entityId }, type: QueryTypes.SELECT },
+  );
+  return rows.length > 0;
 }
 
 // Puts the row back with its original primary key.
@@ -86,44 +86,38 @@ async function restore(binId, restoredBy) {
 
   // Only restore columns the table still has - a column dropped since the
   // delete would otherwise make the INSERT fail.
-  const pool = await poolPromise;
-  const cols = await pool
-    .request()
-    .input("table", sql.VarChar, target.table.replace("dbo.", "")).query(`
+  const cols = await sequelize.query(`
       SELECT COLUMN_NAME
       FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_NAME = @table AND TABLE_SCHEMA = 'dbo'
-    `);
-  const liveColumns = new Set(cols.recordset.map((r) => r.COLUMN_NAME));
+      WHERE TABLE_NAME = :table AND TABLE_SCHEMA = 'dbo'
+    `, { replacements: { table: target.table.replace("dbo.", "") }, type: QueryTypes.SELECT });
+  const liveColumns = new Set(cols.map((r) => r.COLUMN_NAME));
 
   const columns = Object.keys(data).filter(
     (c) => liveColumns.has(c) && data[c] !== undefined,
   );
   if (columns.length === 0) return { error: "no_columns", entry };
 
-  const transaction = new sql.Transaction(pool);
-  await transaction.begin();
-
-  try {
+  // Self-contained now that this whole restore lives on one Sequelize
+  // transaction - sequelize.transaction() rolls back automatically if the
+  // callback throws, same guarantee the raw try/catch/rollback gave before.
+  await sequelize.transaction(async (transaction) => {
     const columnList = columns.map((c) => `[${c}]`).join(", ");
-    const valueList = columns.map((_, i) => `@p${i}`).join(", ");
+    const valueList = columns.map((_, i) => `:p${i}`).join(", ");
+    const replacements = {};
+    columns.forEach((col, i) => { replacements[`p${i}`] = data[col]; });
 
     // SET IDENTITY_INSERT only lasts for the dynamic-SQL scope it was set
-    // in - the mssql driver runs every parameterised .query() through its
-    // own sp_executesql call, so a SET issued in one .query() call does not
-    // carry over into the next one even on the same transaction/connection.
-    // It has to be set, used and cleared inside one single .query() call.
-    // TRY/CATCH inside that one batch guarantees the OFF still runs if the
-    // INSERT fails, since IDENTITY_INSERT is session state, not
-    // transactional - a rollback would not undo it, and SQL Server allows
-    // it on only one table per session, so leaving it on breaks the next
-    // restore that reuses this pooled connection.
-    const insertRequest = new sql.Request(transaction);
-    columns.forEach((col, i) => {
-      insertRequest.input(`p${i}`, data[col]);
-    });
-
-    await insertRequest.query(`
+    // in - the driver runs each sequelize.query() call as its own batch, so
+    // a SET issued in one call does not carry over into the next one even
+    // on the same transaction/connection. It has to be set, used and
+    // cleared inside this one single sequelize.query() call. TRY/CATCH
+    // inside that one batch guarantees the OFF still runs if the INSERT
+    // fails, since IDENTITY_INSERT is session state, not transactional - a
+    // rollback would not undo it, and SQL Server allows it on only one
+    // table per session, so leaving it on breaks the next restore that
+    // reuses this pooled connection.
+    await sequelize.query(`
       BEGIN TRY
         SET IDENTITY_INSERT ${target.table} ON;
         INSERT INTO ${target.table} (${columnList}) VALUES (${valueList});
@@ -133,26 +127,16 @@ async function restore(binId, restoredBy) {
         SET IDENTITY_INSERT ${target.table} OFF;
         THROW;
       END CATCH
-    `);
+    `, { replacements, transaction });
 
-    await new sql.Request(transaction)
-      .input("id", sql.Int, binId)
-      .input("restored_by", sql.NVarChar, restoredBy || null).query(`
+    await sequelize.query(`
         UPDATE dbo.recycle_bin
-        SET restored_at = GETDATE(), restored_by = @restored_by
-        WHERE bin_id = @id
-      `);
+        SET restored_at = GETDATE(), restored_by = :restored_by
+        WHERE bin_id = :id
+      `, { replacements: { id: binId, restored_by: restoredBy || null }, transaction });
+  });
 
-    await transaction.commit();
-    return { restored: data, entry };
-  } catch (err) {
-    try {
-      await transaction.rollback();
-    } catch {
-      // Already rolled back by SQL Server - keep the original error.
-    }
-    throw err;
-  }
+  return { restored: data, entry };
 }
 
 // Permanent removal from the bin. There is no recovery after this.
