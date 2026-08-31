@@ -1,5 +1,10 @@
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { PartType, PartStock } = require('./partStockModel');
+const { Equipment } = require('./equipmentModel');
+const { Category } = require('./categoryModel');
+const { Employee } = require('./employeeModel');
 
 // Replacing a part of a device rather than the whole thing.
 //
@@ -9,6 +14,47 @@ const { QueryTypes } = require('sequelize');
 // part_type.equipment_column is what ties the two together: RAM maps to
 // equipment.ram, so a replacement updates the device's current specs as well
 // as recording what happened. A bag has no column and only leaves history.
+//
+// Not required by equipmentModel.js (only requires partStockModel.js/
+// customFieldModel.js lazily, inside functions, to dodge a load-time cycle -
+// never the other way round), so it's safe for this file to import
+// PartType/Equipment/Category/Employee and build associations onto them.
+
+const PartReplacement = sequelize.define('PartReplacement', {
+  replacement_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  equipment_id: { type: DataTypes.INTEGER, allowNull: false },
+  part_type_id: { type: DataTypes.INTEGER, allowNull: false },
+  old_value: { type: DataTypes.STRING(400), allowNull: true },
+  new_value: { type: DataTypes.STRING(400), allowNull: true },
+  replacement_date: { type: DataTypes.DATEONLY, allowNull: false },
+  reason: { type: DataTypes.STRING(510), allowNull: true },
+  remark: { type: DataTypes.STRING(1000), allowNull: true },
+  replaced_by: { type: DataTypes.STRING(200), allowNull: true },
+  // Legacy DATETIME with its own DB-side default - allowNull:true even
+  // though the column itself is NOT NULL, same reasoning as
+  // partBorrowModel.js's PartBorrowRecord.created_at.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+  action: { type: DataTypes.STRING(20), allowNull: false },
+  old_part_status: { type: DataTypes.STRING(50), allowNull: true },
+  from_stock: { type: DataTypes.BOOLEAN, allowNull: false },
+  new_model_name: { type: DataTypes.STRING(200), allowNull: true },
+  new_model_number: { type: DataTypes.STRING(200), allowNull: true },
+  new_disk_type: { type: DataTypes.STRING(10), allowNull: true },
+  new_disk_interface: { type: DataTypes.STRING(10), allowNull: true },
+  new_ram_type: { type: DataTypes.STRING(10), allowNull: true },
+  old_model_name: { type: DataTypes.STRING(200), allowNull: true },
+  old_model_number: { type: DataTypes.STRING(200), allowNull: true },
+  old_disk_type: { type: DataTypes.STRING(10), allowNull: true },
+  old_disk_interface: { type: DataTypes.STRING(10), allowNull: true },
+  old_ram_type: { type: DataTypes.STRING(10), allowNull: true },
+}, {
+  tableName: 'part_replacement',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+PartReplacement.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
+PartReplacement.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
 
 // Raw queries with no model attribute definition return a plain string for a
 // DATE/DATETIME column; the driver this replaces returned a Date object for
@@ -193,19 +239,13 @@ async function partAppliesToCategory(partTypeId, categoryId) {
 }
 
 async function findTypeById(id) {
-  const rows = await sequelize.query(
-    'SELECT * FROM dbo.part_type WHERE part_type_id = :id',
-    { replacements: { id }, type: QueryTypes.SELECT },
-  );
-  return fixDates(rows[0]) || null;
+  const row = await PartType.findByPk(id, { raw: true });
+  return fixDates(row) || null;
 }
 
 async function findTypeByName(name) {
-  const rows = await sequelize.query(
-    'SELECT * FROM dbo.part_type WHERE part_name = :name',
-    { replacements: { name }, type: QueryTypes.SELECT },
-  );
-  return fixDates(rows[0]) || null;
+  const row = await PartType.findOne({ where: { part_name: name }, raw: true });
+  return fixDates(row) || null;
 }
 
 async function createType(d) {
@@ -258,22 +298,15 @@ async function updateType(id, d) {
 }
 
 async function countTypeUsage(id) {
-  const [row] = await sequelize.query(
-    'SELECT COUNT(*) AS n FROM dbo.part_replacement WHERE part_type_id = :id',
-    { replacements: { id }, type: QueryTypes.SELECT },
-  );
-  return row.n;
+  return PartReplacement.count({ where: { part_type_id: id } });
 }
 
 // Stock still on the shelf for this part type - deleting the type would
 // silently erase that quantity with no history of it ever existing, unlike
 // part_replacement usage above which at least leaves a trail.
 async function countStockUsage(id) {
-  const [row] = await sequelize.query(`
-      SELECT ISNULL(SUM(quantity), 0) AS n FROM dbo.part_stock
-      WHERE part_type_id = :id AND quantity > 0
-    `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row.n;
+  const total = await PartStock.sum('quantity', { where: { part_type_id: id, quantity: { [Op.gt]: 0 } } });
+  return total || 0;
 }
 
 // Clears the junction/dependent rows first - part_type_category,
@@ -324,100 +357,156 @@ async function removeType(id) {
 // per-device history joined out across their whole kit, for an employee-level
 // audit trail rather than one device at a time.
 async function findByEmployee(employeeId) {
-  const rows = await sequelize.query(`
-      SELECT r.replacement_id, r.equipment_id,
-             e.computer_name, e.device_model, e.asset_code,
-             c.category_name,
-             emp.full_name AS owner_name, emp.staff_code,
-             pt.part_name,
-             r.action, r.old_value, r.new_value, r.replacement_date,
-             r.new_model_name, r.new_model_number,
-             r.new_disk_type, r.new_disk_interface, r.new_ram_type,
-             r.old_model_name, r.old_model_number,
-             r.old_disk_type, r.old_disk_interface, r.old_ram_type,
-             r.reason, r.remark, r.replaced_by
-      FROM dbo.part_replacement r
-      JOIN dbo.part_type pt ON r.part_type_id = pt.part_type_id
-      JOIN dbo.equipment e  ON r.equipment_id = e.equipment_id
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      WHERE e.owner_id = :employee_id
-      ORDER BY r.replacement_date DESC, r.replacement_id DESC
-    `, { replacements: { employee_id: employeeId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartReplacement.findAll({
+    include: [
+      { model: PartType, as: 'partType' },
+      {
+        model: Equipment, as: 'equipment', required: true, where: { owner_id: employeeId },
+        include: [{ model: Category, as: 'category' }, { model: Employee, as: 'owner' }],
+      },
+    ],
+    order: [['replacement_date', 'DESC'], ['replacement_id', 'DESC']],
+  });
+
+  return rows.map((row) => {
+    const { partType, equipment, ...r } = row.get({ plain: true });
+    const owner = equipment.owner;
+    return fixDates({
+      replacement_id: r.replacement_id,
+      equipment_id: r.equipment_id,
+      computer_name: equipment.computer_name,
+      device_model: equipment.device_model,
+      asset_code: equipment.asset_code,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      owner_name: owner ? owner.full_name : null,
+      staff_code: owner ? owner.staff_code : null,
+      part_name: partType ? partType.part_name : null,
+      action: r.action,
+      old_value: r.old_value,
+      new_value: r.new_value,
+      replacement_date: r.replacement_date,
+      new_model_name: r.new_model_name,
+      new_model_number: r.new_model_number,
+      new_disk_type: r.new_disk_type,
+      new_disk_interface: r.new_disk_interface,
+      new_ram_type: r.new_ram_type,
+      old_model_name: r.old_model_name,
+      old_model_number: r.old_model_number,
+      old_disk_type: r.old_disk_type,
+      old_disk_interface: r.old_disk_interface,
+      old_ram_type: r.old_ram_type,
+      reason: r.reason,
+      remark: r.remark,
+      replaced_by: r.replaced_by,
+    });
+  });
 }
 
 async function findByEquipment(equipmentId) {
-  const rows = await sequelize.query(`
-      SELECT r.replacement_id, r.equipment_id, r.part_type_id,
-             pt.part_name, pt.equipment_column,
-             emp.full_name AS owner_name, emp.staff_code,
-             r.action, r.old_value, r.new_value, r.replacement_date,
-             r.new_model_name, r.new_model_number,
-             r.new_disk_type, r.new_disk_interface, r.new_ram_type,
-             r.old_model_name, r.old_model_number,
-             r.old_disk_type, r.old_disk_interface, r.old_ram_type,
-             r.reason, r.remark, r.replaced_by
-      FROM dbo.part_replacement r
-      JOIN dbo.part_type pt ON r.part_type_id = pt.part_type_id
-      JOIN dbo.equipment e ON r.equipment_id = e.equipment_id
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      WHERE r.equipment_id = :equipment_id
-      ORDER BY r.replacement_date DESC, r.replacement_id DESC
-    `, { replacements: { equipment_id: equipmentId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartReplacement.findAll({
+    where: { equipment_id: equipmentId },
+    include: [
+      { model: PartType, as: 'partType' },
+      { model: Equipment, as: 'equipment', required: true, include: [{ model: Employee, as: 'owner' }] },
+    ],
+    order: [['replacement_date', 'DESC'], ['replacement_id', 'DESC']],
+  });
+
+  return rows.map((row) => {
+    const { partType, equipment, ...r } = row.get({ plain: true });
+    const owner = equipment.owner;
+    return fixDates({
+      replacement_id: r.replacement_id,
+      equipment_id: r.equipment_id,
+      part_type_id: r.part_type_id,
+      part_name: partType ? partType.part_name : null,
+      equipment_column: partType ? partType.equipment_column : null,
+      owner_name: owner ? owner.full_name : null,
+      staff_code: owner ? owner.staff_code : null,
+      action: r.action,
+      old_value: r.old_value,
+      new_value: r.new_value,
+      replacement_date: r.replacement_date,
+      new_model_name: r.new_model_name,
+      new_model_number: r.new_model_number,
+      new_disk_type: r.new_disk_type,
+      new_disk_interface: r.new_disk_interface,
+      new_ram_type: r.new_ram_type,
+      old_model_name: r.old_model_name,
+      old_model_number: r.old_model_number,
+      old_disk_type: r.old_disk_type,
+      old_disk_interface: r.old_disk_interface,
+      old_ram_type: r.old_ram_type,
+      reason: r.reason,
+      remark: r.remark,
+      replaced_by: r.replaced_by,
+    });
+  });
 }
 
 async function findAll(filters = {}) {
   const { category, part_type_id, from, to, q } = filters;
 
-  let query = `
-    SELECT r.replacement_id, r.equipment_id,
-           e.device_name, e.computer_name, e.asset_code, e.device_model,
-           c.category_name,
-           emp.full_name AS owner_name, emp.staff_code,
-           pt.part_name,
-           r.action, r.old_value, r.new_value, r.replacement_date,
-           r.new_model_name, r.new_model_number,
-           r.new_disk_type, r.new_disk_interface, r.new_ram_type,
-           r.reason, r.remark, r.replaced_by
-    FROM dbo.part_replacement r
-    JOIN dbo.part_type pt ON r.part_type_id = pt.part_type_id
-    JOIN dbo.equipment e ON r.equipment_id = e.equipment_id
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-    WHERE 1=1
-  `;
-  const replacements = {};
-
-  if (category) {
-    query += ' AND c.category_name = :category';
-    replacements.category = category;
-  }
-  if (part_type_id) {
-    query += ' AND r.part_type_id = :part_type_id';
-    replacements.part_type_id = part_type_id;
-  }
-  if (from) {
-    query += ' AND r.replacement_date >= :from';
-    replacements.from = from;
-  }
-  if (to) {
-    query += ' AND r.replacement_date <= :to';
-    replacements.to = to;
-  }
+  const equipmentWhere = {};
+  if (category) equipmentWhere['$equipment.category.category_name$'] = category;
   if (q) {
-    query += ` AND (
-      e.device_name LIKE :q OR e.computer_name LIKE :q OR
-      e.asset_code LIKE :q OR emp.full_name LIKE :q
-    )`;
-    replacements.q = `%${q}%`;
+    equipmentWhere[Op.or] = [
+      { '$equipment.device_name$': { [Op.like]: `%${q}%` } },
+      { '$equipment.computer_name$': { [Op.like]: `%${q}%` } },
+      { '$equipment.asset_code$': { [Op.like]: `%${q}%` } },
+      { '$equipment.owner.full_name$': { [Op.like]: `%${q}%` } },
+    ];
   }
 
-  query += ' ORDER BY r.replacement_date DESC, r.replacement_id DESC';
+  const where = { ...equipmentWhere };
+  if (part_type_id) where.part_type_id = part_type_id;
+  if (from || to) {
+    where.replacement_date = {};
+    if (from) where.replacement_date[Op.gte] = from;
+    if (to) where.replacement_date[Op.lte] = to;
+  }
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartReplacement.findAll({
+    where,
+    include: [
+      { model: PartType, as: 'partType' },
+      {
+        model: Equipment, as: 'equipment', required: true,
+        include: [{ model: Category, as: 'category' }, { model: Employee, as: 'owner' }],
+      },
+    ],
+    order: [['replacement_date', 'DESC'], ['replacement_id', 'DESC']],
+    subQuery: false,
+  });
+
+  return rows.map((row) => {
+    const { partType, equipment, ...r } = row.get({ plain: true });
+    const owner = equipment.owner;
+    return fixDates({
+      replacement_id: r.replacement_id,
+      equipment_id: r.equipment_id,
+      device_name: equipment.device_name,
+      computer_name: equipment.computer_name,
+      asset_code: equipment.asset_code,
+      device_model: equipment.device_model,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      owner_name: owner ? owner.full_name : null,
+      staff_code: owner ? owner.staff_code : null,
+      part_name: partType ? partType.part_name : null,
+      action: r.action,
+      old_value: r.old_value,
+      new_value: r.new_value,
+      replacement_date: r.replacement_date,
+      new_model_name: r.new_model_name,
+      new_model_number: r.new_model_number,
+      new_disk_type: r.new_disk_type,
+      new_disk_interface: r.new_disk_interface,
+      new_ram_type: r.new_ram_type,
+      reason: r.reason,
+      remark: r.remark,
+      replaced_by: r.replaced_by,
+    });
+  });
 }
 
 // Records the replacement and, where the part maps to a column, updates the

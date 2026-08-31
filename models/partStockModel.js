@@ -8,13 +8,18 @@ const { QueryTypes } = require('sequelize');
 // exported for partModel.js/partBorrowModel.js to build associations onto.
 const PartType = sequelize.define('PartType', {
   part_type_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
-  part_name: { type: DataTypes.STRING(50), allowNull: false },
-  description: { type: DataTypes.STRING(255), allowNull: true },
+  part_name: { type: DataTypes.STRING(100), allowNull: false },
+  description: { type: DataTypes.STRING(510), allowNull: true },
   equipment_column: { type: DataTypes.STRING(50), allowNull: true },
   tracks_value: { type: DataTypes.BOOLEAN, allowNull: true },
-  is_countable: { type: DataTypes.BOOLEAN, allowNull: true },
   sort_order: { type: DataTypes.INTEGER, allowNull: true },
   is_active: { type: DataTypes.BOOLEAN, allowNull: true },
+  // Legacy DATETIME with its own DB-side default - allowNull:true even
+  // though the column itself is NOT NULL, same reasoning as
+  // partBorrowModel.js's PartBorrowRecord.created_at.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+  is_countable: { type: DataTypes.BOOLEAN, allowNull: true },
+  uses_model: { type: DataTypes.BOOLEAN, allowNull: true },
 }, {
   tableName: 'part_type',
   schema: 'dbo',
