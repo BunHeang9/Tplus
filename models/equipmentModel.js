@@ -416,34 +416,57 @@ async function assignToEmployee(id, employeeId, { status, assignedDate } = {}) {
 }
 
 async function assign(id, d) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.equipment
-      SET owner_id      = :owner_id,
-          assigned_date = COALESCE(:assigned_date, assigned_date),
-          computer_name = COALESCE(:computer_name, computer_name),
-          ip_address    = COALESCE(:ip_address, ip_address),
-          location      = COALESCE(:location, location),
-          department_id = COALESCE(:department_id, department_id),
-          status        = COALESCE(:status, status),
-          status_id     = COALESCE(
-                              (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
-                              status_id)
-      OUTPUT INSERTED.*
-      WHERE equipment_id = :id
-    `, {
-    replacements: {
-      id,
-      owner_id: d.owner_id,
-      assigned_date: d.assigned_date || null,
-      computer_name: d.computer_name || null,
-      ip_address: d.ip_address || null,
-      location: d.location || null,
-      department_id: d.department_id || null,
-      status: d.status || null,
-    },
-    type: QueryTypes.SELECT,
+  const values = { owner_id: d.owner_id ?? null };
+  if (d.assigned_date) values.assigned_date = d.assigned_date;
+  if (d.computer_name) values.computer_name = d.computer_name;
+  if (d.ip_address) values.ip_address = d.ip_address;
+  if (d.location) values.location = d.location;
+  if (d.department_id) values.department_id = d.department_id;
+  if (d.status) {
+    values.status = d.status;
+    const statusRow = await EquipmentStatus.findOne({ where: { status_name: d.status }, attributes: ['status_id'], raw: true });
+    if (statusRow) values.status_id = statusRow.status_id;
+  }
+
+  const [, rows] = await Equipment.update(values, { where: { equipment_id: id }, returning: true });
+  if (!rows || !rows[0]) return null;
+  const row = rows[0].get({ plain: true });
+
+  // Same physical-column-order reconstruction as createStock()/update()
+  // above.
+  return fixDates({
+    equipment_id: row.equipment_id,
+    device_type: row.device_type,
+    device_model: row.device_model,
+    manufacturer: row.manufacturer,
+    serial_no: row.serial_no,
+    asset_code: row.asset_code,
+    mac_address: row.mac_address,
+    ip_address: row.ip_address,
+    owner_id: row.owner_id,
+    location: row.location,
+    purchase_date: row.purchase_date,
+    status: row.status,
+    remark: row.remark,
+    received_date: row.received_date,
+    assigned_date: row.assigned_date,
+    department_id: row.department_id,
+    category_id: row.category_id,
+    status_id: row.status_id,
+    computer_name: row.computer_name,
+    cpu: row.cpu,
+    ram: row.ram,
+    hd: row.hd,
+    os_type: row.os_type,
+    os_version: row.os_version,
+    windows_license: row.windows_license,
+    av_license: row.av_license,
+    service_tag: row.service_tag,
+    product_id: row.product_id,
+    device_name: row.device_name,
+    platform: row.platform,
+    server_type: row.server_type,
   });
-  return fixDates(row) || null;
 }
 
 //Unassign
