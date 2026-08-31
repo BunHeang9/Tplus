@@ -7,15 +7,14 @@ const { EquipmentStatus } = require('./statusModel');
 const { Employee } = require('./employeeModel');
 
 // findAll/findById, and since then createStock/update/assign/the unassign*
-// family, all go through real Sequelize associations rather than
-// sequelize.query(). Two remaining raw exceptions, both deliberate:
-// assignToEmployee() reads department_id/location from dbo.employee inside
-// the same atomic UPDATE - splitting that into a read-then-write would
-// reintroduce a real race condition the original was built to avoid, so it
-// stays raw on purpose, not because it's technically blocked. countReferences()
-// and remove() are genuinely blocked/transaction-interop (see their own
-// comments). Two consequences of moving findAll/findById to the ORM early
-// on, both deliberate, not oversights:
+// family/countReferences()/remove(), all go through real Sequelize
+// associations rather than sequelize.query(). One remaining raw exception,
+// deliberate: assignToEmployee() reads department_id/location from
+// dbo.employee inside the same atomic UPDATE - splitting that into a
+// read-then-write would reintroduce a real race condition the original was
+// built to avoid, so it stays raw on purpose, not because it's technically
+// blocked. Two consequences of moving findAll/findById to the ORM early on,
+// both deliberate, not oversights:
 //   1. purchase_date/received_date/assigned_date/borrowed_on/due_back come
 //      back as plain 'YYYY-MM-DD' strings now, not Date objects - Sequelize's
 //      mssql dialect derives the JS type from the SQL column's actual type
@@ -199,11 +198,11 @@ async function findById(id) {
   return row ? shapeEquipmentRow(row) : null;
 }
 
-// Used by every function below - these are all still raw sequelize.query()
-// (see the comment above findAll for why), where an unmapped DATE column
-// still comes back as a string and needs converting back to a Date object
-// to match their existing behavior. Only findAll/findById went through the
-// ORM-association rewrite and dropped this - everything below is unchanged.
+// Used by most functions below, ORM-converted or not: a DATE column comes
+// back as a plain string either way (see point 1 in the comment above
+// findAll for why no model declaration fixes this), so this still needs to
+// convert it back to a Date object to match pre-migration behavior. Only
+// findAll/findById dropped this - see point 1 above for why.
 const DATE_FIELDS = ['purchase_date', 'received_date', 'assigned_date'];
 function fixDates(row) {
   if (!row) return row;
@@ -760,10 +759,7 @@ async function remove(id, actor) {
   const customFieldModel = require('./customFieldModel');
 
   return sequelize.transaction(async (transaction) => {
-    const [equipment] = await sequelize.query(
-      'SELECT * FROM dbo.equipment WHERE equipment_id = :id',
-      { replacements: { id }, type: QueryTypes.SELECT, transaction },
-    );
+    const equipment = await Equipment.findByPk(id, { transaction, raw: true });
     if (!equipment) return null;
 
     let customValues = [];
@@ -791,10 +787,7 @@ async function remove(id, actor) {
       transaction,
     );
 
-    await sequelize.query(
-      'DELETE FROM dbo.equipment WHERE equipment_id = :id',
-      { replacements: { id }, transaction },
-    );
+    await Equipment.destroy({ where: { equipment_id: id }, transaction });
 
     return equipment;
   });
