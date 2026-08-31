@@ -6,13 +6,16 @@ const { Department } = require('./departmentModel');
 const { EquipmentStatus } = require('./statusModel');
 const { Employee } = require('./employeeModel');
 
-// findAll/findById below go through real Sequelize associations rather than
-// sequelize.query() - every other function in this file (assign/update/
-// createStock/the unassign* family/findAvailable*/findByDateRange) stays on
-// raw sequelize.query(), largely for the same status-name-to-status_id
-// subquery reason explained on assign()/update() below, which doesn't map
-// onto Model.update(). Two consequences of moving these two to the ORM,
-// both deliberate, not oversights:
+// findAll/findById, and since then createStock/update/assign/the unassign*
+// family, all go through real Sequelize associations rather than
+// sequelize.query(). Two remaining raw exceptions, both deliberate:
+// assignToEmployee() reads department_id/location from dbo.employee inside
+// the same atomic UPDATE - splitting that into a read-then-write would
+// reintroduce a real race condition the original was built to avoid, so it
+// stays raw on purpose, not because it's technically blocked. countReferences()
+// and remove() are genuinely blocked/transaction-interop (see their own
+// comments). Two consequences of moving findAll/findById to the ORM early
+// on, both deliberate, not oversights:
 //   1. purchase_date/received_date/assigned_date/borrowed_on/due_back come
 //      back as plain 'YYYY-MM-DD' strings now, not Date objects - Sequelize's
 //      mssql dialect derives the JS type from the SQL column's actual type
