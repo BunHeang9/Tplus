@@ -1,6 +1,5 @@
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Deleted records held for admin review.
 //
@@ -96,16 +95,30 @@ async function findById(binId) {
   return RecycleBin.findByPk(binId, { raw: true });
 }
 
+// Which Sequelize model owns each restorable entity_type - lazily required
+// (this whole file's own required-by graph is a mix: employeeModel.js
+// requires this file eagerly at its own top level, so this file's require
+// of Employee back must be lazy; department/equipment/category don't
+// require this file eagerly at all, but the same lazy pattern is used for
+// all four here for consistency, verified in both load orders).
+function resolveModel(entityType) {
+  switch (entityType) {
+    case 'employee': return require('./employeeModel').Employee;
+    case 'equipment': return require('./equipmentModel').Equipment;
+    case 'department': return require('./departmentModel').Department;
+    case 'category': return require('./categoryModel').Category;
+    default: return null;
+  }
+}
+
 // Checks whether the original id is free before attempting a restore.
 async function idIsTaken(entityType, entityId) {
   const target = RESTORE_TARGETS[entityType];
-  if (!target) return false;
+  const Model = resolveModel(entityType);
+  if (!target || !Model) return false;
 
-  const rows = await sequelize.query(
-    `SELECT 1 AS found FROM ${target.table} WHERE ${target.idColumn} = :id`,
-    { replacements: { id: entityId }, type: QueryTypes.SELECT },
-  );
-  return rows.length > 0;
+  const count = await Model.count({ where: { [target.idColumn]: entityId } });
+  return count > 0;
 }
 
 // Puts the row back with its original primary key.
@@ -129,13 +142,15 @@ async function restore(binId, restoredBy) {
   const data = JSON.parse(entry.entity_data);
 
   // Only restore columns the table still has - a column dropped since the
-  // delete would otherwise make the INSERT fail.
-  const cols = await sequelize.query(`
-      SELECT COLUMN_NAME
-      FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_NAME = :table AND TABLE_SCHEMA = 'dbo'
-    `, { replacements: { table: target.table.replace("dbo.", "") }, type: QueryTypes.SELECT });
-  const liveColumns = new Set(cols.map((r) => r.COLUMN_NAME));
+  // delete would otherwise make the INSERT fail. No Sequelize model maps
+  // onto "every column of an arbitrary table", so this uses Sequelize's own
+  // QueryInterface.describeTable() - the ORM-level introspection API,
+  // same technique as viewColumnModel.js/partStockColumnModel.js/
+  // partModel.js's uses of it elsewhere in this migration.
+  const desc = await sequelize.getQueryInterface().describeTable({
+    tableName: target.table.replace("dbo.", ""), schema: 'dbo',
+  });
+  const liveColumns = new Set(Object.keys(desc));
 
   const columns = Object.keys(data).filter(
     (c) => liveColumns.has(c) && data[c] !== undefined,
@@ -173,11 +188,10 @@ async function restore(binId, restoredBy) {
       END CATCH
     `, { replacements, transaction });
 
-    await sequelize.query(`
-        UPDATE dbo.recycle_bin
-        SET restored_at = GETDATE(), restored_by = :restored_by
-        WHERE bin_id = :id
-      `, { replacements: { id: binId, restored_by: restoredBy || null }, transaction });
+    await RecycleBin.update(
+      { restored_at: sequelize.fn('GETDATE'), restored_by: restoredBy || null },
+      { where: { bin_id: binId }, transaction },
+    );
   });
 
   return { restored: data, entry };
@@ -205,6 +219,7 @@ module.exports = {
   create,
   findAll,
   findById,
+  idIsTaken,
   restore,
   purge,
   purgeAll,
