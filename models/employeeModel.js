@@ -2,6 +2,7 @@ const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const recycleBinModel = require("./recycleBinModel");
+const { Department } = require('./departmentModel');
 
 // All database access for employees lives here.
 // Controllers call these functions; they never write SQL themselves.
@@ -25,6 +26,12 @@ const Employee = sequelize.define('Employee', {
   schema: 'dbo',
   timestamps: false,
 });
+
+// Defined once, here, since employeeModel.js is Employee's natural owner -
+// equipmentModel.js (which also needs Employee->Department for the owner's
+// department) relies on this having already run by requiring this file
+// before using the association itself.
+Employee.belongsTo(Department, { foreignKey: 'department_id', as: 'department' });
 
 // Active employees only by default - a leaver should not appear in an assign
 // or borrow dropdown. Pass includeInactive to get everyone, e.g. for an admin
@@ -75,13 +82,17 @@ async function findAllWithEquipment(includeInactive = false) {
 }
 
 async function findById(id) {
-  const rows = await sequelize.query(`
-    SELECT emp.*, d.department_code, d.department_name
-    FROM dbo.employee emp
-    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
-    WHERE emp.employee_id = :id
-  `, { replacements: { id }, type: QueryTypes.SELECT });
-  return rows[0] || null;
+  const row = await Employee.findByPk(id, {
+    include: [{ model: Department, as: 'department' }],
+  });
+  if (!row) return null;
+
+  const { department, ...rest } = row.get({ plain: true });
+  return {
+    ...rest,
+    department_code: department ? department.department_code : null,
+    department_name: department ? department.department_name : null,
+  };
 }
 
 // The "search employee, see everything" query - joins equipment,

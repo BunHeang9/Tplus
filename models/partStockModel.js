@@ -1,5 +1,52 @@
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+
+// Leaf models for dbo.part_type and dbo.part_stock - partModel.js only ever
+// requires this file lazily (inside functions, to dodge a load-time cycle),
+// never the other way round, so it's safe for these two to live here and be
+// exported for partModel.js/partBorrowModel.js to build associations onto.
+const PartType = sequelize.define('PartType', {
+  part_type_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  part_name: { type: DataTypes.STRING(50), allowNull: false },
+  description: { type: DataTypes.STRING(255), allowNull: true },
+  equipment_column: { type: DataTypes.STRING(50), allowNull: true },
+  tracks_value: { type: DataTypes.BOOLEAN, allowNull: true },
+  is_countable: { type: DataTypes.BOOLEAN, allowNull: true },
+  sort_order: { type: DataTypes.INTEGER, allowNull: true },
+  is_active: { type: DataTypes.BOOLEAN, allowNull: true },
+}, {
+  tableName: 'part_type',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+const PartStock = sequelize.define('PartStock', {
+  stock_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  part_type_id: { type: DataTypes.INTEGER, allowNull: false },
+  part_value: { type: DataTypes.STRING(50), allowNull: true },
+  model_name: { type: DataTypes.STRING(100), allowNull: true },
+  model_number: { type: DataTypes.STRING(100), allowNull: true },
+  disk_type: { type: DataTypes.STRING(30), allowNull: true },
+  disk_interface: { type: DataTypes.STRING(30), allowNull: true },
+  ram_type: { type: DataTypes.STRING(30), allowNull: true },
+  status: { type: DataTypes.STRING(30), allowNull: false },
+  quantity: { type: DataTypes.INTEGER, allowNull: false },
+  location: { type: DataTypes.STRING(100), allowNull: true },
+  remark: { type: DataTypes.STRING(255), allowNull: true },
+  is_active: { type: DataTypes.BOOLEAN, allowNull: true },
+  // DATETIME, not DATEONLY - fixDates() below still converts it back to a
+  // Date object for the functions that stay raw; the two ORM reads
+  // (findAll/findAvailable/findById) return it as a string instead, same
+  // accepted trade-off as everywhere else in this migration.
+  updated_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'part_stock',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+PartStock.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
 
 // Spare parts held in stock.
 //
@@ -51,76 +98,123 @@ function parseNumericPartValue(value) {
 async function findAll(filters = {}) {
   const { part_type_id, status, in_stock_only } = filters;
 
-  let query = `
-    SELECT s.stock_id, s.part_type_id, pt.part_name, pt.is_countable,
-           pt.tracks_value,
-           s.part_value, s.model_name, s.model_number,
-           s.disk_type, s.disk_interface, s.ram_type,
-           s.status, s.quantity, s.location, s.remark, s.is_active, s.updated_at,
-           -- Separate from status: status is the part's condition (working/
-           -- broken), this is whether there's any left to hand out. A broken
-           -- line at 0 is still "Broken", just also out of stock.
-           CASE WHEN s.quantity = 0 THEN 'Out of Stock' ELSE 'In Stock' END AS stock_state
-    FROM dbo.part_stock s
-    JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-    WHERE 1=1
-  `;
-  const replacements = {};
-
-  if (part_type_id) {
-    query += ' AND s.part_type_id = :part_type_id';
-    replacements.part_type_id = part_type_id;
-  }
-  if (status) {
-    query += ' AND s.status = :status';
-    replacements.status = status;
-  }
+  const where = { is_active: true };
+  if (part_type_id) where.part_type_id = part_type_id;
+  if (status) where.status = status;
   // A line that has dropped to zero is history, not stock - the form should
   // not offer it.
-  if (in_stock_only === 'true') query += ' AND s.quantity > 0';
-  query += ' AND s.is_active = 1';
-  // Falls back to the model name - accessories have no part_value, so
-  // ordering on it alone would group them unpredictably.
-  query += ' ORDER BY pt.sort_order, COALESCE(s.part_value, s.model_name), s.status';
+  if (in_stock_only === 'true') where.quantity = { [Op.gt]: 0 };
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartStock.findAll({
+    where,
+    include: [{ model: PartType, as: 'partType', attributes: ['part_name', 'is_countable', 'tracks_value'] }],
+    order: [
+      [{ model: PartType, as: 'partType' }, 'sort_order', 'ASC'],
+      // Falls back to the model name - accessories have no part_value, so
+      // ordering on it alone would group them unpredictably.
+      [sequelize.fn('COALESCE', sequelize.col('part_value'), sequelize.col('model_name')), 'ASC'],
+      ['status', 'ASC'],
+    ],
+  });
+
+  return rows.map((row) => {
+    const { partType, ...s } = row.get({ plain: true });
+    return fixDates({
+      stock_id: s.stock_id,
+      part_type_id: s.part_type_id,
+      part_name: partType ? partType.part_name : null,
+      is_countable: partType ? partType.is_countable : null,
+      tracks_value: partType ? partType.tracks_value : null,
+      part_value: s.part_value,
+      model_name: s.model_name,
+      model_number: s.model_number,
+      disk_type: s.disk_type,
+      disk_interface: s.disk_interface,
+      ram_type: s.ram_type,
+      status: s.status,
+      quantity: s.quantity,
+      location: s.location,
+      remark: s.remark,
+      is_active: s.is_active,
+      updated_at: s.updated_at,
+      // Separate from status: status is the part's condition (working/
+      // broken), this is whether there's any left to hand out. A broken
+      // line at 0 is still "Broken", just also out of stock.
+      stock_state: s.quantity === 0 ? 'Out of Stock' : 'In Stock',
+    });
+  });
 }
 
 // What can actually be fitted right now: working, and more than zero.
 async function findAvailable(partTypeId) {
-  let query = `
-    SELECT s.stock_id, s.part_type_id, pt.part_name, pt.tracks_value,
-           s.part_value, s.model_name, s.model_number,
-           s.disk_type, s.disk_interface, s.ram_type,
-           s.status, s.quantity, s.location
-    FROM dbo.part_stock s
-    JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-    WHERE s.quantity > 0
-      AND s.is_active = 1
-            -- Only stock statuses can be fitted. Excluding known-bad ones let
-      -- 'Borrowed' and 'Working/Using' through, neither of which describes
-      -- something sitting on a shelf.
-      AND s.status = 'Working - IT Stock'
-  `;
-  const replacements = {};
-  if (partTypeId) {
-    query += ' AND s.part_type_id = :part_type_id';
-    replacements.part_type_id = partTypeId;
-  }
-  query += ' ORDER BY pt.sort_order, COALESCE(s.part_value, s.model_name)';
+  const where = {
+    quantity: { [Op.gt]: 0 },
+    is_active: true,
+    // Only stock statuses can be fitted. Excluding known-bad ones lets
+    // 'Borrowed' and 'Working/Using' through, neither of which describes
+    // something sitting on a shelf.
+    status: 'Working - IT Stock',
+  };
+  if (partTypeId) where.part_type_id = partTypeId;
 
-  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  const rows = await PartStock.findAll({
+    where,
+    attributes: ['stock_id', 'part_type_id', 'part_value', 'model_name', 'model_number',
+      'disk_type', 'disk_interface', 'ram_type', 'status', 'quantity', 'location'],
+    include: [{ model: PartType, as: 'partType', attributes: ['part_name', 'tracks_value'] }],
+    order: [
+      [{ model: PartType, as: 'partType' }, 'sort_order', 'ASC'],
+      [sequelize.fn('COALESCE', sequelize.col('part_value'), sequelize.col('model_name')), 'ASC'],
+    ],
+  });
+
+  return rows.map((row) => {
+    const { partType, ...s } = row.get({ plain: true });
+    return {
+      stock_id: s.stock_id,
+      part_type_id: s.part_type_id,
+      part_name: partType ? partType.part_name : null,
+      tracks_value: partType ? partType.tracks_value : null,
+      part_value: s.part_value,
+      model_name: s.model_name,
+      model_number: s.model_number,
+      disk_type: s.disk_type,
+      disk_interface: s.disk_interface,
+      ram_type: s.ram_type,
+      status: s.status,
+      quantity: s.quantity,
+      location: s.location,
+    };
+  });
 }
 
 async function findById(stockId) {
-  const rows = await sequelize.query(`
-      SELECT s.*, pt.part_name, pt.is_countable
-      FROM dbo.part_stock s
-      JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-      WHERE s.stock_id = :id
-    `, { replacements: { id: stockId }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
+  const row = await PartStock.findByPk(stockId, {
+    include: [{ model: PartType, as: 'partType', attributes: ['part_name', 'is_countable'] }],
+  });
+  if (!row) return null;
+  const { partType, ...s } = row.get({ plain: true });
+  // `s.*` in the original query returns columns in the table's own physical
+  // order, which doesn't match this model's attribute declaration order -
+  // reconstructed explicitly so the JSON key order matches byte-for-byte.
+  return fixDates({
+    stock_id: s.stock_id,
+    part_type_id: s.part_type_id,
+    part_value: s.part_value,
+    status: s.status,
+    quantity: s.quantity,
+    remark: s.remark,
+    updated_at: s.updated_at,
+    location: s.location,
+    model_name: s.model_name,
+    model_number: s.model_number,
+    is_active: s.is_active,
+    disk_type: s.disk_type,
+    disk_interface: s.disk_interface,
+    ram_type: s.ram_type,
+    part_name: partType ? partType.part_name : null,
+    is_countable: partType ? partType.is_countable : null,
+  });
 }
 
 // Adds to stock, creating the line if this part, value and condition have not
@@ -356,22 +450,33 @@ async function remove(stockId) {
   });
 }
 
-// Totals for a dashboard tile.
+// Totals for a dashboard tile. The two conditional sums have no plain-column
+// equivalent in Sequelize's query builder, so they go through fn()+literal()
+// for the CASE expression itself - everything around it (the join, the
+// group, the order) is still expressed as ORM include/group/order, not a
+// hand-written query string.
 async function getSummary() {
-  return sequelize.query(`
-    SELECT pt.part_name,
-           SUM(CASE WHEN s.status NOT LIKE '%Broken%' AND s.status NOT LIKE '%Retired%'
-                    THEN s.quantity ELSE 0 END) AS working,
-           SUM(CASE WHEN s.status LIKE '%Broken%' THEN s.quantity ELSE 0 END) AS broken,
-           SUM(s.quantity) AS total
-    FROM dbo.part_stock s
-    JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-    GROUP BY pt.part_name, pt.sort_order
-    ORDER BY pt.sort_order
-  `, { type: QueryTypes.SELECT });
+  return PartStock.findAll({
+    attributes: [
+      [sequelize.col('partType.part_name'), 'part_name'],
+      [sequelize.fn('SUM', sequelize.literal(
+        "CASE WHEN status NOT LIKE '%Broken%' AND status NOT LIKE '%Retired%' THEN quantity ELSE 0 END",
+      )), 'working'],
+      [sequelize.fn('SUM', sequelize.literal(
+        "CASE WHEN status LIKE '%Broken%' THEN quantity ELSE 0 END",
+      )), 'broken'],
+      [sequelize.fn('SUM', sequelize.col('PartStock.quantity')), 'total'],
+    ],
+    include: [{ model: PartType, as: 'partType', attributes: [] }],
+    group: ['partType.part_name', 'partType.sort_order'],
+    order: [[{ model: PartType, as: 'partType' }, 'sort_order', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
 }
 
 module.exports = {
+  PartStock, PartType,
   STATUSES,
   parseNumericPartValue,
   findAll, findAvailable, findById,

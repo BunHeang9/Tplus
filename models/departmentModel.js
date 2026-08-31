@@ -82,30 +82,24 @@ async function remove(id, actor) {
   const recycleBinModel = require('./recycleBinModel');
 
   return sequelize.transaction(async (transaction) => {
-    const [department] = await sequelize.query(
-      'SELECT * FROM dbo.department WHERE department_id = :id',
-      { replacements: { id }, type: QueryTypes.SELECT, transaction },
-    );
-    if (!department) return null;
+    const row = await Department.findByPk(id, { transaction, raw: true });
+    if (!row) return null;
 
     await recycleBinModel.create(
       {
         entityType: 'department',
         entityId: id,
-        entityLabel: department.department_name || department.department_code,
-        entityData: department,
+        entityLabel: row.department_name || row.department_code,
+        entityData: row,
         actor,
         reason: 'Department deleted',
       },
       transaction,
     );
 
-    await sequelize.query(
-      'DELETE FROM dbo.department WHERE department_id = :id',
-      { replacements: { id }, transaction },
-    );
+    await Department.destroy({ where: { department_id: id }, transaction });
 
-    return department;
+    return row;
   });
 }
 

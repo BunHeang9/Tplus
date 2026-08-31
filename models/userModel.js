@@ -93,5 +93,6 @@ async function countAdmins(excludeUserId) {
 }
 
 module.exports = {
+  ApiUser,
   findByUsername, create, findAll, findById, update, setPassword, countAdmins,
 };

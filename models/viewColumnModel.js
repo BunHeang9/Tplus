@@ -25,6 +25,8 @@ const CategoryViewColumn = sequelize.define('CategoryViewColumn', {
   timestamps: false,
 });
 
+Category.hasMany(CategoryViewColumn, { foreignKey: 'category_id', as: 'viewColumns' });
+
 // Columns that are always present and not configurable - a view without an id
 // would give the frontend no way to open or edit a row.
 const ALWAYS_INCLUDED = ['equipment_id'];
@@ -132,18 +134,36 @@ async function findByCategory(categoryId) {
   });
 }
 
-// A LEFT JOIN from category to its columns - raw query, since a category
-// with none configured still needs to come back (with an empty column set),
-// not be silently dropped the way an INNER-JOIN-shaped association would.
+// A LEFT JOIN from category to its columns - a category with none
+// configured still needs to come back (with an empty column set), not be
+// silently dropped, so the include below isn't `required`. Flattened back
+// into the same one-row-per-column (or one all-null row) shape the raw
+// LEFT JOIN gave, since Category.hasMany(...) naturally nests the columns
+// under a single category row instead.
 async function findByViewKey(viewKey) {
-  return sequelize.query(`
-    SELECT c.category_id, c.category_name, c.view_key,
-           v.field_name, v.header_text, v.sort_order, v.is_editable
-    FROM dbo.category c
-    LEFT JOIN dbo.category_view_column v ON c.category_id = v.category_id
-    WHERE c.view_key = :view_key
-    ORDER BY v.sort_order, v.view_column_id
-  `, { replacements: { view_key: viewKey }, type: QueryTypes.SELECT });
+  const cat = await Category.findOne({
+    where: { view_key: viewKey },
+    include: [{ model: CategoryViewColumn, as: 'viewColumns' }],
+  });
+  if (!cat) return [];
+
+  const { category_id, category_name, view_key: vk, viewColumns } = cat.get({ plain: true });
+  const base = { category_id, category_name, view_key: vk };
+
+  if (!viewColumns || viewColumns.length === 0) {
+    return [{ ...base, field_name: null, header_text: null, sort_order: null, is_editable: null }];
+  }
+
+  return viewColumns
+    .slice()
+    .sort((a, b) => a.sort_order - b.sort_order || a.view_column_id - b.view_column_id)
+    .map((v) => ({
+      ...base,
+      field_name: v.field_name,
+      header_text: v.header_text,
+      sort_order: v.sort_order,
+      is_editable: v.is_editable,
+    }));
 }
 
 async function listViews() {

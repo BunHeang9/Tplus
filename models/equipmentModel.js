@@ -87,7 +87,8 @@ Equipment.belongsTo(Category, { foreignKey: 'category_id', as: 'category' });
 Equipment.belongsTo(Department, { foreignKey: 'department_id', as: 'department' });
 Equipment.belongsTo(EquipmentStatus, { foreignKey: 'status_id', as: 'equipmentStatus' });
 Equipment.belongsTo(Employee, { foreignKey: 'owner_id', as: 'owner' });
-Employee.belongsTo(Department, { foreignKey: 'department_id', as: 'department' });
+// Employee->Department ('owner'.department) is defined in employeeModel.js
+// itself, not here - already set up by the require above.
 Equipment.hasOne(BorrowRecord, { foreignKey: 'equipment_id', as: 'openLoan' });
 BorrowRecord.belongsTo(Employee, { foreignKey: 'borrower_id', as: 'borrower' });
 
@@ -721,6 +722,9 @@ async function remove(id, actor) {
 }
 
 module.exports = {
+  Equipment, // exported so other files can build associations against this
+  // same table definition (and its own category/department/owner
+  // associations) rather than redefining it.
   findAll,
   update,
   countReferences,

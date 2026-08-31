@@ -1,5 +1,11 @@
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { Equipment } = require('./equipmentModel');
+const { Employee } = require('./employeeModel');
+const { Department } = require('./departmentModel');
+const { Category } = require('./categoryModel');
+const { EquipmentStatus } = require('./statusModel');
 
 // Temporary equipment loans (dbo.borrow_record).
 //
@@ -13,10 +19,76 @@ const { QueryTypes } = require('sequelize');
 const BORROWABLE_STATUS = 'Working - IT Stock';
 const BORROWED_STATUS   = 'Borrowed';
 
+// Defined here (not in equipmentModel.js) and pointing outward at
+// Equipment/Employee via belongsTo only - equipmentModel.js never needs to
+// know about BorrowRecord, so this avoids the circular require that would
+// come from the reverse (Equipment.hasOne(BorrowRecord)) needing this file
+// while this file also needs Equipment.
+const BorrowRecord = sequelize.define('BorrowRecord', {
+  borrow_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  equipment_id: { type: DataTypes.INTEGER, allowNull: false },
+  borrower_id: { type: DataTypes.INTEGER, allowNull: false },
+  borrow_date: { type: DataTypes.DATEONLY, allowNull: true },
+  expected_return_date: { type: DataTypes.DATEONLY, allowNull: true },
+  return_date: { type: DataTypes.DATEONLY, allowNull: true },
+  condition_on_borrow: { type: DataTypes.STRING(255), allowNull: true },
+  condition_on_return: { type: DataTypes.STRING(255), allowNull: true },
+  issued_by_id: { type: DataTypes.INTEGER, allowNull: true },
+  received_by_id: { type: DataTypes.INTEGER, allowNull: true },
+  purpose: { type: DataTypes.STRING(255), allowNull: true },
+  remark: { type: DataTypes.STRING(255), allowNull: true },
+  // Legacy DATETIME with its own DB-side default - same allowNull:true,
+  // no-defaultValue pattern used everywhere else in this migration.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+  // Name snapshots, only ever written by employeeModel.remove() when the
+  // employee record itself is about to be deleted - not touched by
+  // anything in this file, but findOpenLoanByEquipment's raw `SELECT *`
+  // exposed them, so they're declared to keep that response shape intact.
+  borrower_name: { type: DataTypes.STRING(255), allowNull: true },
+  issued_by_name: { type: DataTypes.STRING(255), allowNull: true },
+  received_by_name: { type: DataTypes.STRING(255), allowNull: true },
+}, {
+  tableName: 'borrow_record',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+BorrowRecord.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
+BorrowRecord.belongsTo(Employee, { foreignKey: 'borrower_id', as: 'borrower' });
+BorrowRecord.belongsTo(Employee, { foreignKey: 'issued_by_id', as: 'issuer' });
+BorrowRecord.belongsTo(Employee, { foreignKey: 'received_by_id', as: 'receiver' });
+
+// Read-only mapping of the vw_currently_borrowed view (findCurrentlyBorrowed).
+const CurrentlyBorrowedView = sequelize.define('CurrentlyBorrowedView', {
+  borrow_id: { type: DataTypes.INTEGER, primaryKey: true },
+  equipment_id: DataTypes.INTEGER,
+  category_name: DataTypes.STRING(50),
+  computer_name: DataTypes.STRING(100),
+  device_model: DataTypes.STRING(100),
+  asset_code: DataTypes.STRING(30),
+  service_tag: DataTypes.STRING(100),
+  borrower_id: DataTypes.INTEGER,
+  borrower_name: DataTypes.STRING(150),
+  borrower_department: DataTypes.STRING(50),
+  borrow_date: DataTypes.DATEONLY,
+  expected_return_date: DataTypes.DATEONLY,
+  days_out: DataTypes.INTEGER,
+  is_overdue: DataTypes.INTEGER,
+  condition_on_borrow: DataTypes.STRING(255),
+  purpose: DataTypes.STRING(255),
+  remark: DataTypes.STRING(255),
+}, {
+  tableName: 'vw_currently_borrowed',
+  schema: 'dbo',
+  timestamps: false,
+});
+
 // Raw queries with no model attribute definition return a plain string for a
 // DATE/DATETIME column; the driver this replaces returned a Date object for
 // the same column. Converting back keeps every response identical to before
-// this migration.
+// this migration. Still needed even on the ORM path - DATEONLY reads back
+// as a string through the ORM too, the same trade-off already made (and
+// approved) for equipmentModel.js's findAll/findById.
 const DATE_FIELDS = ['borrow_date', 'expected_return_date', 'return_date', 'created_at'];
 function fixDates(row) {
   if (!row) return row;
@@ -26,33 +98,44 @@ function fixDates(row) {
   return row;
 }
 
-// Everything needed to decide whether this item can be lent out.
+// Everything needed to decide whether this item can be lent out. Two
+// separate ORM reads (the equipment row, and its open loan if any) merged
+// in JS, rather than one JOIN - avoids needing Equipment to know about
+// BorrowRecord at all (see the comment on BorrowRecord above), and this is
+// a single-equipment lookup, not a list, so the extra round trip is free
+// in practice.
 async function findEquipmentForBorrow(equipmentId) {
-  const rows = await sequelize.query(`
-      SELECT e.equipment_id, e.owner_id, e.status,
-             st.is_borrowable,
-             e.computer_name, e.device_model, e.asset_code,
-             c.category_name,
-             owner.full_name    AS current_owner,
-             open_loan.borrow_id   AS open_borrow_id,
-             open_loan.borrow_date AS open_borrow_date,
-             borrower.full_name AS current_borrower
-      FROM dbo.equipment e
-      LEFT JOIN dbo.category c    ON e.category_id = c.category_id
-      LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-      LEFT JOIN dbo.employee owner ON e.owner_id = owner.employee_id
-      OUTER APPLY (
-          SELECT TOP 1 b.borrow_id, b.borrow_date, b.borrower_id
-          FROM dbo.borrow_record b
-          WHERE b.equipment_id = e.equipment_id AND b.return_date IS NULL
-          ORDER BY b.borrow_date DESC
-      ) AS open_loan
-      LEFT JOIN dbo.employee borrower ON open_loan.borrower_id = borrower.employee_id
-      WHERE e.equipment_id = :id
-    `, { replacements: { id: equipmentId }, type: QueryTypes.SELECT });
-  const row = rows[0];
-  if (row && row.open_borrow_date) row.open_borrow_date = new Date(row.open_borrow_date);
-  return row || null;
+  const equipment = await Equipment.findByPk(equipmentId, {
+    include: [
+      { model: Category, as: 'category' },
+      { model: EquipmentStatus, as: 'equipmentStatus' },
+      { model: Employee, as: 'owner' },
+    ],
+  });
+  if (!equipment) return null;
+  const e = equipment.get({ plain: true });
+
+  const openLoan = await BorrowRecord.findOne({
+    where: { equipment_id: equipmentId, return_date: null },
+    order: [['borrow_date', 'DESC']],
+    include: [{ model: Employee, as: 'borrower' }],
+  });
+  const loan = openLoan ? openLoan.get({ plain: true }) : null;
+
+  return {
+    equipment_id: e.equipment_id,
+    owner_id: e.owner_id,
+    status: e.status,
+    is_borrowable: e.equipmentStatus ? e.equipmentStatus.is_borrowable : null,
+    computer_name: e.computer_name,
+    device_model: e.device_model,
+    asset_code: e.asset_code,
+    category_name: e.category ? e.category.category_name : null,
+    current_owner: e.owner ? e.owner.full_name : null,
+    open_borrow_id: loan ? loan.borrow_id : null,
+    open_borrow_date: loan ? loan.borrow_date : null,
+    current_borrower: loan && loan.borrower ? loan.borrower.full_name : null,
+  };
 }
 
 // Creating the loan and flipping the equipment status happen together in a
@@ -61,31 +144,20 @@ async function findEquipmentForBorrow(equipmentId) {
 // (no external transaction interop), so this uses sequelize.transaction().
 async function create(d) {
   return sequelize.transaction(async (transaction) => {
-    const [inserted] = await sequelize.query(`
-        INSERT INTO dbo.borrow_record (
-          equipment_id, borrower_id, borrow_date, expected_return_date,
-          condition_on_borrow, issued_by_id, purpose, remark
-        )
-        OUTPUT INSERTED.*
-        VALUES (
-          :equipment_id, :borrower_id, :borrow_date, :expected_return_date,
-          :condition_on_borrow, :issued_by_id, :purpose, :remark
-        )
-      `, {
-      replacements: {
-        equipment_id: d.equipment_id,
-        borrower_id: d.borrower_id,
-        borrow_date: d.borrow_date,
-        expected_return_date: d.expected_return_date || null,
-        condition_on_borrow: d.condition_on_borrow || null,
-        issued_by_id: d.issued_by_id || null,
-        purpose: d.purpose || null,
-        remark: d.remark || null,
-      },
-      type: QueryTypes.SELECT,
-      transaction,
-    });
+    const row = await BorrowRecord.create({
+      equipment_id: d.equipment_id,
+      borrower_id: d.borrower_id,
+      borrow_date: d.borrow_date,
+      expected_return_date: d.expected_return_date || null,
+      condition_on_borrow: d.condition_on_borrow || null,
+      issued_by_id: d.issued_by_id || null,
+      purpose: d.purpose || null,
+      remark: d.remark || null,
+    }, { transaction });
 
+    // status_id is resolved from the status name via a correlated subquery,
+    // same reasoning as equipmentModel.js's own assign()/update() - doesn't
+    // map onto Model.update(), so this one statement stays raw.
     await sequelize.query(`
         UPDATE dbo.equipment
         SET status    = :status,
@@ -96,33 +168,38 @@ async function create(d) {
       transaction,
     });
 
-    return fixDates(inserted);
+    return fixDates(row.get({ plain: true }));
   });
 }
 
 async function findById(borrowId) {
-  const rows = await sequelize.query(`
-      SELECT b.*,
-             e.computer_name, e.device_model, e.asset_code,
-             c.category_name,
-             emp.full_name AS borrower_name
-      FROM dbo.borrow_record b
-      JOIN dbo.equipment e     ON b.equipment_id = e.equipment_id
-      JOIN dbo.employee emp    ON b.borrower_id = emp.employee_id
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      WHERE b.borrow_id = :id
-    `, { replacements: { id: borrowId }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
+  const row = await BorrowRecord.findByPk(borrowId, {
+    include: [
+      { model: Equipment, as: 'equipment', required: true, include: [{ model: Category, as: 'category' }] },
+      { model: Employee, as: 'borrower', required: true },
+    ],
+  });
+  if (!row) return null;
+
+  const { equipment, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+  return fixDates({
+    ...b,
+    computer_name: equipment.computer_name,
+    device_model: equipment.device_model,
+    asset_code: equipment.asset_code,
+    category_name: equipment.category ? equipment.category.category_name : null,
+    borrower_name: borrower.full_name,
+  });
 }
 
 // Lets the caller return an item by equipment_id without knowing the borrow_id.
 async function findOpenLoanByEquipment(equipmentId) {
-  const rows = await sequelize.query(`
-      SELECT TOP 1 * FROM dbo.borrow_record
-      WHERE equipment_id = :id AND return_date IS NULL
-      ORDER BY borrow_date DESC
-    `, { replacements: { id: equipmentId }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
+  const row = await BorrowRecord.findOne({
+    where: { equipment_id: equipmentId, return_date: null },
+    order: [['borrow_date', 'DESC']],
+    raw: true,
+  });
+  return fixDates(row) || null;
 }
 
 // Closing the loan and returning the equipment to stock, in one transaction.
@@ -131,179 +208,178 @@ async function findOpenLoanByEquipment(equipmentId) {
 // Self-contained, so this uses sequelize.transaction().
 async function markReturned(borrowId, d) {
   return sequelize.transaction(async (transaction) => {
-    const [returned] = await sequelize.query(`
-        UPDATE dbo.borrow_record
-        SET return_date         = :return_date,
-            condition_on_return = :condition_on_return,
-            received_by_id      = COALESCE(:received_by_id, received_by_id),
-            remark              = COALESCE(:remark, remark)
-        OUTPUT INSERTED.*
-        WHERE borrow_id = :id
+    const values = { return_date: d.return_date };
+    if (d.condition_on_return !== undefined) values.condition_on_return = d.condition_on_return || null;
+    if (d.received_by_id) values.received_by_id = d.received_by_id;
+    if (d.remark) values.remark = d.remark;
+
+    const [, [row]] = await BorrowRecord.update(values, {
+      where: { borrow_id: borrowId },
+      returning: true,
+      transaction,
+    });
+    if (!row) return null;
+    const returned = row.get({ plain: true });
+
+    await sequelize.query(`
+        UPDATE dbo.equipment
+        SET status    = :status,
+            status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
+        WHERE equipment_id = :equipment_id
       `, {
-      replacements: {
-        id: borrowId,
-        return_date: d.return_date,
-        condition_on_return: d.condition_on_return || null,
-        received_by_id: d.received_by_id || null,
-        remark: d.remark || null,
-      },
-      type: QueryTypes.SELECT,
+      replacements: { equipment_id: returned.equipment_id, status: d.return_status || BORROWABLE_STATUS },
       transaction,
     });
 
-    if (returned) {
-      await sequelize.query(`
-          UPDATE dbo.equipment
-          SET status    = :status,
-              status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
-          WHERE equipment_id = :equipment_id
-        `, {
-        replacements: { equipment_id: returned.equipment_id, status: d.return_status || BORROWABLE_STATUS },
-        transaction,
-      });
-    }
-
-    return fixDates(returned) || null;
+    return fixDates(returned);
   });
 }
 
 async function findCurrentlyBorrowed(overdueOnly) {
-  let query = 'SELECT * FROM dbo.vw_currently_borrowed';
-  if (overdueOnly === 'true') query += ' WHERE is_overdue = 1';
-  query += ' ORDER BY is_overdue DESC, borrow_date';
-  const rows = await sequelize.query(query, { type: QueryTypes.SELECT });
+  const rows = await CurrentlyBorrowedView.findAll({
+    where: overdueOnly === 'true' ? { is_overdue: 1 } : undefined,
+    order: [['is_overdue', 'DESC'], ['borrow_date', 'ASC']],
+    raw: true,
+  });
   return rows.map(fixDates);
 }
 
 async function findHistory(filters = {}) {
   const { equipment_id, borrower_id, from, to } = filters;
 
-  let query = `
-    SELECT b.borrow_id, b.equipment_id,
-           c.category_name, e.computer_name, e.device_model, e.asset_code,
-           b.borrower_id, emp.full_name AS borrower_name,
-           d.department_code AS borrower_department,
-           b.borrow_date, b.expected_return_date, b.return_date,
-           CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status,
-           b.condition_on_borrow, b.condition_on_return,
-           issuer.full_name   AS issued_by,
-           receiver.full_name AS received_by,
-           b.purpose, b.remark
-    FROM dbo.borrow_record b
-    JOIN dbo.equipment e        ON b.equipment_id = e.equipment_id
-    JOIN dbo.employee emp       ON b.borrower_id = emp.employee_id
-    LEFT JOIN dbo.category c    ON e.category_id = c.category_id
-    LEFT JOIN dbo.department d  ON emp.department_id = d.department_id
-    LEFT JOIN dbo.employee issuer   ON b.issued_by_id = issuer.employee_id
-    LEFT JOIN dbo.employee receiver ON b.received_by_id = receiver.employee_id
-    WHERE 1=1
-  `;
-  const replacements = {};
-
-  if (equipment_id) {
-    query += ' AND b.equipment_id = :equipment_id';
-    replacements.equipment_id = equipment_id;
-  }
-  if (borrower_id) {
-    query += ' AND b.borrower_id = :borrower_id';
-    replacements.borrower_id = borrower_id;
-  }
-  if (from) {
-    query += ' AND b.borrow_date >= :from';
-    replacements.from = from;
-  }
-  if (to) {
-    query += ' AND b.borrow_date <= :to';
-    replacements.to = to;
+  const where = {};
+  if (equipment_id) where.equipment_id = equipment_id;
+  if (borrower_id) where.borrower_id = borrower_id;
+  if (from || to) {
+    where.borrow_date = {};
+    if (from) where.borrow_date[Op.gte] = from;
+    if (to) where.borrow_date[Op.lte] = to;
   }
 
-  query += ' ORDER BY b.borrow_date DESC, b.borrow_id DESC';
+  const rows = await BorrowRecord.findAll({
+    where,
+    include: [
+      {
+        model: Equipment, as: 'equipment', required: true,
+        include: [{ model: Category, as: 'category' }],
+      },
+      {
+        model: Employee, as: 'borrower', required: true,
+        include: [{ model: Department, as: 'department' }],
+      },
+      { model: Employee, as: 'issuer' },
+      { model: Employee, as: 'receiver' },
+    ],
+    order: [['borrow_date', 'DESC'], ['borrow_id', 'DESC']],
+  });
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  return rows.map((row) => {
+    const { equipment, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    return fixDates({
+      borrow_id: b.borrow_id,
+      equipment_id: b.equipment_id,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      computer_name: equipment.computer_name,
+      device_model: equipment.device_model,
+      asset_code: equipment.asset_code,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      loan_status: b.return_date === null ? 'Out' : 'Returned',
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+    });
+  });
 }
 
 // Returned loans only - the Returns page. Newest first, and it works out
 // days_kept and was_late here rather than making the frontend calculate them.
+// DATEDIFF-based day counts stay computed in JS below instead of via
+// sequelize.fn('DATEDIFF', ...) (mssql-specific, three-argument DATEDIFF
+// isn't one of Sequelize's portable fn helpers) - same values, computed
+// after the ORM read instead of inside the query.
 async function findReturns(filters = {}) {
   const { equipment_id, borrower_id, from, to, late_only } = filters;
 
-  let query = `
-    SELECT b.borrow_id,
-           b.equipment_id,
-           c.category_name,
-           e.computer_name,
-           e.device_model,
-           e.asset_code,
-           e.service_tag,
-           b.borrower_id,
-           emp.full_name        AS borrower_name,
-           emp.position         AS borrower_position,
-           d.department_code    AS borrower_department,
-           b.borrow_date,
-           b.expected_return_date,
-           b.return_date,
-           DATEDIFF(DAY, b.borrow_date, b.return_date) AS days_kept,
-           CASE
-               WHEN b.expected_return_date IS NOT NULL
-                AND b.return_date > b.expected_return_date
-               THEN 1 ELSE 0
-           END AS was_late,
-           CASE
-               WHEN b.expected_return_date IS NOT NULL
-                AND b.return_date > b.expected_return_date
-               THEN DATEDIFF(DAY, b.expected_return_date, b.return_date)
-               ELSE 0
-           END AS days_late,
-           b.condition_on_borrow,
-           b.condition_on_return,
-           st.status_name       AS current_status,
-           issuer.full_name     AS issued_by,
-           receiver.full_name   AS received_by,
-           b.purpose,
-           b.remark
-    FROM dbo.borrow_record b
-    JOIN dbo.equipment e             ON b.equipment_id = e.equipment_id
-    JOIN dbo.employee emp            ON b.borrower_id = emp.employee_id
-    LEFT JOIN dbo.category c         ON e.category_id = c.category_id
-    LEFT JOIN dbo.department d       ON emp.department_id = d.department_id
-    LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-    LEFT JOIN dbo.employee issuer    ON b.issued_by_id = issuer.employee_id
-    LEFT JOIN dbo.employee receiver  ON b.received_by_id = receiver.employee_id
-    WHERE b.return_date IS NOT NULL
-  `;
-  const replacements = {};
-
-  if (equipment_id) {
-    query += ' AND b.equipment_id = :equipment_id';
-    replacements.equipment_id = equipment_id;
-  }
-  if (borrower_id) {
-    query += ' AND b.borrower_id = :borrower_id';
-    replacements.borrower_id = borrower_id;
-  }
-  if (from) {
-    query += ' AND b.return_date >= :from';
-    replacements.from = from;
-  }
-  if (to) {
-    query += ' AND b.return_date <= :to';
-    replacements.to = to;
-  }
-  if (late_only === 'true') {
-    query += ' AND b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date';
+  const where = { return_date: { [Op.ne]: null } };
+  if (equipment_id) where.equipment_id = equipment_id;
+  if (borrower_id) where.borrower_id = borrower_id;
+  if (from || to) {
+    where.return_date = { ...where.return_date, ...(from ? { [Op.gte]: from } : {}), ...(to ? { [Op.lte]: to } : {}) };
   }
 
-  query += ' ORDER BY b.return_date DESC, b.borrow_id DESC';
+  const rows = await BorrowRecord.findAll({
+    where,
+    include: [
+      {
+        model: Equipment, as: 'equipment', required: true,
+        include: [{ model: Category, as: 'category' }, { model: EquipmentStatus, as: 'equipmentStatus' }],
+      },
+      {
+        model: Employee, as: 'borrower', required: true,
+        include: [{ model: Department, as: 'department' }],
+      },
+      { model: Employee, as: 'issuer' },
+      { model: Employee, as: 'receiver' },
+    ],
+    order: [['return_date', 'DESC'], ['borrow_id', 'DESC']],
+  });
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const dayMs = 24 * 60 * 60 * 1000;
+  const toDay = (v) => (v ? Date.parse(String(v).slice(0, 10)) : null);
+
+  const shaped = rows.map((row) => {
+    const { equipment, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    const borrowDay = toDay(b.borrow_date);
+    const returnDay = toDay(b.return_date);
+    const expectedDay = toDay(b.expected_return_date);
+    const wasLate = expectedDay !== null && returnDay > expectedDay;
+
+    return fixDates({
+      borrow_id: b.borrow_id,
+      equipment_id: b.equipment_id,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      computer_name: equipment.computer_name,
+      device_model: equipment.device_model,
+      asset_code: equipment.asset_code,
+      service_tag: equipment.service_tag,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_position: borrower.position,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      days_kept: Math.round((returnDay - borrowDay) / dayMs),
+      was_late: wasLate ? 1 : 0,
+      days_late: wasLate ? Math.round((returnDay - expectedDay) / dayMs) : 0,
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      current_status: equipment.equipmentStatus ? equipment.equipmentStatus.status_name : null,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+      _wasLate: wasLate,
+    });
+  });
+
+  return late_only === 'true' ? shaped.filter((r) => r._wasLate).map(({ _wasLate, ...rest }) => rest) : shaped.map(({ _wasLate, ...rest }) => rest);
 }
 
-// What can be borrowed right now: correct status, and not already out.
+// What can be borrowed right now: correct status, and not already out. The
+// NOT EXISTS correlated subquery stays raw - it's a negative-existence
+// check across the whole borrow_record table, not a fit for an association.
 async function findAvailableToBorrow(category) {
-  // Uses the is_borrowable flag on dbo.equipment_status, so the rule lives
-  // in one place and can be changed without touching code.
   let query = `
     SELECT e.equipment_id, e.category_id, c.category_name,
            e.device_type, e.computer_name, e.device_model, e.manufacturer,
@@ -330,22 +406,34 @@ async function findAvailableToBorrow(category) {
 }
 
 async function findByBorrower(borrowerId, openOnly) {
-  let query = `
-    SELECT b.borrow_id, b.equipment_id,
-           c.category_name, e.computer_name, e.device_model, e.asset_code,
-           b.borrow_date, b.expected_return_date, b.return_date,
-           CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status,
-           b.condition_on_borrow, b.condition_on_return, b.purpose, b.remark
-    FROM dbo.borrow_record b
-    JOIN dbo.equipment e     ON b.equipment_id = e.equipment_id
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    WHERE b.borrower_id = :id
-  `;
-  if (openOnly === 'true') query += ' AND b.return_date IS NULL';
-  query += ' ORDER BY b.borrow_date DESC';
+  const where = { borrower_id: borrowerId };
+  if (openOnly === 'true') where.return_date = null;
 
-  const rows = await sequelize.query(query, { replacements: { id: borrowerId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await BorrowRecord.findAll({
+    where,
+    include: [{ model: Equipment, as: 'equipment', required: true, include: [{ model: Category, as: 'category' }] }],
+    order: [['borrow_date', 'DESC']],
+  });
+
+  return rows.map((row) => {
+    const { equipment, ...b } = row.get({ plain: true });
+    return fixDates({
+      borrow_id: b.borrow_id,
+      equipment_id: b.equipment_id,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      computer_name: equipment.computer_name,
+      device_model: equipment.device_model,
+      asset_code: equipment.asset_code,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      loan_status: b.return_date === null ? 'Out' : 'Returned',
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      purpose: b.purpose,
+      remark: b.remark,
+    });
+  });
 }
 
 // Deleting a loan record is for correcting a mistaken entry, not for erasing
@@ -354,30 +442,24 @@ async function findByBorrower(borrowerId, openOnly) {
 // Self-contained transaction, so this uses sequelize.transaction().
 async function remove(borrowId) {
   return sequelize.transaction(async (transaction) => {
-    const [loan] = await sequelize.query(
-      'SELECT * FROM dbo.borrow_record WHERE borrow_id = :id',
-      { replacements: { id: borrowId }, type: QueryTypes.SELECT, transaction },
-    );
-    if (!loan) return null;
+    const row = await BorrowRecord.findByPk(borrowId, { transaction, raw: true });
+    if (!row) return null;
 
-    await sequelize.query(
-      'DELETE FROM dbo.borrow_record WHERE borrow_id = :id',
-      { replacements: { id: borrowId }, transaction },
-    );
+    await BorrowRecord.destroy({ where: { borrow_id: borrowId }, transaction });
 
-    if (!loan.return_date) {
+    if (!row.return_date) {
       await sequelize.query(`
           UPDATE dbo.equipment
           SET status    = :status,
               status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
           WHERE equipment_id = :equipment_id
         `, {
-        replacements: { equipment_id: loan.equipment_id, status: BORROWABLE_STATUS },
+        replacements: { equipment_id: row.equipment_id, status: BORROWABLE_STATUS },
         transaction,
       });
     }
 
-    return fixDates(loan);
+    return fixDates(row);
   });
 }
 

@@ -43,6 +43,8 @@ const PartTypeCustomField = sequelize.define('PartTypeCustomField', {
   timestamps: false,
 });
 
+PartTypeCustomField.belongsTo(PartCustomField, { foreignKey: 'field_id', as: 'field' });
+
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
 // "Serial Number" -> serial_number, so the frontend gets a usable JSON key.
@@ -125,14 +127,22 @@ async function remove(fieldId) {
 // --- which part types use which fields ---
 
 async function findByPartType(partTypeId) {
-  return sequelize.query(`
-    SELECT f.field_id, f.field_key, f.field_label, f.field_type,
-           tf.sort_order, tf.is_required
-    FROM dbo.part_type_custom_field tf
-    JOIN dbo.part_custom_field f ON tf.field_id = f.field_id
-    WHERE tf.part_type_id = :part_type_id
-    ORDER BY tf.sort_order, f.field_id
-  `, { replacements: { part_type_id: partTypeId }, type: QueryTypes.SELECT });
+  const rows = await PartTypeCustomField.findAll({
+    where: { part_type_id: partTypeId },
+    include: [{ model: PartCustomField, as: 'field' }],
+    order: [['sort_order', 'ASC'], [{ model: PartCustomField, as: 'field' }, 'field_id', 'ASC']],
+  });
+  return rows.map((row) => {
+    const { field, sort_order, is_required } = row.get({ plain: true });
+    return {
+      field_id: field.field_id,
+      field_key: field.field_key,
+      field_label: field.field_label,
+      field_type: field.field_type,
+      sort_order,
+      is_required,
+    };
+  });
 }
 
 // One query for every part type at once - GET /api/part-types needs each

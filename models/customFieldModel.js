@@ -57,6 +57,8 @@ const EquipmentCustomValue = sequelize.define('EquipmentCustomValue', {
   timestamps: false,
 });
 
+EquipmentCategoryField.belongsTo(EquipmentCustomField, { foreignKey: 'field_id', as: 'field' });
+
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
 // "Warranty End" -> warranty_end, so the frontend gets a usable JSON key.
@@ -140,14 +142,22 @@ async function remove(fieldId) {
 // --- which categories use which fields ---
 
 async function findByCategory(categoryId) {
-  return sequelize.query(`
-    SELECT f.field_id, f.field_key, f.field_label, f.field_type,
-           cf.sort_order, cf.is_required
-    FROM dbo.equipment_category_field cf
-    JOIN dbo.equipment_custom_field f ON cf.field_id = f.field_id
-    WHERE cf.category_id = :category_id
-    ORDER BY cf.sort_order, f.field_id
-  `, { replacements: { category_id: categoryId }, type: QueryTypes.SELECT });
+  const rows = await EquipmentCategoryField.findAll({
+    where: { category_id: categoryId },
+    include: [{ model: EquipmentCustomField, as: 'field' }],
+    order: [['sort_order', 'ASC'], [{ model: EquipmentCustomField, as: 'field' }, 'field_id', 'ASC']],
+  });
+  return rows.map((row) => {
+    const { field, sort_order, is_required } = row.get({ plain: true });
+    return {
+      field_id: field.field_id,
+      field_key: field.field_key,
+      field_label: field.field_label,
+      field_type: field.field_type,
+      sort_order,
+      is_required,
+    };
+  });
 }
 
 // Attaching an existing field to a category - the reuse case. upsert() so

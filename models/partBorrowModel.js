@@ -1,6 +1,11 @@
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const partStockModel = require('../models/partStockModel');
+const { PartStock, PartType } = partStockModel;
+const { Employee } = require('./employeeModel');
+const { Department } = require('./departmentModel');
+const { ApiUser } = require('./userModel');
 
 // Temporary loans of individual parts out of part_stock (dbo.part_borrow_record).
 //
@@ -16,10 +21,62 @@ const partStockModel = require('../models/partStockModel');
 
 const AVAILABLE_STATUS = 'Working - IT Stock';
 
+// Defined here (not in partStockModel.js) and pointing outward at
+// PartStock/Employee/ApiUser via belongsTo only - same reasoning as
+// borrowModel.js's BorrowRecord: partStockModel.js never needs to know about
+// loans, so this avoids the circular require that a reverse
+// PartStock.hasMany(PartBorrowRecord) would create.
+const PartBorrowRecord = sequelize.define('PartBorrowRecord', {
+  borrow_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  stock_id: { type: DataTypes.INTEGER, allowNull: false },
+  quantity: { type: DataTypes.INTEGER, allowNull: false },
+  borrower_id: { type: DataTypes.INTEGER, allowNull: false },
+  borrow_date: { type: DataTypes.DATEONLY, allowNull: false },
+  expected_return_date: { type: DataTypes.DATEONLY, allowNull: true },
+  return_date: { type: DataTypes.DATEONLY, allowNull: true },
+  condition_on_borrow: { type: DataTypes.STRING(400), allowNull: true },
+  condition_on_return: { type: DataTypes.STRING(400), allowNull: true },
+  issued_by_id: { type: DataTypes.INTEGER, allowNull: true },
+  received_by_id: { type: DataTypes.INTEGER, allowNull: true },
+  purpose: { type: DataTypes.STRING(400), allowNull: true },
+  remark: { type: DataTypes.STRING(400), allowNull: true },
+  // Legacy DATETIME with its own DB-side default - allowNull:true here even
+  // though the column itself is NOT NULL, same pattern as borrowModel.js's
+  // BorrowRecord.created_at: create() never sets this field, so Sequelize's
+  // client-side validation would otherwise reject the insert before the DB
+  // default ever gets a chance to run.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'part_borrow_record',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+PartBorrowRecord.belongsTo(PartStock, { foreignKey: 'stock_id', as: 'stock' });
+PartBorrowRecord.belongsTo(Employee, { foreignKey: 'borrower_id', as: 'borrower' });
+PartBorrowRecord.belongsTo(ApiUser, { foreignKey: 'issued_by_id', as: 'issuer' });
+PartBorrowRecord.belongsTo(ApiUser, { foreignKey: 'received_by_id', as: 'receiver' });
+
+// Shared include set for every read below: stock (with its part type),
+// borrower (with department), issuer/receiver - mirrors
+// borrowModel.js's repeated include block, and equipmentModel.js's
+// equipmentIncludes() helper for the same "used by several functions"
+// reason.
+function partBorrowIncludes() {
+  return [
+    { model: PartStock, as: 'stock', required: true, include: [{ model: PartType, as: 'partType' }] },
+    { model: Employee, as: 'borrower', required: true, include: [{ model: Department, as: 'department' }] },
+    { model: ApiUser, as: 'issuer' },
+    { model: ApiUser, as: 'receiver' },
+  ];
+}
+
 // Raw queries with no model attribute definition return a plain string for a
 // DATE/DATETIME column; the driver this replaces returned a Date object for
 // the same column. Converting back keeps every response identical to before
-// this migration.
+// this migration. Still needed even on the ORM path - DATEONLY reads back as
+// a string through the ORM too, the same trade-off already made (and
+// approved) for equipmentModel.js's findAll/findById.
 const DATE_FIELDS = ['borrow_date', 'expected_return_date', 'return_date', 'created_at'];
 function fixDates(row) {
   if (!row) return row;
@@ -29,44 +86,33 @@ function fixDates(row) {
   return row;
 }
 
-function selectFields(alias = 'b') {
-  return `
-    ${alias}.borrow_id, ${alias}.stock_id, ${alias}.quantity,
-    pt.part_name, s.part_value, s.model_name, s.model_number,
-    s.disk_type, s.disk_interface, s.ram_type,
-    ${alias}.borrower_id, emp.full_name AS borrower_name,
-    d.department_code AS borrower_department,
-    ${alias}.borrow_date, ${alias}.expected_return_date, ${alias}.return_date,
-    ${alias}.condition_on_borrow, ${alias}.condition_on_return,
-    issuer.full_name   AS issued_by,
-    receiver.full_name AS received_by,
-    ${alias}.purpose, ${alias}.remark
-  `;
-}
-
-function joins(alias = 'b') {
-  return `
-    JOIN dbo.part_stock s        ON ${alias}.stock_id = s.stock_id
-    JOIN dbo.part_type pt        ON s.part_type_id = pt.part_type_id
-    JOIN dbo.employee emp        ON ${alias}.borrower_id = emp.employee_id
-    LEFT JOIN dbo.department d   ON emp.department_id = d.department_id
-    LEFT JOIN dbo.api_user issuer   ON ${alias}.issued_by_id = issuer.user_id
-    LEFT JOIN dbo.api_user receiver ON ${alias}.received_by_id = receiver.user_id
-  `;
-}
-
-// Everything needed to decide whether this line has enough to lend out.
+// Everything needed to decide whether this line has enough to lend out. Two
+// separate ORM reads (the stock row, and its currently-borrowed total)
+// merged in JS - same "single-row lookup, not a list" reasoning as
+// borrowModel.findEquipmentForBorrow. sum() is a real Sequelize aggregate
+// method, not a raw query.
 async function findStockForBorrow(stockId) {
-  const rows = await sequelize.query(`
-    SELECT s.stock_id, s.part_type_id, s.quantity, s.status,
-           pt.part_name, s.part_value, s.model_name, s.model_number,
-           (SELECT ISNULL(SUM(quantity), 0) FROM dbo.part_borrow_record
-             WHERE stock_id = s.stock_id AND return_date IS NULL) AS currently_borrowed
-    FROM dbo.part_stock s
-    JOIN dbo.part_type pt ON s.part_type_id = pt.part_type_id
-    WHERE s.stock_id = :id
-  `, { replacements: { id: stockId }, type: QueryTypes.SELECT });
-  return rows[0] || null;
+  const stock = await PartStock.findByPk(stockId, {
+    include: [{ model: PartType, as: 'partType', attributes: ['part_name'] }],
+  });
+  if (!stock) return null;
+  const s = stock.get({ plain: true });
+
+  const currentlyBorrowed = await PartBorrowRecord.sum('quantity', {
+    where: { stock_id: stockId, return_date: null },
+  });
+
+  return {
+    stock_id: s.stock_id,
+    part_type_id: s.part_type_id,
+    quantity: s.quantity,
+    status: s.status,
+    part_name: s.partType ? s.partType.part_name : null,
+    part_value: s.part_value,
+    model_name: s.model_name,
+    model_number: s.model_number,
+    currently_borrowed: currentlyBorrowed || 0,
+  };
 }
 
 // Creating the loan and taking the quantity off the shelf happen together in
@@ -79,44 +125,52 @@ async function create(d) {
     const decremented = await partStockModel.decrement(d.stock_id, d.quantity, transaction);
     if (!decremented) return { error: 'insufficient_stock' };
 
-    const [row] = await sequelize.query(`
-        INSERT INTO dbo.part_borrow_record (
-          stock_id, quantity, borrower_id, borrow_date, expected_return_date,
-          condition_on_borrow, issued_by_id, purpose, remark
-        )
-        OUTPUT INSERTED.*
-        VALUES (
-          :stock_id, :quantity, :borrower_id, :borrow_date, :expected_return_date,
-          :condition_on_borrow, :issued_by_id, :purpose, :remark
-        )
-      `, {
-      replacements: {
-        stock_id: d.stock_id,
-        quantity: d.quantity,
-        borrower_id: d.borrower_id,
-        borrow_date: d.borrow_date,
-        expected_return_date: d.expected_return_date || null,
-        condition_on_borrow: d.condition_on_borrow || null,
-        issued_by_id: d.issued_by_id || null,
-        purpose: d.purpose || null,
-        remark: d.remark || null,
-      },
-      type: QueryTypes.SELECT,
-      transaction,
-    });
+    const row = await PartBorrowRecord.create({
+      stock_id: d.stock_id,
+      quantity: d.quantity,
+      borrower_id: d.borrower_id,
+      borrow_date: d.borrow_date,
+      expected_return_date: d.expected_return_date || null,
+      condition_on_borrow: d.condition_on_borrow || null,
+      issued_by_id: d.issued_by_id || null,
+      purpose: d.purpose || null,
+      remark: d.remark || null,
+    }, { transaction });
 
-    return fixDates(row);
+    return fixDates(row.get({ plain: true }));
   });
 }
 
 async function findById(borrowId) {
-  const rows = await sequelize.query(`
-    SELECT ${selectFields()}
-    FROM dbo.part_borrow_record b
-    ${joins()}
-    WHERE b.borrow_id = :id
-  `, { replacements: { id: borrowId }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
+  const row = await PartBorrowRecord.findByPk(borrowId, { include: partBorrowIncludes() });
+  if (!row) return null;
+
+  const { stock, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+  const borrowerDept = borrower.department;
+  return fixDates({
+    borrow_id: b.borrow_id,
+    stock_id: b.stock_id,
+    quantity: b.quantity,
+    part_name: stock.partType ? stock.partType.part_name : null,
+    part_value: stock.part_value,
+    model_name: stock.model_name,
+    model_number: stock.model_number,
+    disk_type: stock.disk_type,
+    disk_interface: stock.disk_interface,
+    ram_type: stock.ram_type,
+    borrower_id: b.borrower_id,
+    borrower_name: borrower.full_name,
+    borrower_department: borrowerDept ? borrowerDept.department_code : null,
+    borrow_date: b.borrow_date,
+    expected_return_date: b.expected_return_date,
+    return_date: b.return_date,
+    condition_on_borrow: b.condition_on_borrow,
+    condition_on_return: b.condition_on_return,
+    issued_by: issuer ? issuer.full_name : null,
+    received_by: receiver ? receiver.full_name : null,
+    purpose: b.purpose,
+    remark: b.remark,
+  });
 }
 
 // Closing the loan and putting the quantity back, in one transaction. If it
@@ -129,32 +183,22 @@ async function findById(borrowId) {
 // Sequelize transaction.
 async function markReturned(borrowId, d) {
   return sequelize.transaction(async (transaction) => {
-    const [loan] = await sequelize.query(`
-        UPDATE dbo.part_borrow_record
-        SET return_date         = :return_date,
-            condition_on_return = :condition_on_return,
-            received_by_id      = COALESCE(:received_by_id, received_by_id),
-            remark              = COALESCE(:remark, remark)
-        OUTPUT INSERTED.*
-        WHERE borrow_id = :id AND return_date IS NULL
-      `, {
-      replacements: {
-        id: borrowId,
-        return_date: d.return_date,
-        condition_on_return: d.condition_on_return || null,
-        received_by_id: d.received_by_id || null,
-        remark: d.remark || null,
-      },
-      type: QueryTypes.SELECT,
+    const values = {
+      return_date: d.return_date,
+      condition_on_return: d.condition_on_return || null,
+    };
+    if (d.received_by_id) values.received_by_id = d.received_by_id;
+    if (d.remark) values.remark = d.remark;
+
+    const [, [row]] = await PartBorrowRecord.update(values, {
+      where: { borrow_id: borrowId, return_date: null },
+      returning: true,
       transaction,
     });
+    if (!row) return null;
+    const loan = row.get({ plain: true });
 
-    if (!loan) return null;
-
-    const [stock] = await sequelize.query(
-      'SELECT * FROM dbo.part_stock WHERE stock_id = :id',
-      { replacements: { id: loan.stock_id }, type: QueryTypes.SELECT, transaction },
-    );
+    const stock = await PartStock.findByPk(loan.stock_id, { transaction, raw: true });
 
     if (d.return_status && d.return_status !== stock.status) {
       await partStockModel.increment(
@@ -163,7 +207,7 @@ async function markReturned(borrowId, d) {
           model_name: stock.model_name, model_number: stock.model_number,
           disk_type: stock.disk_type, disk_interface: stock.disk_interface,
           ram_type: stock.ram_type, location: stock.location,
-        }
+        },
       );
     } else {
       await partStockModel.incrementById(loan.stock_id, loan.quantity, transaction);
@@ -174,122 +218,206 @@ async function markReturned(borrowId, d) {
 }
 
 async function findCurrentlyBorrowed(overdueOnly) {
-  let query = `
-    SELECT ${selectFields()},
-           CASE
-             WHEN b.expected_return_date IS NOT NULL AND b.expected_return_date < CAST(GETDATE() AS DATE)
-             THEN 1 ELSE 0
-           END AS is_overdue
-    FROM dbo.part_borrow_record b
-    ${joins()}
-    WHERE b.return_date IS NULL
-  `;
-  if (overdueOnly === 'true') {
-    query += ' AND b.expected_return_date IS NOT NULL AND b.expected_return_date < CAST(GETDATE() AS DATE)';
-  }
-  query += ' ORDER BY is_overdue DESC, b.borrow_date';
+  // GETDATE() is the server's clock, not a column any include can filter or
+  // sort by - one small raw call gets today's date once, then is_overdue is
+  // computed in JS against every open loan fetched through the ORM below.
+  const [{ today }] = await sequelize.query(
+    'SELECT CAST(GETDATE() AS DATE) AS today', { type: QueryTypes.SELECT },
+  );
+  const todayMs = Date.parse(today);
 
-  const rows = await sequelize.query(query, { type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartBorrowRecord.findAll({ where: { return_date: null }, include: partBorrowIncludes() });
+
+  let shaped = rows.map((row) => {
+    const { stock, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    const isOverdue = b.expected_return_date && Date.parse(b.expected_return_date) < todayMs;
+    return fixDates({
+      borrow_id: b.borrow_id,
+      stock_id: b.stock_id,
+      quantity: b.quantity,
+      part_name: stock.partType ? stock.partType.part_name : null,
+      part_value: stock.part_value,
+      model_name: stock.model_name,
+      model_number: stock.model_number,
+      disk_type: stock.disk_type,
+      disk_interface: stock.disk_interface,
+      ram_type: stock.ram_type,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+      is_overdue: isOverdue ? 1 : 0,
+    });
+  });
+
+  if (overdueOnly === 'true') shaped = shaped.filter((r) => r.is_overdue === 1);
+  shaped.sort((a, b) => (b.is_overdue - a.is_overdue) || (new Date(a.borrow_date) - new Date(b.borrow_date)));
+
+  return shaped;
 }
 
 async function findHistory(filters = {}) {
   const { stock_id, borrower_id, from, to } = filters;
 
-  let query = `
-    SELECT ${selectFields()},
-           CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status
-    FROM dbo.part_borrow_record b
-    ${joins()}
-    WHERE 1=1
-  `;
-  const replacements = {};
-
-  if (stock_id) {
-    query += ' AND b.stock_id = :stock_id';
-    replacements.stock_id = stock_id;
-  }
-  if (borrower_id) {
-    query += ' AND b.borrower_id = :borrower_id';
-    replacements.borrower_id = borrower_id;
-  }
-  if (from) {
-    query += ' AND b.borrow_date >= :from';
-    replacements.from = from;
-  }
-  if (to) {
-    query += ' AND b.borrow_date <= :to';
-    replacements.to = to;
+  const where = {};
+  if (stock_id) where.stock_id = stock_id;
+  if (borrower_id) where.borrower_id = borrower_id;
+  if (from || to) {
+    where.borrow_date = {};
+    if (from) where.borrow_date[Op.gte] = from;
+    if (to) where.borrow_date[Op.lte] = to;
   }
 
-  query += ' ORDER BY b.borrow_date DESC, b.borrow_id DESC';
+  const rows = await PartBorrowRecord.findAll({
+    where,
+    include: partBorrowIncludes(),
+    order: [['borrow_date', 'DESC'], ['borrow_id', 'DESC']],
+  });
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  return rows.map((row) => {
+    const { stock, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    return fixDates({
+      borrow_id: b.borrow_id,
+      stock_id: b.stock_id,
+      quantity: b.quantity,
+      part_name: stock.partType ? stock.partType.part_name : null,
+      part_value: stock.part_value,
+      model_name: stock.model_name,
+      model_number: stock.model_number,
+      disk_type: stock.disk_type,
+      disk_interface: stock.disk_interface,
+      ram_type: stock.ram_type,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+      loan_status: b.return_date === null ? 'Out' : 'Returned',
+    });
+  });
 }
 
 // Returned loans only, with days_kept/was_late worked out here rather than
-// making the frontend calculate them - same pattern as borrowModel.findReturns.
+// making the frontend calculate them - same pattern as
+// borrowModel.findReturns (DATEDIFF isn't one of Sequelize's portable fn
+// helpers, so this is computed in JS after the ORM read instead of inside
+// the query).
 async function findReturns(filters = {}) {
   const { stock_id, borrower_id, from, to, late_only } = filters;
 
-  let query = `
-    SELECT ${selectFields()},
-           DATEDIFF(DAY, b.borrow_date, b.return_date) AS days_kept,
-           CASE
-             WHEN b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date
-             THEN 1 ELSE 0
-           END AS was_late,
-           CASE
-             WHEN b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date
-             THEN DATEDIFF(DAY, b.expected_return_date, b.return_date)
-             ELSE 0
-           END AS days_late
-    FROM dbo.part_borrow_record b
-    ${joins()}
-    WHERE b.return_date IS NOT NULL
-  `;
-  const replacements = {};
-
-  if (stock_id) {
-    query += ' AND b.stock_id = :stock_id';
-    replacements.stock_id = stock_id;
-  }
-  if (borrower_id) {
-    query += ' AND b.borrower_id = :borrower_id';
-    replacements.borrower_id = borrower_id;
-  }
-  if (from) {
-    query += ' AND b.return_date >= :from';
-    replacements.from = from;
-  }
-  if (to) {
-    query += ' AND b.return_date <= :to';
-    replacements.to = to;
-  }
-  if (late_only === 'true') {
-    query += ' AND b.expected_return_date IS NOT NULL AND b.return_date > b.expected_return_date';
+  const where = { return_date: { [Op.ne]: null } };
+  if (stock_id) where.stock_id = stock_id;
+  if (borrower_id) where.borrower_id = borrower_id;
+  if (from || to) {
+    where.return_date = { ...where.return_date, ...(from ? { [Op.gte]: from } : {}), ...(to ? { [Op.lte]: to } : {}) };
   }
 
-  query += ' ORDER BY b.return_date DESC, b.borrow_id DESC';
+  const rows = await PartBorrowRecord.findAll({
+    where,
+    include: partBorrowIncludes(),
+    order: [['return_date', 'DESC'], ['borrow_id', 'DESC']],
+  });
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const dayMs = 24 * 60 * 60 * 1000;
+  const toDay = (v) => (v ? Date.parse(String(v).slice(0, 10)) : null);
+
+  const shaped = rows.map((row) => {
+    const { stock, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    const borrowDay = toDay(b.borrow_date);
+    const returnDay = toDay(b.return_date);
+    const expectedDay = toDay(b.expected_return_date);
+    const wasLate = expectedDay !== null && returnDay > expectedDay;
+
+    return fixDates({
+      borrow_id: b.borrow_id,
+      stock_id: b.stock_id,
+      quantity: b.quantity,
+      part_name: stock.partType ? stock.partType.part_name : null,
+      part_value: stock.part_value,
+      model_name: stock.model_name,
+      model_number: stock.model_number,
+      disk_type: stock.disk_type,
+      disk_interface: stock.disk_interface,
+      ram_type: stock.ram_type,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+      days_kept: Math.round((returnDay - borrowDay) / dayMs),
+      was_late: wasLate ? 1 : 0,
+      days_late: wasLate ? Math.round((returnDay - expectedDay) / dayMs) : 0,
+      _wasLate: wasLate,
+    });
+  });
+
+  return late_only === 'true' ? shaped.filter((r) => r._wasLate).map(({ _wasLate, ...rest }) => rest) : shaped.map(({ _wasLate, ...rest }) => rest);
 }
 
 async function findByBorrower(borrowerId, openOnly) {
-  let query = `
-    SELECT ${selectFields()},
-           CASE WHEN b.return_date IS NULL THEN 'Out' ELSE 'Returned' END AS loan_status
-    FROM dbo.part_borrow_record b
-    ${joins()}
-    WHERE b.borrower_id = :id
-  `;
-  if (openOnly === 'true') query += ' AND b.return_date IS NULL';
-  query += ' ORDER BY b.borrow_date DESC';
+  const where = { borrower_id: borrowerId };
+  if (openOnly === 'true') where.return_date = null;
 
-  const rows = await sequelize.query(query, { replacements: { id: borrowerId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await PartBorrowRecord.findAll({
+    where,
+    include: partBorrowIncludes(),
+    order: [['borrow_date', 'DESC']],
+  });
+
+  return rows.map((row) => {
+    const { stock, borrower, issuer, receiver, ...b } = row.get({ plain: true });
+    const borrowerDept = borrower.department;
+    return fixDates({
+      borrow_id: b.borrow_id,
+      stock_id: b.stock_id,
+      quantity: b.quantity,
+      part_name: stock.partType ? stock.partType.part_name : null,
+      part_value: stock.part_value,
+      model_name: stock.model_name,
+      model_number: stock.model_number,
+      disk_type: stock.disk_type,
+      disk_interface: stock.disk_interface,
+      ram_type: stock.ram_type,
+      borrower_id: b.borrower_id,
+      borrower_name: borrower.full_name,
+      borrower_department: borrowerDept ? borrowerDept.department_code : null,
+      borrow_date: b.borrow_date,
+      expected_return_date: b.expected_return_date,
+      return_date: b.return_date,
+      condition_on_borrow: b.condition_on_borrow,
+      condition_on_return: b.condition_on_return,
+      issued_by: issuer ? issuer.full_name : null,
+      received_by: receiver ? receiver.full_name : null,
+      purpose: b.purpose,
+      remark: b.remark,
+      loan_status: b.return_date === null ? 'Out' : 'Returned',
+    });
+  });
 }
 
 // Deleting a loan record is for correcting a mistaken entry, not erasing
@@ -299,22 +427,16 @@ async function findByBorrower(borrowerId, openOnly) {
 // transaction.
 async function remove(borrowId) {
   return sequelize.transaction(async (transaction) => {
-    const [loan] = await sequelize.query(
-      'SELECT * FROM dbo.part_borrow_record WHERE borrow_id = :id',
-      { replacements: { id: borrowId }, type: QueryTypes.SELECT, transaction },
-    );
-    if (!loan) return null;
+    const row = await PartBorrowRecord.findByPk(borrowId, { transaction, raw: true });
+    if (!row) return null;
 
-    await sequelize.query(
-      'DELETE FROM dbo.part_borrow_record WHERE borrow_id = :id',
-      { replacements: { id: borrowId }, transaction },
-    );
+    await PartBorrowRecord.destroy({ where: { borrow_id: borrowId }, transaction });
 
-    if (!loan.return_date) {
-      await partStockModel.incrementById(loan.stock_id, loan.quantity, transaction);
+    if (!row.return_date) {
+      await partStockModel.incrementById(row.stock_id, row.quantity, transaction);
     }
 
-    return fixDates(loan);
+    return fixDates(row);
   });
 }
 

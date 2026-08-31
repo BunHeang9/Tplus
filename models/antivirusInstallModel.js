@@ -1,6 +1,7 @@
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
+const { Equipment } = require('./equipmentModel');
+const { Employee } = require('./employeeModel');
 
 // Antivirus rollout tracking (dbo.antivirus_install) - plan/due/completed
 // dates and status per install attempt on a device.
@@ -24,6 +25,8 @@ const AntivirusInstall = sequelize.define('AntivirusInstall', {
   schema: 'dbo',
   timestamps: false,
 });
+
+AntivirusInstall.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
 
 const DATE_FIELDS = ['plan_date', 'due_date', 'completed_date'];
 
@@ -84,28 +87,24 @@ async function removeAntivirusInstall(installId) {
   return fixDates(row);
 }
 
-// A 2-table join - raw query through Sequelize.
 async function getAntivirus() {
-  const rows = await sequelize.query(`
-    SELECT
-      av.install_id,
-      av.equipment_id,
-      e.computer_name,
-      e.device_model,
-      e.asset_code AS asset_code,
-      emp.full_name AS owner_name,
-      av.antivirus_status,
-      av.windows_server_license,
-      av.plan_date,
-      av.due_date,
-      av.completed_date,
-      av.remark
-    FROM dbo.antivirus_install av
-    LEFT JOIN dbo.equipment e ON av.equipment_id = e.equipment_id
-    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-    ORDER BY av.install_id
-  `, { type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await AntivirusInstall.findAll({
+    include: [{ model: Equipment, as: 'equipment', include: [{ model: Employee, as: 'owner' }] }],
+    order: [['install_id', 'ASC']],
+  });
+  return rows.map((row) => {
+    const { equipment, install_id, equipment_id, ...ownFields } = row.get({ plain: true });
+    const owner = equipment && equipment.owner;
+    return fixDates({
+      install_id,
+      equipment_id,
+      computer_name: equipment ? equipment.computer_name : null,
+      device_model: equipment ? equipment.device_model : null,
+      asset_code: equipment ? equipment.asset_code : null,
+      owner_name: owner ? owner.full_name : null,
+      ...ownFields,
+    });
+  });
 }
 
 module.exports = {

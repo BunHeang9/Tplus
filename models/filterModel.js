@@ -1,31 +1,63 @@
+const { Op, fn, col, where: sequelizeWhere } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { Category } = require('./categoryModel');
+const { Department } = require('./departmentModel');
+const { EquipmentStatus } = require('./statusModel');
+const { Employee } = require('./employeeModel');
+const { Equipment } = require('./equipmentModel');
 
-// Distinct values for building dropdown filters on the frontend,
-// read live from the data so new values appear automatically.
-//
-// Nine independent single-purpose lookups across four tables, none of them
-// writes - raw queries through Sequelize rather than ORM models, same
-// reasoning as deviceReplacementModel: Equipment/Department/EquipmentStatus/
-// Employee get real Sequelize models when their own owning files
-// (equipmentModel, departmentModel, statusModel, employeeModel) are
-// migrated, not designed early just to serve a handful of dropdown lists
-// here.
+// Distinct values for building dropdown filters on the frontend, read live
+// from the data so new values appear automatically.
+
+// A plain DISTINCT-one-column lookup, expressed as a GROUP BY - Sequelize
+// has no dedicated "DISTINCT single column" shortcut, and GROUP BY on that
+// one column is the standard way to get the same result through the ORM.
+async function distinctColumn(Model, columnName) {
+  const rows = await Model.findAll({
+    attributes: [columnName],
+    where: { [columnName]: { [Op.ne]: null } },
+    group: [columnName],
+    order: [[columnName, 'ASC']],
+    raw: true,
+  });
+  return rows.map((r) => r[columnName]);
+}
+
 async function getAllFilterOptions() {
-  const q = (sql) => sequelize.query(sql, { type: QueryTypes.SELECT });
-
   const [categories, deviceTypes, locations, departments, statuses,
          manufacturers, empDepartments, empLocations, empPositions] = await Promise.all([
-    q('SELECT category_id, category_name FROM dbo.category WHERE is_active = 1 ORDER BY category_name'),
-    q('SELECT DISTINCT device_type FROM dbo.equipment WHERE device_type IS NOT NULL ORDER BY device_type'),
-    q('SELECT DISTINCT location FROM dbo.equipment WHERE location IS NOT NULL ORDER BY location'),
-    q('SELECT department_id, department_code, department_name FROM dbo.department WHERE is_active = 1 ORDER BY department_code'),
-    q(`SELECT status_id, status_name, description, is_assignable, is_borrowable
-       FROM dbo.equipment_status WHERE is_active = 1 ORDER BY sort_order`),
-    q('SELECT DISTINCT manufacturer FROM dbo.equipment WHERE manufacturer IS NOT NULL ORDER BY manufacturer'),
-    q('SELECT department_id, department_code, department_name FROM dbo.department WHERE is_active = 1 ORDER BY department_code'),
-    q('SELECT DISTINCT location FROM dbo.employee WHERE location IS NOT NULL ORDER BY location'),
-    q('SELECT DISTINCT position FROM dbo.employee WHERE position IS NOT NULL ORDER BY position'),
+    Category.findAll({
+      attributes: ['category_id', 'category_name'],
+      where: { is_active: true },
+      order: [['category_name', 'ASC']],
+      raw: true,
+    }),
+    distinctColumn(Equipment, 'device_type'),
+    distinctColumn(Equipment, 'location'),
+    Department.findAll({
+      attributes: ['department_id', 'department_code', 'department_name'],
+      where: { is_active: true },
+      order: [['department_code', 'ASC']],
+      raw: true,
+    }),
+    // From the reference table, so every valid option appears in the
+    // dropdown even when no equipment currently has that status.
+    EquipmentStatus.findAll({
+      attributes: ['status_id', 'status_name', 'description', 'is_assignable', 'is_borrowable'],
+      where: { is_active: true },
+      order: [['sort_order', 'ASC']],
+      raw: true,
+    }),
+    distinctColumn(Equipment, 'manufacturer'),
+    Department.findAll({
+      attributes: ['department_id', 'department_code', 'department_name'],
+      where: { is_active: true },
+      order: [['department_code', 'ASC']],
+      raw: true,
+    }),
+    distinctColumn(Employee, 'location'),
+    distinctColumn(Employee, 'position'),
   ]);
 
   return {
@@ -33,18 +65,16 @@ async function getAllFilterOptions() {
       // Now objects rather than plain strings, so the frontend can send
       // back the id while still showing the name in the dropdown.
       categories,
-      device_types:  deviceTypes.map(r => r.device_type),
-      locations:     locations.map(r => r.location),
+      device_types: deviceTypes,
+      locations,
       departments,
-      // From the reference table, so every valid option appears in the
-      // dropdown even when no equipment currently has that status.
       statuses,
-      manufacturers: manufacturers.map(r => r.manufacturer),
+      manufacturers,
     },
     employee: {
       departments: empDepartments,
-      locations:   empLocations.map(r => r.location),
-      positions:   empPositions.map(r => r.position),
+      locations: empLocations,
+      positions: empPositions,
     },
   };
 }
@@ -56,22 +86,49 @@ async function getAllFilterOptions() {
 // here means unowned equipment locations only, not every device's. Moved
 // here from assignController.js, which used to run these queries itself.
 async function getAssignFormData() {
-  const q = (sql) => sequelize.query(sql, { type: QueryTypes.SELECT });
-
   const [positions, statuses, categories, locations] = await Promise.all([
-    q(`SELECT position, COUNT(*) AS employee_count
-       FROM dbo.employee
-       WHERE position IS NOT NULL AND LTRIM(RTRIM(position)) <> '' AND is_active = 1
-       GROUP BY position ORDER BY position`),
-    q(`SELECT status_id, status_name, description, is_assignable
-       FROM dbo.equipment_status
-       WHERE is_active = 1 ORDER BY sort_order`),
-    q(`SELECT c.category_id, c.category_name,
+    Employee.findAll({
+      attributes: ['position', [fn('COUNT', col('employee_id')), 'employee_count']],
+      where: {
+        position: { [Op.ne]: null },
+        is_active: true,
+        // LTRIM(RTRIM(position)) <> '' - a computed-expression condition,
+        // not a plain column comparison, so it needs sequelize.where()
+        // wrapping a raw fn() rather than a plain attribute key.
+        [Op.and]: [sequelizeWhere(fn('LTRIM', fn('RTRIM', col('position'))), { [Op.ne]: '' })],
+      },
+      group: ['position'],
+      order: [['position', 'ASC']],
+      raw: true,
+    }),
+    EquipmentStatus.findAll({
+      attributes: ['status_id', 'status_name', 'description', 'is_assignable'],
+      where: { is_active: true },
+      order: [['sort_order', 'ASC']],
+      raw: true,
+    }),
+    // available_count is a conditional COUNT across a JOIN (category ->
+    // equipment WHERE owner_id IS NULL) - stays raw, same reasoning as
+    // every other correlated-aggregate read in this migration (e.g.
+    // categoryModel.js's own equipment_count, viewColumnModel.js's
+    // listViews()): a real fit for a SQL subquery, not for .findAll().
+    sequelize.query(`
+       SELECT c.category_id, c.category_name,
               (SELECT COUNT(*) FROM dbo.equipment e
                 WHERE e.category_id = c.category_id AND e.owner_id IS NULL) AS available_count
-       FROM dbo.category c WHERE c.is_active = 1 ORDER BY c.category_name`),
-    q(`SELECT DISTINCT location FROM dbo.equipment
-       WHERE location IS NOT NULL AND owner_id IS NULL ORDER BY location`),
+       FROM dbo.category c WHERE c.is_active = 1 ORDER BY c.category_name
+    `, { type: QueryTypes.SELECT }),
+    // Same DISTINCT-via-GROUP-BY idea as the distinctColumn() helper, but
+    // with an extra owner_id IS NULL condition the helper doesn't take a
+    // parameter for - written directly instead of extending it for a
+    // one-off.
+    Equipment.findAll({
+      attributes: ['location'],
+      where: { location: { [Op.ne]: null }, owner_id: null },
+      group: ['location'],
+      order: [['location', 'ASC']],
+      raw: true,
+    }),
   ]);
 
   return {
