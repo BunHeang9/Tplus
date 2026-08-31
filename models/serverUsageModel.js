@@ -3,6 +3,7 @@ const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const { Equipment } = require('./equipmentModel');
 const { Employee } = require('./employeeModel');
+const { Category } = require('./categoryModel');
 
 // The capacity-planning calculation sheet ("Plan optimize"): Total Capacity
 // vs Usage, one row per server. This is deliberately separate from "server"
@@ -35,6 +36,11 @@ const ServerUsage = sequelize.define('ServerUsage', {
 });
 
 ServerUsage.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
+// Reverse direction for getServerUsage() below - lets the list start from
+// every Server-category equipment and LEFT JOIN outward to its usage row
+// (or lack of one), rather than starting from server_usage and only ever
+// showing equipment that already has a row.
+Equipment.hasOne(ServerUsage, { foreignKey: 'equipment_id', as: 'usage' });
 
 // upsertServerUsage's MERGE with COALESCE-per-field doesn't map onto
 // Sequelize's upsert() (which would null out any field left unprovided,
@@ -66,41 +72,44 @@ function fixDates(row) {
   return row;
 }
 
+// Every Server-category equipment, not just the ones that already have a
+// server_usage row - a server nobody has filled usage in for yet still
+// needs to show up here (with blank usage fields) so there's somewhere to
+// find it and fill it in, rather than only listing what already exists.
 async function getServerUsage() {
-  const rows = await ServerUsage.findAll({
-    include: [{
-      model: Equipment, as: 'equipment', required: false,
-      attributes: [
-        'device_name', 'ip_address', 'owner_id',
-        [sequelize.literal('TRY_CAST(equipment.cpu AS INT)'), 'cpu_core_total'],
-        [sequelize.literal('TRY_CAST(equipment.ram AS INT)'), 'memory_gb_total'],
-        [sequelize.literal('TRY_CAST(equipment.hd AS INT)'), 'hdd_gb_total'],
-      ],
-      include: [{ model: Employee, as: 'owner', attributes: ['full_name'], required: false }],
-    }],
-    order: [
-      [{ model: Equipment, as: 'equipment' }, 'device_name', 'ASC'],
-      ['usage_id', 'ASC'],
+  const rows = await Equipment.findAll({
+    where: { '$category.category_name$': 'Server' },
+    attributes: [
+      'equipment_id', 'device_name', 'ip_address', 'owner_id',
+      [sequelize.literal('TRY_CAST(cpu AS INT)'), 'cpu_core_total'],
+      [sequelize.literal('TRY_CAST(ram AS INT)'), 'memory_gb_total'],
+      [sequelize.literal('TRY_CAST(hd AS INT)'), 'hdd_gb_total'],
     ],
+    include: [
+      { model: Category, as: 'category', attributes: [] },
+      { model: Employee, as: 'owner', attributes: ['full_name'], required: false },
+      { model: ServerUsage, as: 'usage', required: false },
+    ],
+    order: [['device_name', 'ASC'], ['equipment_id', 'ASC']],
   });
 
   return rows.map((row) => {
-    const { equipment, ...su } = row.get({ plain: true });
+    const { owner, usage, ...e } = row.get({ plain: true });
     return fixDates({
-      usage_id: su.usage_id,
-      equipment_id: su.equipment_id,
-      device_name: equipment ? equipment.device_name : null,
-      ip_address: equipment ? equipment.ip_address : null,
-      owner_id: equipment ? equipment.owner_id : null,
-      owner_name: equipment && equipment.owner ? equipment.owner.full_name : null,
-      due_date: su.due_date,
-      cpu_core_total: equipment ? equipment.cpu_core_total : null,
-      memory_gb_total: equipment ? equipment.memory_gb_total : null,
-      hdd_gb_total: equipment ? equipment.hdd_gb_total : null,
-      cpu_usage_pct: su.cpu_usage_pct,
-      memory_usage_pct: su.memory_usage_pct,
-      hdd_usage_gb: su.hdd_usage_gb,
-      remark: su.remark,
+      usage_id: usage ? usage.usage_id : null,
+      equipment_id: e.equipment_id,
+      device_name: e.device_name,
+      ip_address: e.ip_address,
+      owner_id: e.owner_id,
+      owner_name: owner ? owner.full_name : null,
+      due_date: usage ? usage.due_date : null,
+      cpu_core_total: e.cpu_core_total,
+      memory_gb_total: e.memory_gb_total,
+      hdd_gb_total: e.hdd_gb_total,
+      cpu_usage_pct: usage ? usage.cpu_usage_pct : null,
+      memory_usage_pct: usage ? usage.memory_usage_pct : null,
+      hdd_usage_gb: usage ? usage.hdd_usage_gb : null,
+      remark: usage ? usage.remark : null,
     });
   });
 }
