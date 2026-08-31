@@ -464,6 +464,9 @@ async function remove(borrowId) {
 }
 
 module.exports = {
+  BorrowRecord, // exported so equipmentModel.js can count references
+  // against this same table definition (countReferences()) via a lazy
+  // require, rather than a raw correlated subquery.
   BORROWABLE_STATUS,
   remove,
   findEquipmentForBorrow,

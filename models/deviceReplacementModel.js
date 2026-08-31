@@ -86,4 +86,9 @@ async function getReplacements() {
   });
 }
 
-module.exports = { getReplacements };
+module.exports = {
+  DeviceReplacement, // exported so equipmentModel.js can count references
+  // against this same table definition (countReferences()) via a lazy
+  // require, rather than a raw correlated subquery.
+  getReplacements,
+};

@@ -108,6 +108,9 @@ async function getAntivirus() {
 }
 
 module.exports = {
+  AntivirusInstall, // exported so equipmentModel.js can count references
+  // against this same table definition (countReferences()) via a lazy
+  // require, rather than a raw correlated subquery.
   getAntivirus,
   createAntivirusInstall,
   updateAntivirusInstall,

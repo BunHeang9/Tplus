@@ -722,16 +722,27 @@ async function update(id, d) {
 // Counts everything pointing at this equipment. Delete is refused while any
 // of these exist, otherwise we would orphan borrow history, antivirus records
 // and replacement history.
+// Counts across borrowModel/antivirusInstallModel/serverUsageModel/
+// deviceReplacementModel's own tables - all four of those files import
+// Equipment from this one at their own top level, so this file importing
+// any of them back at ITS top level would be a real require cycle. Lazy
+// instead (same technique as categoryModel.js/statusModel.js/
+// departmentModel.js's own correlated counts): by the time any request
+// handler calls countReferences(), the whole app has already finished
+// starting up and all four are already loaded.
 async function countReferences(id) {
-  const [row] = await sequelize.query(`
-      SELECT
-        (SELECT COUNT(*) FROM dbo.borrow_record      WHERE equipment_id = :id) AS borrow_records,
-        (SELECT COUNT(*) FROM dbo.antivirus_install  WHERE equipment_id = :id) AS antivirus_records,
-        (SELECT COUNT(*) FROM dbo.server_usage       WHERE equipment_id = :id) AS server_usage_records,
-        (SELECT COUNT(*) FROM dbo.device_replacement WHERE old_equipment_id = :id
-                                                        OR new_equipment_id = :id) AS replacement_records
-    `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row;
+  const { BorrowRecord } = require('./borrowModel');
+  const { AntivirusInstall } = require('./antivirusInstallModel');
+  const { ServerUsage } = require('./serverUsageModel');
+  const { DeviceReplacement } = require('./deviceReplacementModel');
+
+  const [borrow_records, antivirus_records, server_usage_records, replacement_records] = await Promise.all([
+    BorrowRecord.count({ where: { equipment_id: id } }),
+    AntivirusInstall.count({ where: { equipment_id: id } }),
+    ServerUsage.count({ where: { equipment_id: id } }),
+    DeviceReplacement.count({ where: { [Op.or]: [{ old_equipment_id: id }, { new_equipment_id: id }] } }),
+  ]);
+  return { borrow_records, antivirus_records, server_usage_records, replacement_records };
 }
 
 // Captures the row into the recycle bin before removing it, both in one

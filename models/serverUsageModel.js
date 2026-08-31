@@ -183,4 +183,9 @@ async function removeServerUsage(usageId) {
   return fixDates(row);
 }
 
-module.exports = { getServerUsage, getServerUsageHistory, upsertServerUsage, removeServerUsage };
+module.exports = {
+  ServerUsage, // exported so equipmentModel.js can count references
+  // against this same table definition (countReferences()) via a lazy
+  // require, rather than a raw correlated subquery.
+  getServerUsage, getServerUsageHistory, upsertServerUsage, removeServerUsage,
+};
