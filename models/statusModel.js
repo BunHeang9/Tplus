@@ -1,6 +1,5 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Equipment statuses (dbo.equipment_status).
 //
@@ -26,27 +25,55 @@ const EquipmentStatus = sequelize.define('EquipmentStatus', {
   timestamps: false,
 });
 
-// Correlated subquery for equipment_count - raw query through Sequelize.
+// equipment_count needs Equipment, and equipmentModel.js already imports
+// EquipmentStatus from this file at ITS top level (for its own belongsTo) -
+// so this file importing Equipment back at ITS OWN top level would be a
+// real require cycle. Lazy instead (inside the function body, evaluated
+// only when the function actually runs): by the time any request handler
+// calls findAll()/findById(), the whole app has already finished starting
+// up and every model file is already loaded, so this just returns the
+// cached module. Same technique as departmentModel.js/categoryModel.js's
+// own findAll()/countUsage().
 async function findAll(includeInactive = false) {
-  let query = `
-    SELECT s.status_id, s.status_name, s.description,
-           s.has_owner, s.is_assignable, s.is_borrowable,
-           s.sort_order, s.is_active,
-           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.status_id = s.status_id) AS equipment_count
-    FROM dbo.equipment_status s
-  `;
-  if (!includeInactive) query += ' WHERE s.is_active = 1';
-  query += ' ORDER BY s.sort_order, s.status_id';
-  return sequelize.query(query, { type: QueryTypes.SELECT });
+  const { Equipment } = require('./equipmentModel');
+
+  const counts = await Equipment.findAll({
+    attributes: ['status_id', [fn('COUNT', col('equipment_id')), 'n']],
+    group: ['status_id'],
+    raw: true,
+  });
+  const countByStatus = new Map(counts.map((r) => [r.status_id, r.n]));
+
+  const statuses = await EquipmentStatus.findAll({
+    where: includeInactive ? {} : { is_active: true },
+    order: [['sort_order', 'ASC'], ['status_id', 'ASC']],
+    raw: true,
+  });
+  return statuses.map((s) => ({
+    status_id: s.status_id,
+    status_name: s.status_name,
+    description: s.description,
+    has_owner: s.has_owner,
+    is_assignable: s.is_assignable,
+    is_borrowable: s.is_borrowable,
+    sort_order: s.sort_order,
+    is_active: s.is_active,
+    equipment_count: countByStatus.get(s.status_id) || 0,
+  }));
 }
 
 async function findById(id) {
-  const [row] = await sequelize.query(`
-    SELECT s.*,
-           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.status_id = s.status_id) AS equipment_count
-    FROM dbo.equipment_status s WHERE s.status_id = :id
-  `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row || null;
+  const { Equipment } = require('./equipmentModel');
+
+  const row = await EquipmentStatus.findByPk(id, { raw: true });
+  if (!row) return null;
+  const equipment_count = await Equipment.count({ where: { status_id: id } });
+  // `s.*` in the original query, then equipment_count appended - a plain
+  // read's key order matches physical column order here (confirmed live,
+  // same as equipmentModel.js's own findByOwner()/findAll() - it's only a
+  // .create()/.update() result that doesn't, per equipmentModel.js's
+  // toPhysicalOrder() comment).
+  return { ...row, equipment_count };
 }
 
 async function findByName(name) {
@@ -102,9 +129,13 @@ async function update(id, d) {
     }
 
     if (d.status_name && d.status_name !== oldName) {
-      await sequelize.query(
-        'UPDATE dbo.equipment SET status = :new_name WHERE status_id = :id',
-        { replacements: { id, new_name: d.status_name }, transaction },
+      // Same lazy-require reasoning as findAll()/findById() above - safe
+      // here too since this only ever runs once a request is already being
+      // handled, long after every model file has finished loading.
+      const { Equipment } = require('./equipmentModel');
+      await Equipment.update(
+        { status: d.status_name },
+        { where: { status_id: id }, transaction },
       );
     }
 
@@ -113,11 +144,8 @@ async function update(id, d) {
 }
 
 async function countUsage(id) {
-  const [row] = await sequelize.query(
-    'SELECT COUNT(*) AS equipment_count FROM dbo.equipment WHERE status_id = :id',
-    { replacements: { id }, type: QueryTypes.SELECT },
-  );
-  return row.equipment_count;
+  const { Equipment } = require('./equipmentModel');
+  return Equipment.count({ where: { status_id: id } });
 }
 
 // Sequelize's destroy() doesn't return the deleted row - fetch first so the

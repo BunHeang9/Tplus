@@ -1,6 +1,5 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Reference table: dbo.category (Laptop, Desktop, PC, Server, Monitor, CCTV, ...)
 
@@ -50,15 +49,32 @@ function toViewKey(name) {
   return name.toLowerCase().replace(/ /g, '-').replace(/_/g, '-');
 }
 
-// Correlated subquery for equipment_count - a reporting-style read, not a
-// fit for .findAll(), so raw query through Sequelize.
+// equipment_count needs Equipment, and equipmentModel.js already imports
+// Category from this file at ITS top level (for its own belongsTo) - so
+// this file importing Equipment back at ITS OWN top level would be a real
+// require cycle. Lazy instead (inside the function body, evaluated only
+// when the function actually runs): by the time any request handler calls
+// findAll(), the whole app has already finished starting up and every
+// model file is already loaded, so this just returns the cached module.
+// Same technique as departmentModel.js's own findAll()/countUsage().
 async function findAll() {
-  return sequelize.query(`
-    SELECT c.category_id, c.category_name, c.description, c.is_active,
-           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.category_id = c.category_id) AS equipment_count
-    FROM dbo.category c
-    ORDER BY c.category_name
-  `, { type: QueryTypes.SELECT });
+  const { Equipment } = require('./equipmentModel');
+
+  const counts = await Equipment.findAll({
+    attributes: ['category_id', [fn('COUNT', col('equipment_id')), 'n']],
+    group: ['category_id'],
+    raw: true,
+  });
+  const countByCategory = new Map(counts.map((r) => [r.category_id, r.n]));
+
+  const categories = await Category.findAll({ order: [['category_name', 'ASC']], raw: true });
+  return categories.map((c) => ({
+    category_id: c.category_id,
+    category_name: c.category_name,
+    description: c.description,
+    is_active: c.is_active,
+    equipment_count: countByCategory.get(c.category_id) || 0,
+  }));
 }
 
 async function findById(id) {
@@ -101,14 +117,12 @@ async function update(id, { category_name, description, is_active }) {
   return row ? row.get({ plain: true }) : null;
 }
 
-// Not this table's own row count - dbo.equipment's, so a raw query rather
-// than forcing an Equipment model into existence early for one COUNT.
+// Not this table's own row count - dbo.equipment's. Same lazy-require
+// reasoning as findAll() above.
 async function countUsage(id) {
-  const [row] = await sequelize.query(
-    'SELECT COUNT(*) AS equipment_count FROM dbo.equipment WHERE category_id = :id',
-    { replacements: { id }, type: QueryTypes.SELECT },
-  );
-  return row;
+  const { Equipment } = require('./equipmentModel');
+  const equipment_count = await Equipment.count({ where: { category_id: id } });
+  return { equipment_count };
 }
 
 // Sequelize's destroy() doesn't return the deleted row (no OUTPUT DELETED.*
