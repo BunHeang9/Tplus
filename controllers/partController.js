@@ -395,15 +395,19 @@ async function create(req, res, next) {
       hint: 'GET /api/part-types lists what can be replaced.',
     });
   }
-  if (req.body.old_part_status) {
-    const status = await partStatusModel.findByName(req.body.old_part_status);
-    if (!status) {
-      const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
-      return res.status(400).json({ error: `old_part_status must be one of: ${valid.join(', ')}` });
-    }
-  }
-
   try {
+    // Inside the try - this hits the database via partStatusModel, so a
+    // rejection here needs to reach next(err) like every other await below,
+    // rather than becoming an unhandled rejection Express 4 never turns
+    // into a response.
+    if (req.body.old_part_status) {
+      const status = await partStatusModel.findByName(req.body.old_part_status);
+      if (!status) {
+        const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
+        return res.status(400).json({ error: `old_part_status must be one of: ${valid.join(', ')}` });
+      }
+    }
+
     const equipment = await equipmentModel.findById(req.params.id);
     if (!equipment) return res.status(404).json({ error: 'Equipment not found' });
     const applies = await partModel.partAppliesToCategory(

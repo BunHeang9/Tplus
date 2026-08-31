@@ -177,15 +177,21 @@ async function update(req, res, next) {
   if (quantity !== undefined && quantity < 0) {
     return res.status(400).json({ error: 'quantity cannot be negative' });
   }
-  if (status) {
-    const statusRow = await partStatusModel.findByName(status);
-    if (!statusRow) {
-      const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
-      return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}` });
-    }
-  }
 
   try {
+    // Inside the try (not before it, like add()'s own status check above) -
+    // this now hits the database via partStatusModel, so a rejection here
+    // needs to reach next(err) the same way any other await below does,
+    // rather than becoming an unhandled rejection Express 4 never turns
+    // into a response.
+    if (status) {
+      const statusRow = await partStatusModel.findByName(status);
+      if (!statusRow) {
+        const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
+        return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}` });
+      }
+    }
+
     const stock = await partStockModel.updateLine(req.params.id, req.body);
     if (!stock) return res.status(404).json({ error: 'Stock line not found' });
 
