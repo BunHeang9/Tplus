@@ -266,58 +266,83 @@ async function findByServiceTag(tag) {
 }
 
 // New stock always starts with owner_id NULL - assignment is a separate step.
+// New stock always starts with owner_id NULL - assignment is a separate
+// step. status_id is resolved by a plain lookup first rather than a
+// subquery embedded in the INSERT - two ORM calls instead of one raw
+// statement, deliberately: this only runs once per new row (not a hot
+// path), and there's no real correctness difference since nothing else
+// can be reading/writing this specific not-yet-created row in between.
 async function createStock(d) {
-  const [row] = await sequelize.query(`
-      INSERT INTO dbo.equipment (
-        category_id, device_type, device_name, server_type, device_model, manufacturer,
-        asset_code, service_tag, serial_no, product_id,
-        mac_address, ip_address, os_type, os_version,
-        cpu, ram, hd, windows_license, av_license,
-        purchase_date, received_date,
-        location, department_id, status, status_id, remark, owner_id
-      )
-      OUTPUT INSERTED.*
-      VALUES (
-        :category_id, :device_type, :device_name, :server_type, :device_model, :manufacturer,
-        :asset_code, :service_tag, :serial_no, :product_id,
-        :mac_address, :ip_address, :os_type, :os_version,
-        :cpu, :ram, :hd, :windows_license, :av_license,
-        :purchase_date, :received_date,
-        :location, :department_id, :status,
-        (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
-        :remark, NULL
-      )
-    `, {
-    replacements: {
-      category_id: d.category_id,
-      device_type: d.device_type || null,
-      device_name: d.device_name || null,
-      server_type: d.server_type || null,
-      device_model: d.device_model || null,
-      manufacturer: d.manufacturer || null,
-      service_tag: d.service_tag || null,
-      serial_no: d.serial_no || null,
-      product_id: d.product_id || null,
-      mac_address: d.mac_address || null,
-      ip_address: d.ip_address || null,
-      os_type: d.os_type || null,
-      os_version: d.os_version || null,
-      cpu: d.cpu || null,
-      ram: d.ram || null,
-      hd: d.hd || null,
-      windows_license: d.windows_license || null,
-      av_license: d.av_license || null,
-      purchase_date: d.purchase_date || null,
-      received_date: d.received_date || null,
-      location: d.location || null,
-      department_id: d.department_id || null,
-      status: d.status || 'Working - IT Stock',
-      remark: d.remark || null,
-      asset_code: d.asset_code || d.equipment_code || null,
-    },
-    type: QueryTypes.SELECT,
+  const status = d.status || 'Working - IT Stock';
+  const statusRow = await EquipmentStatus.findOne({ where: { status_name: status }, attributes: ['status_id'], raw: true });
+
+  const row = await Equipment.create({
+    category_id: d.category_id,
+    device_type: d.device_type || null,
+    device_name: d.device_name || null,
+    server_type: d.server_type || null,
+    device_model: d.device_model || null,
+    manufacturer: d.manufacturer || null,
+    asset_code: d.asset_code || d.equipment_code || null,
+    service_tag: d.service_tag || null,
+    serial_no: d.serial_no || null,
+    product_id: d.product_id || null,
+    mac_address: d.mac_address || null,
+    ip_address: d.ip_address || null,
+    os_type: d.os_type || null,
+    os_version: d.os_version || null,
+    cpu: d.cpu || null,
+    ram: d.ram || null,
+    hd: d.hd || null,
+    windows_license: d.windows_license || null,
+    av_license: d.av_license || null,
+    purchase_date: d.purchase_date || null,
+    received_date: d.received_date || null,
+    location: d.location || null,
+    department_id: d.department_id || null,
+    status,
+    status_id: statusRow ? statusRow.status_id : null,
+    remark: d.remark || null,
+    owner_id: null,
   });
-  return fixDates(row);
+  // Sequelize's own attribute-declaration order doesn't match this table's
+  // actual physical column order (confirmed against sys.columns) - the
+  // original `OUTPUT INSERTED.*` did, so the row is reconstructed here in
+  // that same physical order for a byte-for-byte identical response shape.
+  const e = row.get({ plain: true });
+  return fixDates({
+    equipment_id: e.equipment_id,
+    device_type: e.device_type,
+    device_model: e.device_model,
+    manufacturer: e.manufacturer,
+    serial_no: e.serial_no,
+    asset_code: e.asset_code,
+    mac_address: e.mac_address,
+    ip_address: e.ip_address,
+    owner_id: e.owner_id,
+    location: e.location,
+    purchase_date: e.purchase_date,
+    status: e.status,
+    remark: e.remark,
+    received_date: e.received_date,
+    assigned_date: e.assigned_date,
+    department_id: e.department_id,
+    category_id: e.category_id,
+    status_id: e.status_id,
+    computer_name: e.computer_name,
+    cpu: e.cpu,
+    ram: e.ram,
+    hd: e.hd,
+    os_type: e.os_type,
+    os_version: e.os_version,
+    windows_license: e.windows_license,
+    av_license: e.av_license,
+    service_tag: e.service_tag,
+    product_id: e.product_id,
+    device_name: e.device_name,
+    platform: e.platform,
+    server_type: e.server_type,
+  });
 }
 
 // Every device this employee owns, with raw equipment columns plus category
