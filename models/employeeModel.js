@@ -1,4 +1,4 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const recycleBinModel = require("./recycleBinModel");
@@ -66,27 +66,76 @@ async function findAll(includeInactive = false) {
 // LEFT JOIN so an employee with nothing owned still gets one row, with the
 // equipment columns null. That is what lets a report show "no equipment"
 // employees alongside everyone else instead of silently dropping them.
+//
+// equipmentModel.js already imports Employee from this file at ITS top
+// level, so this file importing Equipment back at ITS OWN top level would
+// be a real require cycle. Lazy instead - by the time any request handler
+// calls findAllWithEquipment(), the whole app has already finished
+// starting up and equipmentModel.js is already loaded.
 async function findAllWithEquipment(includeInactive = false) {
-  let query = `
-    SELECT emp.employee_id, emp.full_name, emp.staff_code, emp.position,
-           emp.location AS employee_location,
-           d.department_code, d.department_name,
-           emp.is_active,
-           e.equipment_id,
-           c.category_name,
-           e.computer_name, e.device_model, e.manufacturer,
-           e.asset_code, e.service_tag,
-           e.status AS device_status,
-           e.location AS device_location
-    FROM dbo.employee emp
-    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
-    LEFT JOIN dbo.equipment e  ON e.owner_id = emp.employee_id
-    LEFT JOIN dbo.category c   ON e.category_id = c.category_id
-  `;
-  if (!includeInactive) query += ' WHERE emp.is_active = 1';
-  query += ' ORDER BY emp.full_name, c.category_name, e.computer_name';
+  const { Equipment } = require('./equipmentModel');
+  const { Category } = require('./categoryModel');
 
-  return sequelize.query(query, { type: QueryTypes.SELECT });
+  // Declared once, guarded - re-declaring the same association on every
+  // call would eventually throw ("you have used the alias ownedEquipment
+  // in two separate associations").
+  if (!Employee.associations.ownedEquipment) {
+    Employee.hasMany(Equipment, { foreignKey: 'owner_id', as: 'ownedEquipment' });
+  }
+
+  const employees = await Employee.findAll({
+    where: includeInactive ? {} : { is_active: true },
+    include: [
+      { model: Department, as: 'department' },
+      {
+        model: Equipment, as: 'ownedEquipment', required: false,
+        include: [{ model: Category, as: 'category' }],
+      },
+    ],
+    // All three sort keys pushed through SQL (not a JS .sort() afterward) -
+    // SQL Server's default collation is case-insensitive, but a plain JS
+    // string comparison isn't ('bounngern' sorts after 'Bounphahaksa' in
+    // JS, before it in SQL) - caught live by this exact mismatch before
+    // this fix.
+    order: [
+      ['full_name', 'ASC'],
+      [{ model: Equipment, as: 'ownedEquipment' }, { model: Category, as: 'category' }, 'category_name', 'ASC'],
+      [{ model: Equipment, as: 'ownedEquipment' }, 'computer_name', 'ASC'],
+    ],
+    subQuery: false,
+  });
+
+  // One employee with N equipment becomes N rows here (or 1 all-null-
+  // equipment row if they own nothing) - flattening the nested include back
+  // into the original flat, one-row-per-device shape.
+  const rows = [];
+  for (const row of employees) {
+    const { department, ownedEquipment, ...emp } = row.get({ plain: true });
+    const devices = ownedEquipment && ownedEquipment.length > 0 ? ownedEquipment : [null];
+    for (const e of devices) {
+      rows.push({
+        employee_id: emp.employee_id,
+        full_name: emp.full_name,
+        staff_code: emp.staff_code,
+        position: emp.position,
+        employee_location: emp.location,
+        department_code: department ? department.department_code : null,
+        department_name: department ? department.department_name : null,
+        is_active: emp.is_active,
+        equipment_id: e ? e.equipment_id : null,
+        category_name: e && e.category ? e.category.category_name : null,
+        computer_name: e ? e.computer_name : null,
+        device_model: e ? e.device_model : null,
+        manufacturer: e ? e.manufacturer : null,
+        asset_code: e ? e.asset_code : null,
+        service_tag: e ? e.service_tag : null,
+        device_status: e ? e.status : null,
+        device_location: e ? e.location : null,
+      });
+    }
+  }
+
+  return rows;
 }
 
 async function findById(id) {
@@ -234,30 +283,47 @@ async function findForAssign({ position, department, q } = {}) {
   return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
 }
 
+// deviceReplacementModel.js already defines DeviceReplacement with both
+// old/new Equipment self-joins aliased (oldEquipment/newEquipment) - reused
+// here via the same lazy-require reasoning as findAllWithEquipment() above,
+// rather than re-declaring the same associations a second time.
 async function findReplacementHistory(employeeId) {
-  return sequelize.query(`
-      SELECT
-        dr.replacement_id,
-        old_eq.device_model AS old_device_model,
-        old_eq.service_tag AS old_service_tag,
-        old_eq.asset_code AS old_asset_code,
-        dr.old_device_status,
-        dr.old_device_location AS location_of_old,
-        dr.old_bag, dr.old_mouse, dr.old_keyboard,
-        new_eq.computer_name AS new_computer_name,
-        new_eq.device_model AS new_device_model,
-        new_eq.service_tag AS new_service_tag,
-        new_eq.product_id AS new_product_id,
-        new_eq.asset_code AS new_asset_code,
-        dr.new_bag, dr.new_mouse, dr.new_keyboard,
-        dr.replacement_date,
-        dr.new_owner_location
-      FROM dbo.device_replacement dr
-      LEFT JOIN dbo.equipment old_eq ON dr.old_equipment_id = old_eq.equipment_id
-      LEFT JOIN dbo.equipment new_eq ON dr.new_equipment_id = new_eq.equipment_id
-      WHERE dr.employee_id = :id
-      ORDER BY dr.replacement_date
-    `, { replacements: { id: employeeId }, type: QueryTypes.SELECT });
+  const { DeviceReplacement } = require('./deviceReplacementModel');
+  const { Equipment } = require('./equipmentModel');
+
+  const rows = await DeviceReplacement.findAll({
+    where: { employee_id: employeeId },
+    include: [
+      { model: Equipment, as: 'oldEquipment' },
+      { model: Equipment, as: 'newEquipment' },
+    ],
+    order: [['replacement_date', 'ASC']],
+  });
+
+  return rows.map((row) => {
+    const { oldEquipment: oldEq, newEquipment: newEq, ...dr } = row.get({ plain: true });
+    return {
+      replacement_id: dr.replacement_id,
+      old_device_model: oldEq ? oldEq.device_model : null,
+      old_service_tag: oldEq ? oldEq.service_tag : null,
+      old_asset_code: oldEq ? oldEq.asset_code : null,
+      old_device_status: dr.old_device_status,
+      location_of_old: dr.old_device_location,
+      old_bag: dr.old_bag,
+      old_mouse: dr.old_mouse,
+      old_keyboard: dr.old_keyboard,
+      new_computer_name: newEq ? newEq.computer_name : null,
+      new_device_model: newEq ? newEq.device_model : null,
+      new_service_tag: newEq ? newEq.service_tag : null,
+      new_product_id: newEq ? newEq.product_id : null,
+      new_asset_code: newEq ? newEq.asset_code : null,
+      new_bag: dr.new_bag,
+      new_mouse: dr.new_mouse,
+      new_keyboard: dr.new_keyboard,
+      replacement_date: dr.replacement_date,
+      new_owner_location: dr.new_owner_location,
+    };
+  });
 }
 
 async function create(data) {
@@ -304,24 +370,39 @@ async function update(id, data) {
 
 // Everything referencing this employee. Delete is refused while any exist -
 // removing a person would otherwise orphan their equipment and loan history.
+// Same lazy-require reasoning as findAllWithEquipment()/
+// findReplacementHistory() above - four independent counts merged in JS
+// (not one query joining everything) to avoid fan-out between unrelated
+// tables, same as equipmentModel.countReferences()'s own mirror of this.
 async function countReferences(id) {
-  const [row] = await sequelize.query(`
-      SELECT
-        (SELECT COUNT(*) FROM dbo.equipment  WHERE owner_id = :id)   AS owned_equipment,
-        (SELECT COUNT(*) FROM dbo.borrow_record WHERE borrower_id = :id
-             OR issued_by_id = :id OR received_by_id = :id)          AS borrow_records,
-        (SELECT COUNT(*) FROM dbo.borrow_record WHERE borrower_id = :id
-             AND return_date IS NULL)                                AS items_still_out,
-        -- server_usage has no owner_id of its own - ownership lives on the
-        -- equipment row it's for (see serverUsageModel.js).
-        (SELECT COUNT(*) FROM dbo.server_usage su
-           JOIN dbo.equipment e ON su.equipment_id = e.equipment_id
-           WHERE e.owner_id = :id)                                     AS server_usage,
-        -- device_replacement only has employee_id; its issued_by_id and
-        -- received_by_id columns were dropped as they were never populated.
-        (SELECT COUNT(*) FROM dbo.device_replacement WHERE employee_id = :id) AS replacements
-    `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row;
+  // A raw `= :id` parameter never matches a NULL column, even one that's
+  // also NULL (standard SQL, not a bug) - but Sequelize's plain `{ x: null }`
+  // where-shorthand compiles to `x IS NULL`, which DOES match. A handful of
+  // real borrow_record rows genuinely have a NULL borrower_id (from a past
+  // employee delete via remove() below, which clears it) - short-circuiting
+  // here keeps a null/undefined id matching nothing, same as the original.
+  if (id === null || id === undefined) {
+    return { owned_equipment: 0, borrow_records: 0, items_still_out: 0, server_usage: 0, replacements: 0 };
+  }
+
+  const { Equipment } = require('./equipmentModel');
+  const { BorrowRecord } = require('./borrowModel');
+  const { ServerUsage } = require('./serverUsageModel');
+  const { DeviceReplacement } = require('./deviceReplacementModel');
+
+  const [owned_equipment, borrow_records, items_still_out, server_usage, replacements] = await Promise.all([
+    Equipment.count({ where: { owner_id: id } }),
+    BorrowRecord.count({ where: { [Op.or]: [{ borrower_id: id }, { issued_by_id: id }, { received_by_id: id }] } }),
+    BorrowRecord.count({ where: { borrower_id: id, return_date: null } }),
+    // server_usage has no owner_id of its own - ownership lives on the
+    // equipment row it's for (see serverUsageModel.js). belongsTo, so no
+    // fan-out risk counting through the include.
+    ServerUsage.count({ include: [{ model: Equipment, as: 'equipment', where: { owner_id: id }, required: true }] }),
+    // device_replacement only has employee_id; its issued_by_id and
+    // received_by_id columns were dropped as they were never populated.
+    DeviceReplacement.count({ where: { employee_id: id } }),
+  ]);
+  return { owned_equipment, borrow_records, items_still_out, server_usage, replacements };
 }
 
 // Captures the row into the recycle bin before removing it, both in one
@@ -330,10 +411,7 @@ async function countReferences(id) {
 // transaction.
 async function remove(id, fullName, actor) {
   return sequelize.transaction(async (transaction) => {
-    const [employee] = await sequelize.query(
-      'SELECT * FROM dbo.employee WHERE employee_id = :id',
-      { replacements: { id }, type: QueryTypes.SELECT, transaction },
-    );
+    const employee = await Employee.findByPk(id, { transaction, raw: true });
     if (!employee) return false;
 
     // recycleBinModel.create serialises entityData, so pass the object.
@@ -348,27 +426,34 @@ async function remove(id, fullName, actor) {
       },
       transaction,
     );
-    // Snapshot the name and clear each reference before deletion. Doing this
-    // explicitly avoids SQL Server's multiple-cascade-path restriction.
-    await sequelize.query(`
-        UPDATE dbo.borrow_record
-        SET borrower_name = CASE WHEN borrower_id = :id THEN COALESCE(borrower_name, :full_name) ELSE borrower_name END,
-            issued_by_name = CASE WHEN issued_by_id = :id THEN COALESCE(issued_by_name, :full_name) ELSE issued_by_name END,
-            received_by_name = CASE WHEN received_by_id = :id THEN COALESCE(received_by_name, :full_name) ELSE received_by_name END,
-            borrower_id = CASE WHEN borrower_id = :id THEN NULL ELSE borrower_id END,
-            issued_by_id = CASE WHEN issued_by_id = :id THEN NULL ELSE issued_by_id END,
-            received_by_id = CASE WHEN received_by_id = :id THEN NULL ELSE received_by_id END
-        WHERE borrower_id = :id OR issued_by_id = :id OR received_by_id = :id
-      `, { replacements: { id, full_name: fullName }, transaction });
 
-    // No OUTPUT clause here - dbo.employee has a trigger, and SQL Server
-    // rejects OUTPUT without INTO on a table with any enabled trigger.
-    const [, affected] = await sequelize.query(
-      'DELETE FROM dbo.employee WHERE employee_id = :id',
-      { replacements: { id }, transaction },
+    // Snapshot the name and clear each reference before deletion - three
+    // independent updates (one per column) rather than one CASE-per-column
+    // statement, since a row can independently match more than one
+    // condition (the same person could be both borrower and issuer on one
+    // loan) and each update only ever touches its own column regardless.
+    // Doing this explicitly avoids SQL Server's multiple-cascade-path
+    // restriction.
+    const { BorrowRecord } = require('./borrowModel');
+    await BorrowRecord.update(
+      { borrower_name: fn('COALESCE', col('borrower_name'), fullName), borrower_id: null },
+      { where: { borrower_id: id }, transaction },
+    );
+    await BorrowRecord.update(
+      { issued_by_name: fn('COALESCE', col('issued_by_name'), fullName), issued_by_id: null },
+      { where: { issued_by_id: id }, transaction },
+    );
+    await BorrowRecord.update(
+      { received_by_name: fn('COALESCE', col('received_by_name'), fullName), received_by_id: null },
+      { where: { received_by_id: id }, transaction },
     );
 
-    return (affected || 0) > 0;
+    // Sequelize's destroy() doesn't add an OUTPUT clause unless asked, so
+    // the trigger-rejects-OUTPUT-without-INTO problem the old raw DELETE's
+    // comment warned about doesn't apply here - verified live.
+    const affected = await Employee.destroy({ where: { employee_id: id }, transaction });
+
+    return affected > 0;
   });
 }
 

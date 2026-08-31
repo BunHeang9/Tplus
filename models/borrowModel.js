@@ -27,7 +27,12 @@ const BORROWED_STATUS   = 'Borrowed';
 const BorrowRecord = sequelize.define('BorrowRecord', {
   borrow_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   equipment_id: { type: DataTypes.INTEGER, allowNull: false },
-  borrower_id: { type: DataTypes.INTEGER, allowNull: false },
+  // The real column is nullable (confirmed against sys.columns) - this is
+  // set to NULL by employeeModel.remove() when the borrower's own employee
+  // record is deleted (the name gets snapshotted onto borrower_name at the
+  // same time). allowNull:false here would make that legitimate write fail
+  // client-side before ever reaching the database - caught live.
+  borrower_id: { type: DataTypes.INTEGER, allowNull: true },
   borrow_date: { type: DataTypes.DATEONLY, allowNull: true },
   expected_return_date: { type: DataTypes.DATEONLY, allowNull: true },
   return_date: { type: DataTypes.DATEONLY, allowNull: true },
