@@ -2,8 +2,6 @@ const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const { Equipment } = require('./equipmentModel');
-const { Employee } = require('./employeeModel');
-const { Category } = require('./categoryModel');
 
 // The capacity-planning calculation sheet ("Plan optimize"): Total Capacity
 // vs Usage, one row per server. This is deliberately separate from "server"
@@ -36,15 +34,18 @@ const ServerUsage = sequelize.define('ServerUsage', {
 });
 
 ServerUsage.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
-// Reverse direction for getServerUsage() below - lets the list start from
-// every Server-category equipment and LEFT JOIN outward to its usage row
-// (or lack of one), rather than starting from server_usage and only ever
-// showing equipment that already has a row.
-Equipment.hasOne(ServerUsage, { foreignKey: 'equipment_id', as: 'usage' });
+// No reverse hasOne here - an equipment can have many server_usage rows now
+// (see below), not one, so a plain association can't express "give me just
+// the latest one, optionally within a date range" - getServerUsage() below
+// is raw SQL for exactly that reason.
 
-// upsertServerUsage's MERGE with COALESCE-per-field doesn't map onto
-// Sequelize's upsert() (which would null out any field left unprovided,
-// not keep the existing value), so that one stays a raw query.
+// server_usage is a history log, not one row per equipment: every save
+// (admin or self-service) adds a new row rather than overwriting the
+// existing one, so "what was this server's usage as of a given date"
+// stays answerable later, not just "what is it right now". Same
+// MERGE/COALESCE-doesn't-map-onto-the-ORM reasoning as before, now for a
+// plain INSERT that still needs to look at the previous row to carry
+// forward a field the caller didn't supply.
 
 const DATE_FIELDS = ['due_date'];
 
@@ -73,90 +74,78 @@ function fixDates(row) {
 }
 
 // Every Server-category equipment, not just the ones that already have a
-// server_usage row - a server nobody has filled usage in for yet still
+// server_usage entry - a server nobody has filled usage in for yet still
 // needs to show up here (with blank usage fields) so there's somewhere to
 // find it and fill it in, rather than only listing what already exists.
-async function getServerUsage() {
-  const rows = await Equipment.findAll({
-    where: { '$category.category_name$': 'Server' },
-    attributes: [
-      'equipment_id', 'device_name', 'ip_address', 'owner_id',
-      [sequelize.literal('TRY_CAST(cpu AS INT)'), 'cpu_core_total'],
-      [sequelize.literal('TRY_CAST(ram AS INT)'), 'memory_gb_total'],
-      [sequelize.literal('TRY_CAST(hd AS INT)'), 'hdd_gb_total'],
-    ],
-    include: [
-      { model: Category, as: 'category', attributes: [] },
-      { model: Employee, as: 'owner', attributes: ['full_name'], required: false },
-      { model: ServerUsage, as: 'usage', required: false },
-    ],
-    order: [['device_name', 'ASC'], ['equipment_id', 'ASC']],
+//
+// Each equipment can now have many server_usage rows (a history log, not
+// one row per server), so this needs "the single latest one, optionally
+// only counting entries within a date range" - a real top-1-per-group
+// query, not the "business rule guarantees at most one" shortcut used
+// elsewhere in this migration. No clean Sequelize include expresses that,
+// so this one stays raw SQL (OUTER APPLY TOP 1) - same reasoning already
+// applied to borrowModel.findAvailableToBorrow's NOT EXISTS, viewColumnModel
+// listViews()'s item_count, etc.
+//
+// from/to (optional, 'YYYY-MM-DD') scope which entries count as
+// candidates for "latest" - e.g. from=2026-08-01&to=2026-08-31 answers
+// "what was each server's usage as of some point in August", not
+// literally only entries recorded on a single exact day.
+async function getServerUsage(from, to) {
+  const rows = await sequelize.query(`
+    SELECT e.equipment_id, e.device_name, e.ip_address, e.owner_id,
+           emp.full_name AS owner_name,
+           su.usage_id, su.due_date,
+           TRY_CAST(e.cpu AS INT) AS cpu_core_total,
+           TRY_CAST(e.ram AS INT) AS memory_gb_total,
+           TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
+           su.cpu_usage_pct, su.memory_usage_pct, su.hdd_usage_gb, su.remark
+    FROM dbo.equipment e
+    JOIN dbo.category c   ON e.category_id = c.category_id AND c.category_name = 'Server'
+    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
+    OUTER APPLY (
+      SELECT TOP 1 s.usage_id, s.due_date, s.cpu_usage_pct, s.memory_usage_pct, s.hdd_usage_gb, s.remark
+      FROM dbo.server_usage s
+      WHERE s.equipment_id = e.equipment_id
+        AND (:from IS NULL OR s.due_date >= :from)
+        AND (:to   IS NULL OR s.due_date <= :to)
+      ORDER BY s.due_date DESC, s.usage_id DESC
+    ) su
+    ORDER BY e.device_name, e.equipment_id
+  `, {
+    replacements: { from: from || null, to: to || null },
+    type: QueryTypes.SELECT,
   });
-
-  return rows.map((row) => {
-    const { owner, usage, ...e } = row.get({ plain: true });
-    return fixDates({
-      usage_id: usage ? usage.usage_id : null,
-      equipment_id: e.equipment_id,
-      device_name: e.device_name,
-      ip_address: e.ip_address,
-      owner_id: e.owner_id,
-      owner_name: owner ? owner.full_name : null,
-      due_date: usage ? usage.due_date : null,
-      cpu_core_total: e.cpu_core_total,
-      memory_gb_total: e.memory_gb_total,
-      hdd_gb_total: e.hdd_gb_total,
-      cpu_usage_pct: usage ? usage.cpu_usage_pct : null,
-      memory_usage_pct: usage ? usage.memory_usage_pct : null,
-      hdd_usage_gb: usage ? usage.hdd_usage_gb : null,
-      remark: usage ? usage.remark : null,
-    });
-  });
+  return rows.map(fixDates);
 }
 
-// Sets the calculation fields for one equipment - MERGE so an
-// admin filling this in doesn't need to know whether a row already exists
-// for that server, the same way part_stock's increment() spares the caller
-// from that. COALESCE keeps a field already recorded when this update
-// leaves it out, rather than blanking it back to null.
-//
-// due_date is no longer something a caller sets - it's "last recorded",
-// stamped to today automatically whenever any usage field
-// (cpu_usage_pct/memory_usage_pct/hdd_usage_gb) is actually supplied,
-// whether that's the admin's own form or the self-service one. A caller
-// can no longer set it directly; a due_date-only call (nothing else
-// supplied) leaves it exactly as it was, same as any other field nobody
-// touched. CAST(GETDATE() AS DATE) rather than a JS Date, so it's the
-// server's own clock, not something formatted client-side.
+// Adds a new usage entry for one equipment - never overwrites an existing
+// row, so history stays intact ("history" being the whole point: your boss
+// wants to pick a date range later and see what was recorded, not just the
+// current numbers). A field left out of this call carries forward from the
+// most recent prior entry (if any) rather than coming back blank, the same
+// "don't lose what nobody touched" behaviour the old MERGE/COALESCE gave -
+// just read from the last row instead of written onto it. due_date is
+// always today (CAST(GETDATE() AS DATE), the server's own clock) - every
+// save is its own dated entry now, not something that only moves when
+// usage happens to be touched.
 async function upsertServerUsage(equipmentId, d) {
-  const usageTouched = d.cpu_usage_pct !== undefined || d.memory_usage_pct !== undefined || d.hdd_usage_gb !== undefined;
+  const [previous] = await sequelize.query(
+    'SELECT TOP 1 * FROM dbo.server_usage WHERE equipment_id = :equipment_id ORDER BY due_date DESC, usage_id DESC',
+    { replacements: { equipment_id: equipmentId }, type: QueryTypes.SELECT },
+  );
 
   const [row] = await sequelize.query(`
-      MERGE dbo.server_usage AS target
-      USING (SELECT :equipment_id AS equipment_id) AS source
-      ON target.equipment_id = source.equipment_id
-      WHEN MATCHED THEN UPDATE SET
-        due_date = CASE WHEN :usage_touched = 1 THEN CAST(GETDATE() AS DATE) ELSE due_date END,
-        cpu_usage_pct = COALESCE(:cpu_usage_pct, cpu_usage_pct),
-        memory_usage_pct = COALESCE(:memory_usage_pct, memory_usage_pct),
-        hdd_usage_gb = COALESCE(:hdd_usage_gb, hdd_usage_gb),
-        remark = COALESCE(:remark, remark)
-      WHEN NOT MATCHED THEN INSERT (
-        equipment_id, due_date,
-        cpu_usage_pct, memory_usage_pct, hdd_usage_gb, remark
-      ) VALUES (
-        :equipment_id, CASE WHEN :usage_touched = 1 THEN CAST(GETDATE() AS DATE) ELSE NULL END,
-        :cpu_usage_pct, :memory_usage_pct, :hdd_usage_gb, :remark
-      )
-      OUTPUT INSERTED.*;
-  `, {
+      INSERT INTO dbo.server_usage (equipment_id, due_date, cpu_usage_pct, memory_usage_pct, hdd_usage_gb, remark)
+      OUTPUT INSERTED.*
+      VALUES (:equipment_id, CAST(GETDATE() AS DATE), :cpu_usage_pct, :memory_usage_pct, :hdd_usage_gb, :remark)
+    `, {
     replacements: {
       equipment_id: equipmentId,
-      usage_touched: usageTouched ? 1 : 0,
-      cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? null,
-      memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? null,
-      hdd_usage_gb: d.hdd_usage_gb ?? null,
-      remark: d.remark ?? null,
+      cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? (previous ? previous.cpu_usage_pct : null),
+      memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? (previous ? previous.memory_usage_pct : null),
+      hdd_usage_gb: d.hdd_usage_gb ?? (previous ? previous.hdd_usage_gb : null),
+      remark: d.remark ?? (previous ? previous.remark : null),
     },
     type: QueryTypes.SELECT,
   });
