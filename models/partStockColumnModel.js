@@ -1,4 +1,4 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 
@@ -83,12 +83,12 @@ async function findByPartType(partTypeId) {
 async function findByPartTypes(partTypeIds) {
   if (!partTypeIds || partTypeIds.length === 0) return {};
 
-  const rows = await sequelize.query(`
-    SELECT part_type_id, field_name, header_text, sort_order
-    FROM dbo.part_type_stock_column
-    WHERE part_type_id IN (:ids)
-    ORDER BY sort_order
-  `, { replacements: { ids: partTypeIds }, type: QueryTypes.SELECT });
+  const rows = await PartTypeStockColumn.findAll({
+    attributes: ['part_type_id', 'field_name', 'header_text', 'sort_order'],
+    where: { part_type_id: { [Op.in]: partTypeIds } },
+    order: [['sort_order', 'ASC']],
+    raw: true,
+  });
 
   const byPartType = {};
   for (const row of rows) {

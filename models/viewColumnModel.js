@@ -166,17 +166,27 @@ async function findByViewKey(viewKey) {
     }));
 }
 
+// column_count is a real join (category -> its own view columns, via the
+// same hasMany used by findByViewKey above) so it converts cleanly to an
+// ORM include + COUNT. item_count stays a raw correlated subquery rather
+// than a second include: joining both category_view_column and equipment at
+// once would fan out (a category with 3 columns and 5 devices becomes 15
+// joined rows before grouping), corrupting both counts - the same reason
+// the original raw query used a subquery here instead of a second JOIN.
 async function listViews() {
-  return sequelize.query(`
-    SELECT c.category_id, c.view_key, c.category_name,
-           COUNT(v.view_column_id) AS column_count,
-           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.category_id = c.category_id) AS item_count
-    FROM dbo.category c
-    LEFT JOIN dbo.category_view_column v ON c.category_id = v.category_id
-    WHERE c.is_active = 1
-    GROUP BY c.category_id, c.view_key, c.category_name
-    ORDER BY c.category_name
-  `, { type: QueryTypes.SELECT });
+  return Category.findAll({
+    where: { is_active: true },
+    attributes: [
+      'category_id', 'view_key', 'category_name',
+      [sequelize.fn('COUNT', sequelize.col('viewColumns.view_column_id')), 'column_count'],
+      [sequelize.literal('(SELECT COUNT(*) FROM dbo.equipment e WHERE e.category_id = [Category].[category_id])'), 'item_count'],
+    ],
+    include: [{ model: CategoryViewColumn, as: 'viewColumns', attributes: [] }],
+    group: ['Category.category_id', 'Category.view_key', 'Category.category_name'],
+    order: [['category_name', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
 }
 
 // Replaces the whole set for a category in one transaction. Saving a partial
