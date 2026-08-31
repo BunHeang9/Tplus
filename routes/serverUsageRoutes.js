@@ -14,12 +14,14 @@ router.post(
   serverUsageController.setServerUsage,
 );
 
-// Self-service usage form - any signed-in user, not just admins. Deliberately
-// narrower than POST / above: only cpu_usage_pct/memory_usage_pct/hdd_usage_gb,
-// and only on a server_usage row that already exists (no create, no capacity/
-// due date/owner/remark) - see serverUsageModel.updateUsage()'s comment.
+// Self-service usage form - any signed-in user, not just admins. Keyed by
+// equipment_id (what a user actually has on hand), not usage_id - creates
+// the server_usage row if this equipment has never had one. Deliberately
+// narrower than POST / above: only cpu_usage_pct/memory_usage_pct/
+// hdd_usage_gb, never capacity/due date/owner/remark - see
+// serverUsageController.updateUsage()'s comment.
 router.patch(
-  '/:id/usage',
+  '/equipment/:id/usage',
   authenticate,
   auditActivity('server_usage', 'update_usage'),
   serverUsageController.updateUsage,

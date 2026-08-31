@@ -140,28 +140,4 @@ async function removeServerUsage(usageId) {
   return fixDates(row);
 }
 
-// The self-service form: just the three usage readings, on a row that
-// already exists. Unlike upsertServerUsage() above (admin-only: capacity,
-// due date, remark, owner, and can create a new row), this never creates
-// anything - an admin sets a server up first, then anyone can keep its
-// usage numbers current. Only touches a field actually supplied, same
-// leave-alone-if-omitted behaviour as upsertServerUsage's COALESCE.
-async function updateUsage(usageId, d) {
-  const values = {};
-  if (d.cpu_usage_pct !== undefined && d.cpu_usage_pct !== null) values.cpu_usage_pct = d.cpu_usage_pct;
-  if (d.memory_usage_pct !== undefined && d.memory_usage_pct !== null) values.memory_usage_pct = d.memory_usage_pct;
-  if (d.hdd_usage_gb !== undefined && d.hdd_usage_gb !== null) values.hdd_usage_gb = d.hdd_usage_gb;
-
-  if (Object.keys(values).length === 0) {
-    const row = await ServerUsage.findByPk(usageId, { raw: true });
-    return row ? fixDates(row) : null;
-  }
-
-  const [, rows] = await ServerUsage.update(values, {
-    where: { usage_id: usageId },
-    returning: true,
-  });
-  return rows && rows[0] ? fixDates(rows[0].get({ plain: true })) : null;
-}
-
-module.exports = { getServerUsage, upsertServerUsage, updateUsage, removeServerUsage };
+module.exports = { getServerUsage, upsertServerUsage, removeServerUsage };

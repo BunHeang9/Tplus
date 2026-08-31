@@ -57,20 +57,27 @@ async function removeServerUsage(req, res, next) {
   }
 }
 
-// PATCH /api/server-usage/:id/usage  (any signed-in user)
-// The self-service form: cpu/memory/hdd usage only, on a row that already
-// exists - everything else (capacity, due date, owner, remark, and
-// creating a new row) stays admin-only through setServerUsage above. Any
-// other field sent in the body is silently ignored rather than validated
-// away, since this only ever forwards these three named fields.
+// PATCH /api/server-usage/equipment/:id/usage  (any signed-in user)
+// The self-service form: cpu/memory/hdd usage only, keyed by equipment_id
+// (not usage_id - a user looking at a server knows its equipment_id, not
+// an internal server_usage row id they'd have no way to know). Creates the
+// row if this equipment has never had one, same as setServerUsage's own
+// upsert - only 36 of 521 equipment currently have a row, so requiring one
+// to already exist would block almost every real attempt to use this form.
+// Everything else (capacity, due date, owner, remark) stays admin-only
+// through setServerUsage above: reusing upsertServerUsage() here but only
+// ever forwarding these three named fields, regardless of what else the
+// caller's body contains, is what keeps that boundary - not validation.
 async function updateUsage(req, res, next) {
   const { cpu_usage_pct, memory_usage_pct, hdd_usage_gb } = req.body;
   try {
-    const usage = await serverUsageModel.updateUsage(req.params.id, {
+    const equipment = await equipmentModel.findById(req.params.id);
+    if (!equipment) return res.status(404).json({ error: 'Equipment not found' });
+
+    const usage = await serverUsageModel.upsertServerUsage(req.params.id, {
       cpu_usage_pct, memory_usage_pct, hdd_usage_gb,
     });
-    if (!usage) return res.status(404).json({ error: 'Server usage record not found' });
-    res.json({ message: 'Usage updated', usage });
+    res.json({ message: 'Usage saved', usage });
   } catch (err) {
     next(err);
   }
