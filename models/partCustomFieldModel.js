@@ -322,7 +322,7 @@ async function setValues(stockId, values, transaction) {
 }
 
 module.exports = {
-  PartStockCustomValue,
+  PartStockCustomValue, PartTypeCustomField,
   FIELD_TYPES, toKey,
   findAll, findById, findByKey, create, update, countUsage, remove,
   findByPartType, findByPartTypes, attachToPartType, detachFromPartType, countValuesForPartType,

@@ -123,6 +123,7 @@ async function replaceColumns(partTypeId, columns) {
 }
 
 module.exports = {
+  PartTypeStockColumn,
   validStockFields, isValidStockField,
   findByPartType, findByPartTypes, replaceColumns,
 };

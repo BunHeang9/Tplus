@@ -1,6 +1,5 @@
 const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const { PartType, PartStock } = require('./partStockModel');
 const { Equipment } = require('./equipmentModel');
 const { Category } = require('./categoryModel');
@@ -72,6 +71,7 @@ const PartTypeCategory = sequelize.define('PartTypeCategory', {
 });
 
 Category.hasMany(PartTypeCategory, { foreignKey: 'category_id', as: 'partTypeLinks' });
+PartTypeCategory.belongsTo(Category, { foreignKey: 'category_id', as: 'category' });
 
 // Raw queries with no model attribute definition return a plain string for a
 // DATE/DATETIME column; the driver this replaces returned a Date object for
@@ -99,16 +99,54 @@ class ReplacementError extends Error {
   }
 }
 
+// dbo.part_replacement's own physical column order (confirmed against
+// sys.columns, same check used for PartType/PartStock elsewhere in this
+// migration) - reused below to keep the response shape byte-for-byte
+// identical to the original OUTPUT INSERTED.*.
+function replacementInPhysicalOrder(row) {
+  if (!row) return row;
+  return {
+    replacement_id: row.replacement_id,
+    equipment_id: row.equipment_id,
+    part_type_id: row.part_type_id,
+    old_value: row.old_value,
+    new_value: row.new_value,
+    replacement_date: row.replacement_date,
+    reason: row.reason,
+    remark: row.remark,
+    replaced_by: row.replaced_by,
+    created_at: row.created_at,
+    action: row.action,
+    old_part_status: row.old_part_status,
+    from_stock: row.from_stock,
+    new_model_name: row.new_model_name,
+    new_model_number: row.new_model_number,
+    new_disk_type: row.new_disk_type,
+    new_disk_interface: row.new_disk_interface,
+    new_ram_type: row.new_ram_type,
+    old_model_name: row.old_model_name,
+    old_model_number: row.old_model_number,
+    old_disk_type: row.old_disk_type,
+    old_disk_interface: row.old_disk_interface,
+    old_ram_type: row.old_ram_type,
+  };
+}
+
 // Only columns that actually exist on dbo.equipment can be mapped, or an
-// admin could point a part type at 'banana' and every replacement would fail.
+// admin could point a part type at 'banana' and every replacement would
+// fail. No Sequelize model maps onto "every column of an arbitrary table",
+// so this uses Sequelize's own QueryInterface.describeTable() (introspection
+// through the ORM, not a hand-written SELECT) rather than INFORMATION_SCHEMA
+// directly - same technique as viewColumnModel.js/partStockColumnModel.js's
+// twins of this function. describeTable()'s "type" comes back as e.g.
+// "VARCHAR(50)" where the old DATA_TYPE column gave "varchar" - normalized
+// (strip length/precision, lowercase) before filtering, so the same set of
+// column names comes back.
 async function validEquipmentColumns() {
-  const cols = await sequelize.query(`
-    SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo'
-      AND DATA_TYPE IN ('varchar','nvarchar','int')
-    ORDER BY COLUMN_NAME
-  `, { type: QueryTypes.SELECT });
-  return cols.map((r) => r.COLUMN_NAME);
+  const desc = await sequelize.getQueryInterface().describeTable({ tableName: 'equipment', schema: 'dbo' });
+  return Object.keys(desc)
+    .filter((name) => ['varchar', 'nvarchar', 'int'].includes(desc[name].type.split('(')[0].toLowerCase()))
+    .sort();
 }
 
 // --- part types ---
@@ -119,39 +157,77 @@ async function validEquipmentColumns() {
 // type works immediately, rather than being invisible until someone remembers
 // to link it. Once an admin links it to anything, it appears only there.
 async function findAllTypes(includeInactive = false, categoryId = null) {
-  let query = `
-    SELECT pt.part_type_id, pt.part_name, pt.description, pt.equipment_column,
-           pt.tracks_value, pt.is_countable, pt.sort_order, pt.is_active,
-           (SELECT COUNT(*) FROM dbo.part_replacement r
-             WHERE r.part_type_id = pt.part_type_id) AS replacement_count,
-           (SELECT COUNT(*) FROM dbo.part_type_category ptc
-             WHERE ptc.part_type_id = pt.part_type_id) AS category_count,
-           (SELECT STRING_AGG(c.category_name, ', ')
-              FROM dbo.part_type_category ptc
-              JOIN dbo.category c ON ptc.category_id = c.category_id
-             WHERE ptc.part_type_id = pt.part_type_id) AS applies_to
-    FROM dbo.part_type pt
-    WHERE 1=1
-  `;
-  const replacements = {};
+  const where = {};
+  if (!includeInactive) where.is_active = true;
 
-  if (!includeInactive) query += ' AND pt.is_active = 1';
+  const types = await PartType.findAll({
+    where,
+    order: [['sort_order', 'ASC'], ['part_name', 'ASC']],
+    raw: true,
+  });
+  if (types.length === 0) return [];
 
-  if (categoryId) {
-    query += `
-      AND (
-        EXISTS (SELECT 1 FROM dbo.part_type_category ptc
-                 WHERE ptc.part_type_id = pt.part_type_id
-                   AND ptc.category_id = :category_id)
-        OR NOT EXISTS (SELECT 1 FROM dbo.part_type_category ptc
-                        WHERE ptc.part_type_id = pt.part_type_id)
-      )`;
-    replacements.category_id = categoryId;
+  const typeIds = types.map((t) => t.part_type_id);
+
+  // replacement_count, category_count and applies_to each come from a
+  // different table joined against the same part_type_id - fetched
+  // independently and merged in JS rather than one query joining
+  // everything at once, which would fan out (a type with 3 category links
+  // and 5 replacements becomes 15 joined rows before grouping) and corrupt
+  // every count, same reasoning used throughout this migration.
+  const [replacementCounts, categoryLinks] = await Promise.all([
+    PartReplacement.findAll({
+      attributes: ['part_type_id', [sequelize.fn('COUNT', sequelize.col('replacement_id')), 'count']],
+      where: { part_type_id: { [Op.in]: typeIds } },
+      group: ['part_type_id'],
+      raw: true,
+    }),
+    PartTypeCategory.findAll({
+      where: { part_type_id: { [Op.in]: typeIds } },
+      include: [{ model: Category, as: 'category', attributes: ['category_name'] }],
+      // The original STRING_AGG had no ORDER BY WITHIN GROUP, so its name
+      // order was already undefined - ordering here just makes applies_to
+      // deterministic rather than trying to match an order that was never
+      // guaranteed, same reasoning as customFieldModel.getValuesForMany().
+      order: [[{ model: Category, as: 'category' }, 'category_name', 'ASC']],
+    }),
+  ]);
+
+  const replacementCountByType = new Map(replacementCounts.map((r) => [r.part_type_id, Number(r.count)]));
+
+  const categoryIdsByType = new Map();
+  const namesByType = new Map();
+  for (const link of categoryLinks) {
+    const { part_type_id, category_id, category } = link.get({ plain: true });
+    if (!categoryIdsByType.has(part_type_id)) categoryIdsByType.set(part_type_id, []);
+    categoryIdsByType.get(part_type_id).push(category_id);
+    if (!namesByType.has(part_type_id)) namesByType.set(part_type_id, []);
+    namesByType.get(part_type_id).push(category.category_name);
   }
 
-  query += ' ORDER BY pt.sort_order, pt.part_name';
+  const wantedCategoryId = categoryId ? Number(categoryId) : null;
 
-  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return types
+    .filter((t) => {
+      if (!wantedCategoryId) return true;
+      const linkedCategoryIds = categoryIdsByType.get(t.part_type_id) || [];
+      // No links at all means it applies everywhere; otherwise it must be
+      // linked to this specific category.
+      return linkedCategoryIds.length === 0 || linkedCategoryIds.includes(wantedCategoryId);
+    })
+    .map((t) => ({
+      part_type_id: t.part_type_id,
+      part_name: t.part_name,
+      description: t.description,
+      equipment_column: t.equipment_column,
+      tracks_value: t.tracks_value,
+      is_countable: t.is_countable,
+      sort_order: t.sort_order,
+      is_active: t.is_active,
+      replacement_count: replacementCountByType.get(t.part_type_id) || 0,
+      category_count: (categoryIdsByType.get(t.part_type_id) || []).length,
+      applies_to: (namesByType.get(t.part_type_id) || []).join(', ') || null,
+    }));
 }
 
 // Which categories a part applies to, plus the ones it could be added to.
@@ -226,10 +302,7 @@ async function setTypeCategories(partTypeId, categoryIds) {
         await customFieldModel.attachToCategory(categoryId, field.field_id, {});
       }
 
-      await sequelize.query(
-        'UPDATE dbo.part_type SET equipment_column = :equipment_column WHERE part_type_id = :id',
-        { replacements: { id: partTypeId, equipment_column: fieldKey } },
-      );
+      await PartType.update({ equipment_column: fieldKey }, { where: { part_type_id: partTypeId } });
     }
   }
 
@@ -335,33 +408,33 @@ async function countStockUsage(id) {
 // external interop), so this uses sequelize.transaction().
 async function removeType(id) {
   return sequelize.transaction(async (transaction) => {
-    await sequelize.query(
-      'DELETE FROM dbo.part_type_category WHERE part_type_id = :id',
-      { replacements: { id }, transaction },
-    );
-    await sequelize.query(
-      'DELETE FROM dbo.part_type_custom_field WHERE part_type_id = :id',
-      { replacements: { id }, transaction },
-    );
-    await sequelize.query(
-      'DELETE FROM dbo.part_type_stock_column WHERE part_type_id = :id',
-      { replacements: { id }, transaction },
-    );
-    await sequelize.query(`
-        DELETE v FROM dbo.part_stock_custom_value v
-        JOIN dbo.part_stock s ON s.stock_id = v.stock_id
-        WHERE s.part_type_id = :id
-      `, { replacements: { id }, transaction });
-    await sequelize.query(
-      'DELETE FROM dbo.part_stock WHERE part_type_id = :id',
-      { replacements: { id }, transaction },
-    );
+    // Lazy require - partCustomFieldModel.js imports PartStock from
+    // partStockModel.js eagerly at that file's own top level; this file
+    // isn't in that cycle at all, but the require still happens inside the
+    // function body for consistency with the same technique used
+    // throughout this migration.
+    const { PartStockCustomValue, PartTypeCustomField } = require('./partCustomFieldModel');
+    const { PartTypeStockColumn } = require('./partStockColumnModel');
 
-    const [row] = await sequelize.query(
-      'DELETE FROM dbo.part_type OUTPUT DELETED.* WHERE part_type_id = :id',
-      { replacements: { id }, type: QueryTypes.SELECT, transaction },
-    );
-    return fixDates(row) || null;
+    await PartTypeCategory.destroy({ where: { part_type_id: id }, transaction });
+    await PartTypeCustomField.destroy({ where: { part_type_id: id }, transaction });
+    await PartTypeStockColumn.destroy({ where: { part_type_id: id }, transaction });
+
+    // part_stock_custom_value has no part_type_id of its own (only
+    // stock_id), so the join in the original DELETE...FROM...JOIN becomes
+    // an explicit two-step: find this type's stock lines, then clear their
+    // values - not a fan-out risk, it's a plain delete-by-id-set.
+    const stockLines = await PartStock.findAll({ where: { part_type_id: id }, attributes: ['stock_id'], transaction, raw: true });
+    const stockIds = stockLines.map((s) => s.stock_id);
+    if (stockIds.length > 0) {
+      await PartStockCustomValue.destroy({ where: { stock_id: { [Op.in]: stockIds } }, transaction });
+    }
+    await PartStock.destroy({ where: { part_type_id: id }, transaction });
+
+    const row = await PartType.findByPk(id, { transaction, raw: true });
+    if (!row) return null;
+    await PartType.destroy({ where: { part_type_id: id }, transaction });
+    return fixDates(row);
   });
 }
 
@@ -552,20 +625,16 @@ async function findAll(filters = {}) {
 // removeReplacement() below - self-contained now that partStockModel and
 // customFieldModel.setValues() both take a Sequelize transaction too.
 async function reconstructInstalledUnits(transaction, equipmentId, partTypeId, currentValue, beforeReplacementId = null) {
-  let query = `
-    SELECT action, new_value, new_model_name, new_model_number,
-           new_disk_type, new_disk_interface, new_ram_type
-    FROM dbo.part_replacement
-    WHERE equipment_id = :equipment_id AND part_type_id = :part_type_id
-  `;
-  const replacements = { equipment_id: equipmentId, part_type_id: partTypeId };
-  if (beforeReplacementId) {
-    query += ' AND replacement_id < :before_id';
-    replacements.before_id = beforeReplacementId;
-  }
-  query += ' ORDER BY replacement_date DESC, replacement_id DESC';
+  const where = { equipment_id: equipmentId, part_type_id: partTypeId };
+  if (beforeReplacementId) where.replacement_id = { [Op.lt]: beforeReplacementId };
 
-  const history = await sequelize.query(query, { replacements, type: QueryTypes.SELECT, transaction });
+  const history = await PartReplacement.findAll({
+    where,
+    attributes: ['action', 'new_value', 'new_model_name', 'new_model_number', 'new_disk_type', 'new_disk_interface', 'new_ram_type'],
+    order: [['replacement_date', 'DESC'], ['replacement_id', 'DESC']],
+    transaction,
+    raw: true,
+  });
 
   const toUnit = (row) => ({
     value: row.new_value,
@@ -634,10 +703,7 @@ async function create(equipmentId, d, actor) {
         throw new ReplacementError({ error: 'bad_action' });
       }
 
-      const [partType] = await sequelize.query(
-        'SELECT * FROM dbo.part_type WHERE part_type_id = :id',
-        { replacements: { id: d.part_type_id }, type: QueryTypes.SELECT, transaction },
-      );
+      const partType = await PartType.findByPk(d.part_type_id, { transaction, raw: true });
       if (!partType) {
         throw new ReplacementError({ error: 'unknown_part_type' });
       }
@@ -670,15 +736,18 @@ async function create(equipmentId, d, actor) {
       let currentValue = null;
       if (partType.equipment_column) {
         if (equipmentColumnIsReal) {
-          const current = await sequelize.query(
-            `SELECT [${partType.equipment_column}] AS current_value
-             FROM dbo.equipment WHERE equipment_id = :id`,
-            { replacements: { id: equipmentId }, type: QueryTypes.SELECT, transaction },
-          );
-          if (current.length === 0) {
+          // The column name is dynamic, but it was just validated against
+          // validEquipmentColumns() above - every valid column is also a
+          // real Sequelize attribute on Equipment (confirmed live), so
+          // passing it into attributes[] goes through the ORM's own
+          // identifier quoting rather than string-interpolated SQL.
+          const equipmentRow = await Equipment.findByPk(equipmentId, {
+            attributes: [partType.equipment_column], transaction, raw: true,
+          });
+          if (!equipmentRow) {
             throw new ReplacementError({ error: 'equipment_not_found' });
           }
-          currentValue = current[0].current_value;
+          currentValue = equipmentRow[partType.equipment_column];
         } else {
           const values = await customFieldModel.getValues(equipmentId);
           const match = values.find((v) => v.field_key === partType.equipment_column);
@@ -782,56 +851,43 @@ async function create(equipmentId, d, actor) {
         }
       }
 
-      const [inserted] = await sequelize.query(`
-          INSERT INTO dbo.part_replacement
-            (equipment_id, part_type_id, action, old_value, new_value,
-             old_part_status, from_stock, replacement_date, reason, remark, replaced_by,
-             new_model_name, new_model_number, new_disk_type, new_disk_interface, new_ram_type,
-             old_model_name, old_model_number, old_disk_type, old_disk_interface, old_ram_type)
-          OUTPUT INSERTED.*
-          VALUES (:equipment_id, :part_type_id, :action, :old_value, :new_value,
-                  :old_part_status, :from_stock, :replacement_date, :reason, :remark, :replaced_by,
-                  :new_model_name, :new_model_number, :new_disk_type, :new_disk_interface, :new_ram_type,
-                  :old_model_name, :old_model_number, :old_disk_type, :old_disk_interface, :old_ram_type)
-        `, {
-        replacements: {
-          equipment_id: equipmentId,
-          part_type_id: d.part_type_id,
-          action,
-          old_value: oldValue,
-          new_value: d.new_value || null,
-          old_part_status: hasOutgoingPart ? (d.old_part_status || 'Working - IT Stock') : null,
-          from_stock: d.from_stock_id ? 1 : 0,
-          // What was actually fitted, carried over from the stock line it
-          // came from - so a later replacement knows its real type, not just
-          // its size.
-          new_model_name: stockTaken?.model_name || null,
-          new_model_number: stockTaken?.model_number || null,
-          new_disk_type: stockTaken?.disk_type || null,
-          new_disk_interface: stockTaken?.disk_interface || null,
-          new_ram_type: stockTaken?.ram_type || null,
-          // What actually came out, for a model-based accessory - so undoing
-          // this later can reverse the correct stock line instead of guessing.
-          old_model_name: outgoingPart.model_name,
-          old_model_number: outgoingPart.model_number,
-          old_disk_type: outgoingPart.disk_type,
-          old_disk_interface: outgoingPart.disk_interface,
-          old_ram_type: outgoingPart.ram_type,
-          replacement_date: d.replacement_date || new Date(),
-          reason: d.reason || null,
-          remark: d.remark || null,
-          replaced_by: actor?.username || null,
-        },
-        type: QueryTypes.SELECT,
-        transaction,
-      });
+      const insertedRow = await PartReplacement.create({
+        equipment_id: equipmentId,
+        part_type_id: d.part_type_id,
+        action,
+        old_value: oldValue,
+        new_value: d.new_value || null,
+        old_part_status: hasOutgoingPart ? (d.old_part_status || 'Working - IT Stock') : null,
+        from_stock: !!d.from_stock_id,
+        // What was actually fitted, carried over from the stock line it
+        // came from - so a later replacement knows its real type, not just
+        // its size.
+        new_model_name: stockTaken?.model_name || null,
+        new_model_number: stockTaken?.model_number || null,
+        new_disk_type: stockTaken?.disk_type || null,
+        new_disk_interface: stockTaken?.disk_interface || null,
+        new_ram_type: stockTaken?.ram_type || null,
+        // What actually came out, for a model-based accessory - so undoing
+        // this later can reverse the correct stock line instead of guessing.
+        old_model_name: outgoingPart.model_name,
+        old_model_number: outgoingPart.model_number,
+        old_disk_type: outgoingPart.disk_type,
+        old_disk_interface: outgoingPart.disk_interface,
+        old_ram_type: outgoingPart.ram_type,
+        replacement_date: d.replacement_date || new Date(),
+        reason: d.reason || null,
+        remark: d.remark || null,
+        replaced_by: actor?.username || null,
+      }, { transaction });
+      const inserted = replacementInPhysicalOrder(insertedRow.get({ plain: true }));
 
       // The device's own record follows, so its specs and its history agree.
       if (partType.equipment_column) {
         if (equipmentColumnIsReal) {
-          await sequelize.query(
-            `UPDATE dbo.equipment SET [${partType.equipment_column}] = :value WHERE equipment_id = :id`,
-            { replacements: { id: equipmentId, value: resultingValue }, transaction },
+          // Same dynamic-but-validated column name as the read above.
+          await Equipment.update(
+            { [partType.equipment_column]: resultingValue },
+            { where: { equipment_id: equipmentId }, transaction },
           );
         } else {
           await customFieldModel.setValues(
@@ -882,10 +938,7 @@ async function removeReplacement(replacementId, equipmentId) {
 
   try {
     return await sequelize.transaction(async (transaction) => {
-      const [record] = await sequelize.query(
-        'SELECT * FROM dbo.part_replacement WHERE replacement_id = :id',
-        { replacements: { id: replacementId }, type: QueryTypes.SELECT, transaction },
-      );
+      const record = await PartReplacement.findByPk(replacementId, { transaction, raw: true });
       if (!record || (equipmentId && record.equipment_id !== Number(equipmentId))) {
         throw new ReplacementError({ error: 'not_found' });
       }
@@ -894,19 +947,17 @@ async function removeReplacement(replacementId, equipmentId) {
         throw new ReplacementError({ error: 'cannot_undo_add' });
       }
 
-      const [partType] = await sequelize.query(
-        'SELECT * FROM dbo.part_type WHERE part_type_id = :id',
-        { replacements: { id: record.part_type_id }, type: QueryTypes.SELECT, transaction },
-      );
+      const partType = await PartType.findByPk(record.part_type_id, { transaction, raw: true });
 
       // Put the device's field back to what it read before this replacement.
       // Same real-column-or-custom-field-key branch as create().
       if (partType && partType.equipment_column) {
         const isRealColumn = (await validEquipmentColumns()).includes(partType.equipment_column);
         if (isRealColumn) {
-          await sequelize.query(
-            `UPDATE dbo.equipment SET [${partType.equipment_column}] = :value WHERE equipment_id = :id`,
-            { replacements: { id: record.equipment_id, value: record.old_value }, transaction },
+          // Same dynamic-but-validated column name as create() above.
+          await Equipment.update(
+            { [partType.equipment_column]: record.old_value },
+            { where: { equipment_id: record.equipment_id }, transaction },
           );
         } else {
           await customFieldModel.setValues(
@@ -962,30 +1013,27 @@ async function removeReplacement(replacementId, equipmentId) {
               disk_interface: record.old_disk_interface,
               ram_type: record.old_ram_type,
             }];
+        // ISNULL(col,'') = ISNULL(:val,'') reimplemented as null-safe
+        // equality per column, same pattern (and same real-data assumption
+        // - a stored value is either NULL or a real string, never a stored
+        // empty string) as partStockModel.updateLine()'s clash detection.
+        const nullSafe = (col, val) => ({ [col]: val === null || val === undefined ? null : val });
         for (const unit of units) {
-          const [stockRowFound] = await sequelize.query(`
-              SELECT TOP 1 stock_id, quantity FROM dbo.part_stock
-              WHERE part_type_id = :part_type_id
-                AND ISNULL(part_value, '') = ISNULL(:part_value, '')
-                AND status = :status
-                AND ISNULL(model_name, '') = ISNULL(:model_name, '')
-                AND ISNULL(model_number, '') = ISNULL(:model_number, '')
-                AND ISNULL(disk_type, '') = ISNULL(:disk_type, '')
-                AND ISNULL(disk_interface, '') = ISNULL(:disk_interface, '')
-                AND ISNULL(ram_type, '') = ISNULL(:ram_type, '')
-            `, {
-            replacements: {
+          const partValue = unit.value === null ? null : String(unit.value);
+          const stockRowFound = await PartStock.findOne({
+            where: {
               part_type_id: record.part_type_id,
-              part_value: unit.value === null ? null : String(unit.value),
               status: record.old_part_status,
-              model_name: unit.model_name,
-              model_number: unit.model_number,
-              disk_type: unit.disk_type,
-              disk_interface: unit.disk_interface,
-              ram_type: unit.ram_type,
+              ...nullSafe('part_value', partValue),
+              ...nullSafe('model_name', unit.model_name),
+              ...nullSafe('model_number', unit.model_number),
+              ...nullSafe('disk_type', unit.disk_type),
+              ...nullSafe('disk_interface', unit.disk_interface),
+              ...nullSafe('ram_type', unit.ram_type),
             },
-            type: QueryTypes.SELECT,
+            attributes: ['stock_id', 'quantity'],
             transaction,
+            raw: true,
           });
           if (stockRowFound && stockRowFound.quantity > 0) {
             await partStockModel.decrement(stockRowFound.stock_id, 1, transaction);
@@ -993,10 +1041,7 @@ async function removeReplacement(replacementId, equipmentId) {
         }
       }
 
-      await sequelize.query(
-        'DELETE FROM dbo.part_replacement WHERE replacement_id = :id',
-        { replacements: { id: replacementId }, transaction },
-      );
+      await PartReplacement.destroy({ where: { replacement_id: replacementId }, transaction });
 
       return { removed: fixDates(record) };
     });
