@@ -247,40 +247,59 @@ async function findByName(fullName) {
 // already hold - so an admin can see "already has 3 devices" before handing
 // over a 4th. Moved here from assignController.js, which used to run this
 // query itself.
+// Same lazy-require reasoning as findAllWithEquipment() above.
+// current_equipment_count is a per-employee correlated count, not a
+// fan-out list, so it's a separate GROUP BY merged in JS by employee_id
+// rather than a nested include - avoids counting through a join at all.
 async function findForAssign({ position, department, q } = {}) {
-  let query = `
-    SELECT emp.employee_id,
-           emp.full_name,
-           emp.position,
-           emp.staff_code,
-           emp.location,
-           emp.department_id,
-           d.department_code,
-           d.department_name,
-           (SELECT COUNT(*) FROM dbo.equipment e WHERE e.owner_id = emp.employee_id)
-             AS current_equipment_count
-    FROM dbo.employee emp
-    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
-    WHERE emp.is_active = 1
-  `;
-  const replacements = {};
+  const { Equipment } = require('./equipmentModel');
 
-  if (position) {
-    query += ' AND emp.position = :position';
-    replacements.position = position;
-  }
-  if (department) {
-    query += ' AND d.department_code = :department';
-    replacements.department = department;
-  }
+  const where = { is_active: true };
+  if (position) where.position = position;
   if (q) {
-    query += ' AND (emp.full_name LIKE :q OR emp.staff_code LIKE :q)';
-    replacements.q = `%${q}%`;
+    where[Op.or] = [
+      { full_name: { [Op.like]: `%${q}%` } },
+      { staff_code: { [Op.like]: `%${q}%` } },
+    ];
   }
 
-  query += ' ORDER BY emp.full_name';
+  const departmentInclude = { model: Department, as: 'department' };
+  if (department) {
+    departmentInclude.where = { department_code: department };
+    departmentInclude.required = true;
+  }
 
-  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  const employees = await Employee.findAll({
+    where,
+    include: [departmentInclude],
+    order: [['full_name', 'ASC']],
+  });
+
+  const employeeIds = employees.map((e) => e.employee_id);
+  const counts = employeeIds.length > 0
+    ? await Equipment.findAll({
+      attributes: ['owner_id', [fn('COUNT', col('equipment_id')), 'n']],
+      where: { owner_id: { [Op.in]: employeeIds } },
+      group: ['owner_id'],
+      raw: true,
+    })
+    : [];
+  const countByEmployee = new Map(counts.map((r) => [r.owner_id, r.n]));
+
+  return employees.map((row) => {
+    const { department: dept, ...emp } = row.get({ plain: true });
+    return {
+      employee_id: emp.employee_id,
+      full_name: emp.full_name,
+      position: emp.position,
+      staff_code: emp.staff_code,
+      location: emp.location,
+      department_id: emp.department_id,
+      department_code: dept ? dept.department_code : null,
+      department_name: dept ? dept.department_name : null,
+      current_equipment_count: countByEmployee.get(emp.employee_id) || 0,
+    };
+  });
 }
 
 // deviceReplacementModel.js already defines DeviceReplacement with both
