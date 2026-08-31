@@ -1,13 +1,29 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
-const CategoryViewColumn = require('./sequelize/categoryViewColumnModel');
-const Category = require('./sequelize/categoryModel');
+const { Category } = require('./categoryModel');
 
 // Which columns each category's view shows (dbo.category_view_column).
 //
 // These used to live in a code file, so adding a category meant editing
 // JavaScript and restarting. Holding them in a table lets an admin configure
 // a new category from the dashboard instead.
+
+const CategoryViewColumn = sequelize.define('CategoryViewColumn', {
+  view_column_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  category_id: { type: DataTypes.INTEGER, allowNull: false },
+  field_name: { type: DataTypes.STRING(100), allowNull: false },
+  header_text: { type: DataTypes.STRING(100), allowNull: false },
+  sort_order: { type: DataTypes.INTEGER, allowNull: false },
+  is_editable: { type: DataTypes.BOOLEAN, allowNull: false },
+  // Has its own DB-side default (legacy DATETIME) - let the DB fill it in,
+  // same reasoning as every other table with this pattern in this migration.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'category_view_column',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 // Columns that are always present and not configurable - a view without an id
 // would give the frontend no way to open or edit a row.
@@ -65,7 +81,7 @@ const DERIVED_FIELDS = [
 // server_usage is the capacity-planning calculation sheet, not part of any
 // equipment view - it has its own endpoint (GET /api/server-usage) and is
 // deliberately never merged into an equipment/category row, so its columns
-// (cpu_core_total, reducing_cpu_core, plan_date...) do not belong here.
+// (cpu_core_total, cpu_usage_pct, due_date...) do not belong here.
 // platform/os_type/os_version used to live only in server_usage and were
 // listed here as derived fields for that reason; they are now real columns
 // on dbo.equipment, so getAvailableFields()'s live schema query picks them

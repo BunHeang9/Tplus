@@ -1,12 +1,30 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
-const EquipmentStatus = require('./sequelize/equipmentStatusModel');
 
 // Equipment statuses (dbo.equipment_status).
 //
 // These are not just labels - is_assignable and is_borrowable drive what the
 // stock and borrow features allow. Changing those flags changes behaviour, so
 // they are worth understanding before editing a status.
+
+const EquipmentStatus = sequelize.define('EquipmentStatus', {
+  status_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  status_name: { type: DataTypes.STRING(50), allowNull: false },
+  description: { type: DataTypes.STRING(255), allowNull: true },
+  has_owner: { type: DataTypes.BOOLEAN, allowNull: true },
+  is_assignable: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+  is_borrowable: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+  sort_order: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 99 },
+  is_active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+  // Has its own DB-side default (legacy DATETIME) - let the DB fill it in,
+  // same reasoning as every other table with this pattern in this migration.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'equipment_status',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 // Correlated subquery for equipment_count - raw query through Sequelize.
 async function findAll(includeInactive = false) {

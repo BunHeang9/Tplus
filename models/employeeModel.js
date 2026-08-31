@@ -1,10 +1,30 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const recycleBinModel = require("./recycleBinModel");
-const Employee = require('./sequelize/employeeModel');
 
 // All database access for employees lives here.
 // Controllers call these functions; they never write SQL themselves.
+
+const Employee = sequelize.define('Employee', {
+  employee_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  full_name: { type: DataTypes.STRING(150), allowNull: false },
+  staff_code: { type: DataTypes.STRING(30), allowNull: true },
+  phone: { type: DataTypes.STRING(30), allowNull: true },
+  sex: { type: DataTypes.STRING(10), allowNull: true },
+  location: { type: DataTypes.STRING(50), allowNull: true },
+  position: { type: DataTypes.STRING(255), allowNull: true },
+  department_id: { type: DataTypes.INTEGER, allowNull: true },
+  // Has a DB-side default (1) - declared nullable here (not the real schema)
+  // purely so create(), which never sets it, omits the column from the
+  // INSERT and lets the DB default fill it in.
+  is_active: { type: DataTypes.BOOLEAN, allowNull: true },
+  left_date: { type: DataTypes.DATEONLY, allowNull: true },
+}, {
+  tableName: 'employee',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 // Active employees only by default - a leaver should not appear in an assign
 // or borrow dropdown. Pass includeInactive to get everyone, e.g. for an admin
@@ -273,7 +293,6 @@ async function countReferences(id) {
              OR issued_by_id = :id OR received_by_id = :id)          AS borrow_records,
         (SELECT COUNT(*) FROM dbo.borrow_record WHERE borrower_id = :id
              AND return_date IS NULL)                                AS items_still_out,
-        (SELECT COUNT(*) FROM dbo.ssd_upgrade WHERE employee_id = :id) AS ssd_upgrades,
         -- server_usage has no owner_id of its own - ownership lives on the
         -- equipment row it's for (see serverUsageModel.js).
         (SELECT COUNT(*) FROM dbo.server_usage su

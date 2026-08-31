@@ -1,6 +1,6 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
-const PartTypeStockColumn = require('./sequelize/partTypeStockColumnModel');
 
 // Which part_stock columns each part type's Add/Edit Stock form shows
 // (dbo.part_type_stock_column).
@@ -11,6 +11,18 @@ const PartTypeStockColumn = require('./sequelize/partTypeStockColumnModel');
 // the separate, already-built part_type_custom_field system - this is only
 // for the built-in columns (model_name, location, quantity, disk_type...),
 // selectable per part type instead of every part showing every column.
+
+const PartTypeStockColumn = sequelize.define('PartTypeStockColumn', {
+  view_column_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  part_type_id: { type: DataTypes.INTEGER, allowNull: false },
+  field_name: { type: DataTypes.STRING(50), allowNull: false },
+  header_text: { type: DataTypes.STRING(100), allowNull: false },
+  sort_order: { type: DataTypes.INTEGER, allowNull: false },
+}, {
+  tableName: 'part_type_stock_column',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 const HIDDEN_FROM_PICKER = new Set(['stock_id', 'part_type_id']);
 

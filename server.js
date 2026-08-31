@@ -26,11 +26,9 @@ const partCustomFieldRoutes = require("./routes/partCustomFieldRoutes");
 const partBorrowRoutes = require("./routes/partBorrowRoutes");
 const reportRoutes = require("./routes/reportRoutes");
 const licenseRoutes = require("./routes/licenseRoutes");
-const ssdRoutes = require("./routes/ssdRoutes");
 const serverUsageRoutes = require("./routes/serverUsageRoutes");
 const antivirusInstallRoutes = require("./routes/antivirusInstallRoutes");
 const deviceReplacementRoutes = require("./routes/deviceReplacementRoutes");
-const cloudCostRoutes = require("./routes/cloudCostRoutes");
 
 const app = express();
 
@@ -153,14 +151,10 @@ app.get('/', (req, res) => {
           "GET /api/reports/part-stock?format=xlsx|pdf  (same filters as GET /api/part-stock)",
       },
       other: {
-        ssdUpgrades: "GET /api/ssd-upgrades",
-        ssdProcurement: "GET /api/ssd-procurement",
         licenses: "GET /api/licenses",
         createLicense: "POST /api/licenses",
         serverUsage: "GET /api/server-usage",
         antivirus: "GET /api/antivirus",
-        cloudRates: "GET /api/cloud-rates",
-        cloudUsage: "GET /api/cloud-usage",
       },
     },
   });
@@ -192,12 +186,6 @@ app.use("/api/licenses", licenseRoutes);
 app.use("/api/server-usage", serverUsageRoutes);
 app.use("/api/antivirus", antivirusInstallRoutes);
 app.use("/api/replacements", deviceReplacementRoutes);
-// Mounted at /api directly (not a single dedicated prefix), so these two
-// come last among the /api-rooted mounts - each still only matches its own
-// specific path (/ssd-upgrades, /ssd-procurement, /cloud-rates,
-// /cloud-usage), so order only matters relative to any other /api catch-all.
-app.use("/api", ssdRoutes);
-app.use("/api", cloudCostRoutes);
 app.use(notFound);
 app.use(errorHandler);
 

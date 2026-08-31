@@ -193,7 +193,6 @@ async function remove(req, res, next) {
       if (refs.borrow_records > 0)      blocking.push(`${refs.borrow_records} borrow record(s)`);
       if (refs.antivirus_records > 0)   blocking.push(`${refs.antivirus_records} antivirus record(s)`);
       if (refs.server_usage_records > 0) blocking.push(`${refs.server_usage_records} server usage record(s)`);
-      if (refs.ssd_upgrade_records > 0) blocking.push(`${refs.ssd_upgrade_records} SSD upgrade record(s)`);
       if (refs.replacement_records > 0) blocking.push(`${refs.replacement_records} replacement record(s)`);
 
       return res.status(409).json({

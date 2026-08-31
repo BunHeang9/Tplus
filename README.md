@@ -163,14 +163,10 @@ is refused, since it would leave nobody able to manage the system.
 | GET | `/api/stock/by-date` | Any user |
 | GET | `/api/search?q=X` | Any user |
 | GET | `/api/filters` | Any user |
-| GET | `/api/ssd-upgrades` | Any user |
-| GET | `/api/ssd-procurement` | Any user |
 | GET | `/api/licenses` | Any user |
 | GET | `/api/server-usage` | Any user |
 | GET | `/api/antivirus` | Any user |
 | GET | `/api/replacements` | Any user |
-| GET | `/api/cloud-rates` | Any user |
-| GET | `/api/cloud-usage` | Any user |
 | GET | `/api/departments` | Any user |
 | GET | `/api/departments/:id` | Any user |
 | POST | `/api/departments` | Admin |

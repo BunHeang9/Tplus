@@ -1,10 +1,24 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
-const Department = require('./sequelize/departmentModel');
 
 // Reference table: dbo.department
 // Departments used to be free text on employee/equipment; they now live
 // here and are linked by department_id.
+
+const Department = sequelize.define('Department', {
+  department_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  department_code: { type: DataTypes.STRING(50), allowNull: false },
+  department_name: { type: DataTypes.STRING(100), allowNull: true },
+  is_active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
+  // Has its own DB-side default (legacy DATETIME) - let the DB fill it in,
+  // same reasoning as categoryModel/auditLogModel/apiUserModel.
+  created_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'department',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 // Two correlated subqueries (employee_count, equipment_count) - reporting
 // read, raw query through Sequelize rather than .findAll().

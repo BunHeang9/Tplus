@@ -604,7 +604,6 @@ async function countReferences(id) {
         (SELECT COUNT(*) FROM dbo.borrow_record      WHERE equipment_id = :id) AS borrow_records,
         (SELECT COUNT(*) FROM dbo.antivirus_install  WHERE equipment_id = :id) AS antivirus_records,
         (SELECT COUNT(*) FROM dbo.server_usage       WHERE equipment_id = :id) AS server_usage_records,
-        (SELECT COUNT(*) FROM dbo.ssd_upgrade        WHERE equipment_id = :id) AS ssd_upgrade_records,
         (SELECT COUNT(*) FROM dbo.device_replacement WHERE old_equipment_id = :id
                                                         OR new_equipment_id = :id) AS replacement_records
     `, { replacements: { id }, type: QueryTypes.SELECT });

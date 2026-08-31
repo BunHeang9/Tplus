@@ -1,14 +1,9 @@
 const { Sequelize } = require('sequelize');
 require('dotenv').config();
 
-// Sequelize, alongside the existing raw mssql pool in db.js - not a
-// replacement for it. Same database, same credentials, same env vars.
-// Existing models keep using db.js/poolPromise exactly as they do today;
-// this is only for new code that wants an ORM instead of hand-written SQL.
-// A lot of what's already in this app (MERGE-based upserts, OUTER APPLY,
-// dynamic multi-filter WHERE clauses, multi-table transactions) doesn't map
-// cleanly onto Sequelize's query builder, so migrating the existing models
-// wasn't in scope here - this is additive, not a rewrite.
+// The single connection every model in the app goes through - same
+// database, same credentials, same env vars the old raw mssql pool
+// (config/db.js, now unused) connected with.
 const sequelize = new Sequelize(
   process.env.DB_DATABASE,
   process.env.DB_USER,
@@ -31,5 +26,13 @@ const sequelize = new Sequelize(
     logging: false,
   },
 );
+
+// Sequelize connects lazily on first query by default, so a bad connection
+// would otherwise stay silent until the first request touches the database
+// instead of failing loudly at startup - .authenticate() forces an eager
+// check, same as the old raw pool's own .connect() did.
+sequelize.authenticate()
+  .then(() => console.log('Connected to Tplus SQL Server database'))
+  .catch((err) => console.error('Database connection failed:', err.message));
 
 module.exports = sequelize;

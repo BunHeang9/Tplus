@@ -18,7 +18,7 @@ async function setServerUsage(req, res, next) {
   if (!equipment_id) {
     return res.status(400).json({
       error: 'equipment_id is required',
-      example: { equipment_id: 30, cpu_core_total: 8, memory_gb_total: 32, reducing_cpu_core: 2 },
+      example: { equipment_id: 30, cpu_core_total: 8, memory_gb_total: 32, cpu_usage_pct: '60%' },
     });
   }
   try {
