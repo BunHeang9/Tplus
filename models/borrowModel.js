@@ -142,6 +142,22 @@ async function findEquipmentForBorrow(equipmentId) {
 // transaction. If either fails, neither is applied - so we never end up with
 // a loan whose equipment still looks available, or vice versa. Self-contained
 // (no external transaction interop), so this uses sequelize.transaction().
+// Shared by create()/markReturned()/remove() below - equipmentModel.js's
+// own assign()/unassignById() etc. resolve status_id the same way (a plain
+// lookup, then Equipment.update()), once it turned out the "doesn't map
+// onto Model.update()" reasoning only actually held for assignToEmployee()
+// (which reads a THIRD table, dbo.employee, inside the same statement -
+// no such cross-entity read here, just the equipment_status lookup).
+async function flipEquipmentStatus(equipmentId, statusName, transaction) {
+  const statusRow = await EquipmentStatus.findOne({
+    where: { status_name: statusName }, attributes: ['status_id'], raw: true, transaction,
+  });
+  await Equipment.update(
+    { status: statusName, status_id: statusRow ? statusRow.status_id : null },
+    { where: { equipment_id: equipmentId }, transaction },
+  );
+}
+
 async function create(d) {
   return sequelize.transaction(async (transaction) => {
     const row = await BorrowRecord.create({
@@ -155,18 +171,7 @@ async function create(d) {
       remark: d.remark || null,
     }, { transaction });
 
-    // status_id is resolved from the status name via a correlated subquery,
-    // same reasoning as equipmentModel.js's own assign()/update() - doesn't
-    // map onto Model.update(), so this one statement stays raw.
-    await sequelize.query(`
-        UPDATE dbo.equipment
-        SET status    = :status,
-            status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
-        WHERE equipment_id = :equipment_id
-      `, {
-      replacements: { equipment_id: d.equipment_id, status: BORROWED_STATUS },
-      transaction,
-    });
+    await flipEquipmentStatus(d.equipment_id, BORROWED_STATUS, transaction);
 
     return fixDates(row.get({ plain: true }));
   });
@@ -221,15 +226,7 @@ async function markReturned(borrowId, d) {
     if (!row) return null;
     const returned = row.get({ plain: true });
 
-    await sequelize.query(`
-        UPDATE dbo.equipment
-        SET status    = :status,
-            status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
-        WHERE equipment_id = :equipment_id
-      `, {
-      replacements: { equipment_id: returned.equipment_id, status: d.return_status || BORROWABLE_STATUS },
-      transaction,
-    });
+    await flipEquipmentStatus(returned.equipment_id, d.return_status || BORROWABLE_STATUS, transaction);
 
     return fixDates(returned);
   });
@@ -448,15 +445,7 @@ async function remove(borrowId) {
     await BorrowRecord.destroy({ where: { borrow_id: borrowId }, transaction });
 
     if (!row.return_date) {
-      await sequelize.query(`
-          UPDATE dbo.equipment
-          SET status    = :status,
-              status_id = (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status)
-          WHERE equipment_id = :equipment_id
-        `, {
-        replacements: { equipment_id: row.equipment_id, status: BORROWABLE_STATUS },
-        transaction,
-      });
+      await flipEquipmentStatus(row.equipment_id, BORROWABLE_STATUS, transaction);
     }
 
     return fixDates(row);
