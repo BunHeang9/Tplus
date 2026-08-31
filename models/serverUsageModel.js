@@ -1,7 +1,8 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op, fn } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const { Equipment } = require('./equipmentModel');
+const { Category } = require('./categoryModel');
+const { Employee } = require('./employeeModel');
 
 // The capacity-planning calculation sheet ("Plan optimize"): Total Capacity
 // vs Usage, one row per server. This is deliberately separate from "server"
@@ -73,6 +74,22 @@ function fixDates(row) {
   return row;
 }
 
+// JS mirror of SQL Server's TRY_CAST(x AS INT), confirmed live against real
+// edge cases: whitespace trimmed, an optional leading +/- then digits only
+// (a decimal point, unit suffix like "GB", or any other character makes it
+// NULL - no prefix-parsing the way parseInt() alone would do), an empty or
+// whitespace-only string is 0 (not NULL - a real TRY_CAST quirk), and a
+// value outside INT's range is NULL (overflow), not a wrapped/truncated
+// number.
+function tryCastInt(value) {
+  if (value === null || value === undefined) return null;
+  const str = String(value).trim();
+  if (str === '') return 0;
+  if (!/^[+-]?\d+$/.test(str)) return null;
+  const n = parseInt(str, 10);
+  return n > 2147483647 || n < -2147483648 ? null : n;
+}
+
 // Every Server-category equipment, not just the ones that already have a
 // server_usage entry - a server nobody has filled usage in for yet still
 // needs to show up here (with blank usage fields) so there's somewhere to
@@ -84,32 +101,58 @@ function fixDates(row) {
 //
 // Each equipment can now have many server_usage rows (a history log, not
 // one row per server), so "just the latest one" needs a real
-// top-1-per-group query, not the "business rule guarantees at most one"
-// shortcut used elsewhere in this migration - no clean Sequelize include
-// expresses that, so this stays raw SQL (OUTER APPLY TOP 1), same
-// reasoning already applied to borrowModel.findAvailableToBorrow's NOT
-// EXISTS, viewColumnModel listViews()'s item_count, etc.
+// top-1-per-group query. No clean Sequelize include expresses OUTER APPLY
+// TOP 1 directly, but it reduces to the same "merge separate ORM reads in
+// JS, keep the first-seen row per id" pattern employeeModel.
+// searchWithEquipment() already uses for its own single-most-recent-
+// antivirus-install fix: fetch every Server-category equipment, fetch every
+// server_usage row already sorted latest-first, and take the first match
+// per equipment_id in JS.
 async function getServerUsage() {
-  const rows = await sequelize.query(`
-    SELECT e.equipment_id, e.device_name, e.ip_address, e.owner_id,
-           emp.full_name AS owner_name,
-           su.usage_id, su.due_date,
-           TRY_CAST(e.cpu AS INT) AS cpu_core_total,
-           TRY_CAST(e.ram AS INT) AS memory_gb_total,
-           TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
-           su.cpu_usage_pct, su.memory_usage_pct, su.hdd_usage_gb, su.remark
-    FROM dbo.equipment e
-    JOIN dbo.category c   ON e.category_id = c.category_id AND c.category_name = 'Server'
-    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-    OUTER APPLY (
-      SELECT TOP 1 s.usage_id, s.due_date, s.cpu_usage_pct, s.memory_usage_pct, s.hdd_usage_gb, s.remark
-      FROM dbo.server_usage s
-      WHERE s.equipment_id = e.equipment_id
-      ORDER BY s.due_date DESC, s.usage_id DESC
-    ) su
-    ORDER BY e.device_name, e.equipment_id
-  `, { type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const equipmentRows = await Equipment.findAll({
+    attributes: ['equipment_id', 'device_name', 'ip_address', 'owner_id', 'cpu', 'ram', 'hd'],
+    include: [
+      { model: Category, as: 'category', attributes: [], where: { category_name: 'Server' }, required: true },
+      { model: Employee, as: 'owner', attributes: ['full_name'], required: false },
+    ],
+    order: [['device_name', 'ASC'], ['equipment_id', 'ASC']],
+    subQuery: false,
+  });
+
+  const equipmentIds = equipmentRows.map((r) => r.equipment_id);
+  const usageRows = equipmentIds.length > 0
+    ? await ServerUsage.findAll({
+      where: { equipment_id: { [Op.in]: equipmentIds } },
+      attributes: ['equipment_id', 'usage_id', 'due_date', 'cpu_usage_pct', 'memory_usage_pct', 'hdd_usage_gb', 'remark'],
+      order: [['due_date', 'DESC'], ['usage_id', 'DESC']],
+      raw: true,
+    })
+    : [];
+  const latestByEquipment = new Map();
+  for (const row of usageRows) {
+    if (!latestByEquipment.has(row.equipment_id)) latestByEquipment.set(row.equipment_id, row);
+  }
+
+  return equipmentRows.map((row) => {
+    const { category, owner, ...e } = row.get({ plain: true });
+    const su = latestByEquipment.get(e.equipment_id);
+    return fixDates({
+      equipment_id: e.equipment_id,
+      device_name: e.device_name,
+      ip_address: e.ip_address,
+      owner_id: e.owner_id,
+      owner_name: owner ? owner.full_name : null,
+      usage_id: su ? su.usage_id : null,
+      due_date: su ? su.due_date : null,
+      cpu_core_total: tryCastInt(e.cpu),
+      memory_gb_total: tryCastInt(e.ram),
+      hdd_gb_total: tryCastInt(e.hd),
+      cpu_usage_pct: su ? su.cpu_usage_pct : null,
+      memory_usage_pct: su ? su.memory_usage_pct : null,
+      hdd_usage_gb: su ? su.hdd_usage_gb : null,
+      remark: su ? su.remark : null,
+    });
+  });
 }
 
 // The calendar/history view: every entry actually recorded within
@@ -119,26 +162,44 @@ async function getServerUsage() {
 // unlike getServerUsage() above, this isn't "every server, blank or not",
 // it's a log of what happened, so nothing happening means nothing to show.
 async function getServerUsageHistory(from, to) {
-  const rows = await sequelize.query(`
-    SELECT su.usage_id, e.equipment_id, e.device_name, e.ip_address, e.owner_id,
-           emp.full_name AS owner_name,
-           su.due_date,
-           TRY_CAST(e.cpu AS INT) AS cpu_core_total,
-           TRY_CAST(e.ram AS INT) AS memory_gb_total,
-           TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
-           su.cpu_usage_pct, su.memory_usage_pct, su.hdd_usage_gb, su.remark
-    FROM dbo.server_usage su
-    JOIN dbo.equipment e ON su.equipment_id = e.equipment_id
-    JOIN dbo.category c  ON e.category_id = c.category_id AND c.category_name = 'Server'
-    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-    WHERE (:from IS NULL OR su.due_date >= :from)
-      AND (:to   IS NULL OR su.due_date <= :to)
-    ORDER BY su.due_date DESC, e.device_name ASC, su.usage_id DESC
-  `, {
-    replacements: { from: from || null, to: to || null },
-    type: QueryTypes.SELECT,
+  const where = {};
+  if (from) where.due_date = { ...where.due_date, [Op.gte]: from };
+  if (to) where.due_date = { ...where.due_date, [Op.lte]: to };
+
+  const rows = await ServerUsage.findAll({
+    where,
+    include: [{
+      model: Equipment, as: 'equipment', required: true,
+      attributes: ['equipment_id', 'device_name', 'ip_address', 'owner_id', 'cpu', 'ram', 'hd'],
+      include: [
+        { model: Category, as: 'category', attributes: [], where: { category_name: 'Server' }, required: true },
+        { model: Employee, as: 'owner', attributes: ['full_name'], required: false },
+      ],
+    }],
+    order: [['due_date', 'DESC'], [{ model: Equipment, as: 'equipment' }, 'device_name', 'ASC'], ['usage_id', 'DESC']],
+    subQuery: false,
   });
-  return rows.map(fixDates);
+
+  return rows.map((row) => {
+    const { equipment, ...su } = row.get({ plain: true });
+    const { category, owner, ...e } = equipment;
+    return fixDates({
+      usage_id: su.usage_id,
+      equipment_id: e.equipment_id,
+      device_name: e.device_name,
+      ip_address: e.ip_address,
+      owner_id: e.owner_id,
+      owner_name: owner ? owner.full_name : null,
+      due_date: su.due_date,
+      cpu_core_total: tryCastInt(e.cpu),
+      memory_gb_total: tryCastInt(e.ram),
+      hdd_gb_total: tryCastInt(e.hd),
+      cpu_usage_pct: su.cpu_usage_pct,
+      memory_usage_pct: su.memory_usage_pct,
+      hdd_usage_gb: su.hdd_usage_gb,
+      remark: su.remark,
+    });
+  });
 }
 
 // Adds a new usage entry for one equipment - never overwrites an existing
@@ -152,26 +213,39 @@ async function getServerUsageHistory(from, to) {
 // save is its own dated entry now, not something that only moves when
 // usage happens to be touched.
 async function upsertServerUsage(equipmentId, d) {
-  const [previous] = await sequelize.query(
-    'SELECT TOP 1 * FROM dbo.server_usage WHERE equipment_id = :equipment_id ORDER BY due_date DESC, usage_id DESC',
-    { replacements: { equipment_id: equipmentId }, type: QueryTypes.SELECT },
-  );
-
-  const [row] = await sequelize.query(`
-      INSERT INTO dbo.server_usage (equipment_id, due_date, cpu_usage_pct, memory_usage_pct, hdd_usage_gb, remark)
-      OUTPUT INSERTED.*
-      VALUES (:equipment_id, CAST(GETDATE() AS DATE), :cpu_usage_pct, :memory_usage_pct, :hdd_usage_gb, :remark)
-    `, {
-    replacements: {
-      equipment_id: equipmentId,
-      cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? (previous ? previous.cpu_usage_pct : null),
-      memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? (previous ? previous.memory_usage_pct : null),
-      hdd_usage_gb: d.hdd_usage_gb ?? (previous ? previous.hdd_usage_gb : null),
-      remark: d.remark ?? (previous ? previous.remark : null),
-    },
-    type: QueryTypes.SELECT,
+  const previous = await ServerUsage.findOne({
+    where: { equipment_id: equipmentId },
+    order: [['due_date', 'DESC'], ['usage_id', 'DESC']],
+    raw: true,
   });
-  return fixDates(row);
+
+  const row = await ServerUsage.create({
+    equipment_id: equipmentId,
+    // fn('GETDATE') rather than a JS Date, so the value is sent as a raw
+    // SQL function call - SQL Server implicitly converts the DATETIME
+    // result down to DATEONLY on insert, same result as the original's
+    // explicit CAST(GETDATE() AS DATE) (confirmed live).
+    due_date: fn('GETDATE'),
+    cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? (previous ? previous.cpu_usage_pct : null),
+    memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? (previous ? previous.memory_usage_pct : null),
+    hdd_usage_gb: d.hdd_usage_gb ?? (previous ? previous.hdd_usage_gb : null),
+    remark: d.remark ?? (previous ? previous.remark : null),
+  });
+  const plain = row.get({ plain: true });
+  // Physical column order (confirmed against sys.columns): usage_id,
+  // equipment_id, cpu_usage_pct, memory_usage_pct, hdd_usage_gb, remark,
+  // due_date - reconstructed since .create()'s own key order doesn't
+  // follow it (only a plain read does, see toPhysicalOrder() precedent
+  // elsewhere in this migration).
+  return fixDates({
+    usage_id: plain.usage_id,
+    equipment_id: plain.equipment_id,
+    cpu_usage_pct: plain.cpu_usage_pct,
+    memory_usage_pct: plain.memory_usage_pct,
+    hdd_usage_gb: plain.hdd_usage_gb,
+    remark: plain.remark,
+    due_date: plain.due_date,
+  });
 }
 
 // Sequelize's destroy() doesn't return the deleted row - fetch first so the
