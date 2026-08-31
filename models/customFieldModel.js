@@ -1,6 +1,5 @@
 const { DataTypes, fn, col, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Custom fields are defined once and shared across categories.
 //
@@ -67,6 +66,7 @@ EquipmentCustomField.hasMany(EquipmentCategoryField, { foreignKey: 'field_id', a
 // already fully loaded regardless of which one Node reached first.
 const { Equipment } = require('./equipmentModel');
 EquipmentCustomValue.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
+EquipmentCustomValue.belongsTo(EquipmentCustomField, { foreignKey: 'field_id', as: 'field' });
 
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
@@ -215,34 +215,48 @@ async function countValuesInCategory(categoryId, fieldId) {
 
 // --- values ---
 
+// The join key (field_id AND a specific equipment_id) isn't a plain FK a
+// static association can express, so this reuses findByCategory() above
+// (every field attached to this equipment's category, already ORM) merged
+// in JS with this one equipment's own stored values - not a fan-out risk
+// since both reads are scoped to exactly one equipment_id.
 async function getValues(equipmentId) {
-  return sequelize.query(`
-    SELECT f.field_key, f.field_label, f.field_type, v.field_value
-    FROM dbo.equipment e
-    JOIN dbo.equipment_category_field cf ON cf.category_id = e.category_id
-    JOIN dbo.equipment_custom_field f ON cf.field_id = f.field_id
-    LEFT JOIN dbo.equipment_custom_value v
-           ON v.field_id = f.field_id AND v.equipment_id = e.equipment_id
-    WHERE e.equipment_id = :equipment_id
-    ORDER BY cf.sort_order, f.field_id
-  `, { replacements: { equipment_id: equipmentId }, type: QueryTypes.SELECT });
+  const equipment = await Equipment.findByPk(equipmentId, { attributes: ['category_id'], raw: true });
+  if (!equipment) return [];
+
+  const [fields, values] = await Promise.all([
+    findByCategory(equipment.category_id),
+    EquipmentCustomValue.findAll({ where: { equipment_id: equipmentId }, raw: true }),
+  ]);
+  const valueByFieldId = new Map(values.map((v) => [v.field_id, v.field_value]));
+
+  return fields.map((f) => ({
+    field_key: f.field_key,
+    field_label: f.field_label,
+    field_type: f.field_type,
+    field_value: valueByFieldId.has(f.field_id) ? valueByFieldId.get(f.field_id) : null,
+  }));
 }
 
 // One query for a whole page rather than one per row.
 async function getValuesForMany(equipmentIds) {
   if (!equipmentIds || equipmentIds.length === 0) return {};
 
-  const rows = await sequelize.query(`
-    SELECT v.equipment_id, f.field_key, v.field_value
-    FROM dbo.equipment_custom_value v
-    JOIN dbo.equipment_custom_field f ON v.field_id = f.field_id
-    WHERE v.equipment_id IN (:ids)
-  `, { replacements: { ids: equipmentIds }, type: QueryTypes.SELECT });
+  // The original raw query had no ORDER BY at all, so its row order (and
+  // therefore the resulting object's key order) was already undefined -
+  // ordering by field_key here doesn't "match" anything, it just makes this
+  // version's output deterministic, which the original never was.
+  const rows = await EquipmentCustomValue.findAll({
+    where: { equipment_id: { [Op.in]: equipmentIds } },
+    include: [{ model: EquipmentCustomField, as: 'field', attributes: ['field_key'] }],
+    order: [['equipment_id', 'ASC'], [{ model: EquipmentCustomField, as: 'field' }, 'field_key', 'ASC']],
+  });
 
   const byEquipment = {};
   for (const row of rows) {
-    if (!byEquipment[row.equipment_id]) byEquipment[row.equipment_id] = {};
-    byEquipment[row.equipment_id][row.field_key] = row.field_value;
+    const { equipment_id, field, field_value } = row.get({ plain: true });
+    if (!byEquipment[equipment_id]) byEquipment[equipment_id] = {};
+    byEquipment[equipment_id][field.field_key] = field_value;
   }
   return byEquipment;
 }
@@ -255,34 +269,43 @@ async function getValuesForMany(equipmentIds) {
 // already have one open (partModel.js's part-replacement flow is the live
 // example), so the value write commits or rolls back with everything else
 // that replacement touched.
+// The "field exists AND is attached to this equipment's category" gate
+// was one atomic MERGE...USING before; here it's an explicit lookup chain
+// (field -> attachment -> existing value) ahead of a plain update-or-create,
+// same self-contained-multi-step approach already used for assign()/
+// unassignById() etc. earlier this session - a category's field attachments
+// changing concurrently with a value save is not a realistic race for this
+// feature. updated_at is only ever set on the update branch, never the
+// create branch (which lets the column's own DB-side default fill it in) -
+// matching the original MERGE's INSERT column list, which never included it.
 async function setValues(equipmentId, values, transaction) {
   const entries = Object.entries(values || {});
   if (entries.length === 0) return;
 
+  const equipment = await Equipment.findByPk(equipmentId, { attributes: ['category_id'], transaction, raw: true });
+  if (!equipment) return;
+
   for (const [key, value] of entries) {
-    await sequelize.query(`
-        MERGE dbo.equipment_custom_value AS target
-        USING (
-            SELECT :equipment_id AS equipment_id, f.field_id
-            FROM dbo.equipment_custom_field f
-            JOIN dbo.equipment_category_field cf ON cf.field_id = f.field_id
-            JOIN dbo.equipment e ON e.category_id = cf.category_id
-            WHERE e.equipment_id = :equipment_id AND f.field_key = :field_key
-        ) AS source
-        ON target.equipment_id = source.equipment_id AND target.field_id = source.field_id
-        WHEN MATCHED THEN
-            UPDATE SET field_value = :field_value, updated_at = GETDATE()
-        WHEN NOT MATCHED THEN
-            INSERT (equipment_id, field_id, field_value)
-            VALUES (source.equipment_id, source.field_id, :field_value);
-      `, {
-      replacements: {
-        equipment_id: equipmentId,
-        field_key: key,
-        field_value: value === null || value === undefined ? null : String(value),
-      },
-      transaction,
+    const field = await EquipmentCustomField.findOne({
+      where: { field_key: key }, attributes: ['field_id'], transaction, raw: true,
     });
+    if (!field) continue;
+
+    const attached = await EquipmentCategoryField.findOne({
+      where: { category_id: equipment.category_id, field_id: field.field_id }, transaction, raw: true,
+    });
+    if (!attached) continue;
+
+    const field_value = value === null || value === undefined ? null : String(value);
+    const existing = await EquipmentCustomValue.findOne({
+      where: { equipment_id: equipmentId, field_id: field.field_id }, transaction,
+    });
+
+    if (existing) {
+      await existing.update({ field_value, updated_at: fn('GETDATE') }, { transaction });
+    } else {
+      await EquipmentCustomValue.create({ equipment_id: equipmentId, field_id: field.field_id, field_value }, { transaction });
+    }
   }
 }
 
