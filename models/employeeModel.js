@@ -1,8 +1,8 @@
 const { DataTypes, Op, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const recycleBinModel = require("./recycleBinModel");
 const { Department } = require('./departmentModel');
+const { Category } = require('./categoryModel');
 
 // All database access for employees lives here.
 // Controllers call these functions; they never write SQL themselves.
@@ -152,86 +152,146 @@ async function findById(id) {
   };
 }
 
-// The "search employee, see everything" query - joins equipment,
-// server details and antivirus status into one flat result set.
+// The "search employee, see everything" query - joins equipment, category,
+// department (both employee's own and the device's) and antivirus status
+// into one flat result set, with each device's software licence(s)
+// summarised onto its row.
+//
+// Two real bugs fixed by this conversion, not just a refactor: the LEFT
+// JOIN to dbo.antivirus_install had no way to pick just one row, so a
+// device reinstalled more than once (a normal, expected case - see
+// antivirusInstallModel.js's own comment on why every reinstall adds a new
+// row rather than overwriting) came back as duplicate rows in real search
+// results - confirmed live (searching "Lathdavone Sisouvanh" returned
+// their equipment twice). The LEFT JOIN to dbo.server_usage was never
+// actually used in the SELECT list at all (platform/os_type/os_version
+// moved onto dbo.equipment itself a while back - see the comment that used
+// to be here) - now that server_usage is a history log with potentially
+// many rows per equipment, that dead join was a live fan-out bug waiting
+// to happen the moment anyone edited a searchable employee's server usage
+// twice. Both are gone entirely below: antivirus picks the most recent
+// install per device, and server_usage isn't joined at all since nothing
+// ever read from it.
+//
+// equipmentModel.js/antivirusInstallModel.js both import Employee from
+// this file at their own top level, so Equipment/AntivirusInstall are lazy
+// requires here, same reasoning as this file's other conversions today.
 async function searchWithEquipment(name) {
-  return sequelize.query(`
-      SELECT
-        emp.employee_id,
-        emp.full_name AS owner_name,
-        emp.position AS employee_position,
-        emp.department_id AS employee_department_id,
-        empd.department_code AS employee_department,
-        empd.department_name AS employee_department_name,
-        emp.location AS employee_location,
-        emp.sex,
-        emp.staff_code,
-        emp.phone,
-        e.equipment_id,
-        e.category_id,
-        c.category_name AS category,
-        e.device_type,
-        e.computer_name,
-        e.device_model,
-        e.asset_code,
-        e.service_tag,
-        e.mac_address,
-        e.ip_address,
-        e.manufacturer,
-        e.cpu,
-        e.ram,
-        e.hd,
-        e.windows_license,
-        e.av_license,
-        e.department_id AS device_department_id,
-        eqd.department_code AS device_department,
-        e.location AS device_location,
-        e.status AS device_status,
-        e.remark AS device_remark,
-        -- platform/os_type/os_version moved onto dbo.equipment itself (see
-        -- viewColumnModel.js) - read from e, not the old server_usage join.
-        e.platform AS server_platform,
-        e.os_type AS server_os_type,
-        e.os_version AS server_os_version,
-        av.antivirus_status,
-        av.plan_date AS antivirus_plan_date,
-        av.due_date AS antivirus_due_date,
-        -- Software licences on this device. Gathered into one row rather than
-        -- joined directly, which would repeat the whole device row once per
-        -- licence and show duplicates in the table.
-        lic.license_names,
-        -- Dates only make sense for a single licence; with two, one expiry
-        -- cannot stand for both, so they are left null and the names shown.
-        CASE WHEN lic.license_count = 1 THEN lic.single_start  END AS license_date_start,
-        CASE WHEN lic.license_count = 1 THEN lic.single_expire END AS license_date_expire,
-        CASE WHEN lic.license_count = 1 THEN lic.single_status END AS license_status
-      FROM dbo.employee emp
-      LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      LEFT JOIN dbo.equipment e ON e.owner_id = emp.employee_id
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.department eqd ON e.department_id = eqd.department_id
-      LEFT JOIN dbo.server_usage su ON su.equipment_id = e.equipment_id
-      LEFT JOIN dbo.antivirus_install av ON av.equipment_id = e.equipment_id
-      OUTER APPLY (
-        SELECT
-          STRING_AGG(sl.product_name, ', ') AS license_names,
-          COUNT(*)            AS license_count,
-          MIN(sl.date_start)  AS single_start,
-          MIN(sl.date_expire) AS single_expire,
-          MIN(CASE
-                WHEN sl.license_type IN ('Free', 'Perpetual') THEN 'active'
-                WHEN sl.date_expire IS NULL THEN 'unknown'
-                WHEN sl.date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
-                WHEN sl.date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
-                ELSE 'active'
-              END) AS single_status
-        FROM dbo.equipment_software_license l
-        JOIN dbo.software_license sl ON l.license_id = sl.license_id
-        WHERE l.equipment_id = e.equipment_id
-      ) lic
-      WHERE emp.full_name LIKE :name
-      ORDER BY emp.full_name, c.category_name, e.computer_name
-    `, { replacements: { name: `%${name}%` }, type: QueryTypes.SELECT });
+  const { Equipment } = require('./equipmentModel');
+  const { AntivirusInstall } = require('./antivirusInstallModel');
+  const softwareLicenseModel = require('./softwareLicenseModel');
+
+  if (!Employee.associations.ownedEquipment) {
+    Employee.hasMany(Equipment, { foreignKey: 'owner_id', as: 'ownedEquipment' });
+  }
+
+  const employees = await Employee.findAll({
+    where: { full_name: { [Op.like]: `%${name}%` } },
+    include: [
+      { model: Department, as: 'department' },
+      {
+        model: Equipment, as: 'ownedEquipment', required: false,
+        include: [
+          { model: Category, as: 'category' },
+          { model: Department, as: 'department' },
+        ],
+      },
+    ],
+    order: [
+      ['full_name', 'ASC'],
+      [{ model: Equipment, as: 'ownedEquipment' }, { model: Category, as: 'category' }, 'category_name', 'ASC'],
+      [{ model: Equipment, as: 'ownedEquipment' }, 'computer_name', 'ASC'],
+    ],
+    subQuery: false,
+  });
+
+  // Every antivirus install for every device being shown, most recent
+  // first per device - picked in JS rather than a raw TOP-1-per-group
+  // query, same "merge separate ORM reads" pattern used elsewhere in this
+  // migration (e.g. borrowModel.findEquipmentForBorrow).
+  const equipmentIds = [];
+  for (const row of employees) {
+    for (const e of row.ownedEquipment || []) equipmentIds.push(e.equipment_id);
+  }
+
+  const latestAvByEquipment = new Map();
+  if (equipmentIds.length > 0) {
+    const avRows = await AntivirusInstall.findAll({
+      where: { equipment_id: { [Op.in]: equipmentIds } },
+      order: [['install_id', 'DESC']],
+      raw: true,
+    });
+    for (const av of avRows) {
+      if (!latestAvByEquipment.has(av.equipment_id)) latestAvByEquipment.set(av.equipment_id, av);
+    }
+  }
+
+  // Reuses softwareLicenseModel's own status logic (statusCaseSql(), the
+  // single canonical copy that function's own comment cares about not
+  // duplicating) rather than a fourth independent copy of the same rule.
+  const licensesByEquipment = equipmentIds.length > 0
+    ? await softwareLicenseModel.getLicensesForMany(equipmentIds)
+    : {};
+
+  const rows = [];
+  for (const row of employees) {
+    const { department: empDept, ownedEquipment, ...emp } = row.get({ plain: true });
+    const devices = ownedEquipment && ownedEquipment.length > 0 ? ownedEquipment : [null];
+
+    for (const e of devices) {
+      const av = e ? latestAvByEquipment.get(e.equipment_id) : null;
+      const licenses = e ? (licensesByEquipment[e.equipment_id] || []) : [];
+      const singleLicense = licenses.length === 1 ? licenses[0] : null;
+
+      rows.push({
+        employee_id: emp.employee_id,
+        owner_name: emp.full_name,
+        employee_position: emp.position,
+        employee_department_id: emp.department_id,
+        employee_department: empDept ? empDept.department_code : null,
+        employee_department_name: empDept ? empDept.department_name : null,
+        employee_location: emp.location,
+        sex: emp.sex,
+        staff_code: emp.staff_code,
+        phone: emp.phone,
+        equipment_id: e ? e.equipment_id : null,
+        category_id: e ? e.category_id : null,
+        category: e && e.category ? e.category.category_name : null,
+        device_type: e ? e.device_type : null,
+        computer_name: e ? e.computer_name : null,
+        device_model: e ? e.device_model : null,
+        asset_code: e ? e.asset_code : null,
+        service_tag: e ? e.service_tag : null,
+        mac_address: e ? e.mac_address : null,
+        ip_address: e ? e.ip_address : null,
+        manufacturer: e ? e.manufacturer : null,
+        cpu: e ? e.cpu : null,
+        ram: e ? e.ram : null,
+        hd: e ? e.hd : null,
+        windows_license: e ? e.windows_license : null,
+        av_license: e ? e.av_license : null,
+        device_department_id: e ? e.department_id : null,
+        device_department: e && e.department ? e.department.department_code : null,
+        device_location: e ? e.location : null,
+        device_status: e ? e.status : null,
+        device_remark: e ? e.remark : null,
+        server_platform: e ? e.platform : null,
+        server_os_type: e ? e.os_type : null,
+        server_os_version: e ? e.os_version : null,
+        antivirus_status: av ? av.antivirus_status : null,
+        antivirus_plan_date: av ? av.plan_date : null,
+        antivirus_due_date: av ? av.due_date : null,
+        license_names: licenses.length > 0 ? licenses.map((l) => l.product_name).join(', ') : null,
+        // Dates only make sense for a single licence; with two, one expiry
+        // cannot stand for both, so they are left null and the names shown.
+        license_date_start: singleLicense ? singleLicense.date_start : null,
+        license_date_expire: singleLicense ? singleLicense.date_expire : null,
+        license_status: singleLicense ? singleLicense.status : null,
+      });
+    }
+  }
+
+  return rows;
 }
 
 async function findByName(fullName) {
