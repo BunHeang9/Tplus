@@ -7,6 +7,13 @@ const { EquipmentStatus } = require('./statusModel');
 const { Employee } = require('./employeeModel');
 const { Equipment } = require('./equipmentModel');
 
+// Reverse of Equipment.belongsTo(Category, {as:'category'}) - declared here
+// rather than in categoryModel.js, which can never import Equipment back
+// (it's required BY equipmentModel.js). filterModel.js isn't required by
+// anything, so it's free to declare this, the same way borrowModel.js
+// declares BorrowRecord's associations outward at Equipment.
+Category.hasMany(Equipment, { foreignKey: 'category_id', as: 'unownedEquipment' });
+
 // Distinct values for building dropdown filters on the frontend, read live
 // from the data so new values appear automatically.
 
@@ -108,16 +115,26 @@ async function getAssignFormData() {
       raw: true,
     }),
     // available_count is a conditional COUNT across a JOIN (category ->
-    // equipment WHERE owner_id IS NULL) - stays raw, same reasoning as
-    // every other correlated-aggregate read in this migration (e.g.
-    // categoryModel.js's own equipment_count, viewColumnModel.js's
-    // listViews()): a real fit for a SQL subquery, not for .findAll().
-    sequelize.query(`
-       SELECT c.category_id, c.category_name,
-              (SELECT COUNT(*) FROM dbo.equipment e
-                WHERE e.category_id = c.category_id AND e.owner_id IS NULL) AS available_count
-       FROM dbo.category c WHERE c.is_active = 1 ORDER BY c.category_name
-    `, { type: QueryTypes.SELECT }),
+    // equipment WHERE owner_id IS NULL). Unlike categoryModel.js's own
+    // equipment_count (genuinely blocked - that file is imported BY
+    // equipmentModel.js, so it can never import Equipment back without a
+    // require cycle), filterModel.js is a leaf that already imports both
+    // Category and Equipment, so this converts to a real include + COUNT -
+    // required:false keeps a category with zero unowned equipment in the
+    // results instead of dropping it, same as the original LEFT JOIN-shaped
+    // subquery would.
+    Category.findAll({
+      attributes: [
+        'category_id', 'category_name',
+        [fn('COUNT', col('unownedEquipment.equipment_id')), 'available_count'],
+      ],
+      include: [{ model: Equipment, as: 'unownedEquipment', attributes: [], where: { owner_id: null }, required: false }],
+      where: { is_active: true },
+      group: ['Category.category_id', 'Category.category_name'],
+      order: [['category_name', 'ASC']],
+      subQuery: false,
+      raw: true,
+    }),
     // Same DISTINCT-via-GROUP-BY idea as the distinctColumn() helper, but
     // with an extra owner_id IS NULL condition the helper doesn't take a
     // parameter for - written directly instead of extending it for a
