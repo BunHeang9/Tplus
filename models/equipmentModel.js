@@ -681,75 +681,90 @@ async function findByDateRange(from, to) {
 // Full detail update. COALESCE means only the fields actually supplied
 // change - omitting a field leaves it alone rather than nulling it.
 async function update(id, d) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.equipment
-      SET category_id     = COALESCE(:category_id, category_id),
-          device_type     = COALESCE(:device_type, device_type),
-          device_name     = COALESCE(:device_name, device_name),
-          server_type     = COALESCE(:server_type, server_type),
-          device_model    = COALESCE(:device_model, device_model),
-          computer_name   = COALESCE(:computer_name, computer_name),
-          manufacturer    = COALESCE(:manufacturer, manufacturer),
-          serial_no       = COALESCE(:serial_no, serial_no),
-          service_tag     = COALESCE(:service_tag, service_tag),
-          product_id      = COALESCE(:product_id, product_id),
-          asset_code      = COALESCE(:asset_code, asset_code),
-          mac_address     = COALESCE(:mac_address, mac_address),
-          ip_address      = COALESCE(:ip_address, ip_address),
-          os_type         = COALESCE(:os_type, os_type),
-          os_version      = COALESCE(:os_version, os_version),
-          cpu             = COALESCE(:cpu, cpu),
-          ram             = COALESCE(:ram, ram),
-          hd              = COALESCE(:hd, hd),
-          windows_license = COALESCE(:windows_license, windows_license),
-          av_license      = COALESCE(:av_license, av_license),
-          location        = COALESCE(:location, location),
-          department_id   = COALESCE(:department_id, department_id),
-          status          = COALESCE(:status, status),
-          status_id       = COALESCE(
-                                (SELECT status_id FROM dbo.equipment_status WHERE status_name = :status),
-                                status_id),
-          purchase_date   = COALESCE(:purchase_date, purchase_date),
-          received_date   = COALESCE(:received_date, received_date),
-          assigned_date   = COALESCE(:assigned_date, assigned_date),
-          remark          = COALESCE(:remark, remark)
+  const values = {};
+  // Both undefined and explicit null mean "leave alone" here, same as the
+  // original COALESCE(:x, x) - a caller sending null never had a way to
+  // blank a field out through this endpoint, only skip it or set a real
+  // value.
+  const maybeSet = (key, val) => { if (val !== undefined && val !== null) values[key] = val; };
+  maybeSet('category_id', d.category_id);
+  maybeSet('device_type', d.device_type);
+  maybeSet('device_name', d.device_name);
+  maybeSet('server_type', d.server_type);
+  maybeSet('device_model', d.device_model);
+  maybeSet('computer_name', d.computer_name);
+  maybeSet('manufacturer', d.manufacturer);
+  maybeSet('serial_no', d.serial_no);
+  maybeSet('service_tag', d.service_tag);
+  maybeSet('product_id', d.product_id);
+  maybeSet('asset_code', d.asset_code ?? d.equipment_code);
+  maybeSet('mac_address', d.mac_address);
+  maybeSet('ip_address', d.ip_address);
+  maybeSet('os_type', d.os_type);
+  maybeSet('os_version', d.os_version);
+  maybeSet('cpu', d.cpu);
+  maybeSet('ram', d.ram);
+  maybeSet('hd', d.hd);
+  maybeSet('windows_license', d.windows_license);
+  maybeSet('av_license', d.av_license);
+  maybeSet('location', d.location);
+  maybeSet('department_id', d.department_id);
+  maybeSet('purchase_date', d.purchase_date);
+  maybeSet('received_date', d.received_date);
+  maybeSet('assigned_date', d.assigned_date);
+  maybeSet('remark', d.remark);
 
-      OUTPUT INSERTED.*
-      WHERE equipment_id = :id
-    `, {
-    replacements: {
-      id,
-      category_id: d.category_id ?? null,
-      device_type: d.device_type ?? null,
-      device_name: d.device_name ?? null,
-      server_type: d.server_type ?? null,
-      device_model: d.device_model ?? null,
-      computer_name: d.computer_name ?? null,
-      manufacturer: d.manufacturer ?? null,
-      serial_no: d.serial_no ?? null,
-      service_tag: d.service_tag ?? null,
-      product_id: d.product_id ?? null,
-      asset_code: d.asset_code ?? d.equipment_code ?? null,
-      mac_address: d.mac_address ?? null,
-      ip_address: d.ip_address ?? null,
-      os_type: d.os_type ?? null,
-      os_version: d.os_version ?? null,
-      cpu: d.cpu ?? null,
-      ram: d.ram ?? null,
-      hd: d.hd ?? null,
-      windows_license: d.windows_license ?? null,
-      av_license: d.av_license ?? null,
-      location: d.location ?? null,
-      department_id: d.department_id ?? null,
-      status: d.status ?? null,
-      purchase_date: d.purchase_date ?? null,
-      received_date: d.received_date ?? null,
-      assigned_date: d.assigned_date ?? null,
-      remark: d.remark ?? null,
-    },
-    type: QueryTypes.SELECT,
+  if (d.status !== undefined && d.status !== null) {
+    values.status = d.status;
+    const statusRow = await EquipmentStatus.findOne({ where: { status_name: d.status }, attributes: ['status_id'], raw: true });
+    if (statusRow) values.status_id = statusRow.status_id;
+  }
+
+  let row;
+  if (Object.keys(values).length === 0) {
+    row = await Equipment.findByPk(id, { raw: true });
+  } else {
+    const [, rows] = await Equipment.update(values, { where: { equipment_id: id }, returning: true });
+    row = rows && rows[0] ? rows[0].get({ plain: true }) : null;
+  }
+  if (!row) return null;
+
+  // Same physical-column-order reconstruction as createStock() above -
+  // Sequelize's own attribute-declaration order doesn't match dbo.equipment's
+  // real column order, confirmed against sys.columns.
+  return fixDates({
+    equipment_id: row.equipment_id,
+    device_type: row.device_type,
+    device_model: row.device_model,
+    manufacturer: row.manufacturer,
+    serial_no: row.serial_no,
+    asset_code: row.asset_code,
+    mac_address: row.mac_address,
+    ip_address: row.ip_address,
+    owner_id: row.owner_id,
+    location: row.location,
+    purchase_date: row.purchase_date,
+    status: row.status,
+    remark: row.remark,
+    received_date: row.received_date,
+    assigned_date: row.assigned_date,
+    department_id: row.department_id,
+    category_id: row.category_id,
+    status_id: row.status_id,
+    computer_name: row.computer_name,
+    cpu: row.cpu,
+    ram: row.ram,
+    hd: row.hd,
+    os_type: row.os_type,
+    os_version: row.os_version,
+    windows_license: row.windows_license,
+    av_license: row.av_license,
+    service_tag: row.service_tag,
+    product_id: row.product_id,
+    device_name: row.device_name,
+    platform: row.platform,
+    server_type: row.server_type,
   });
-  return fixDates(row) || null;
 }
 
 // Counts everything pointing at this equipment. Delete is refused while any
