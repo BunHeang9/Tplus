@@ -83,6 +83,31 @@ function fixDates(row) {
   return row;
 }
 
+// `s.*` in a raw query returns columns in the table's own physical order,
+// which doesn't match this model's attribute declaration order - a plain
+// ORM read followed by this explicit reconstruction keeps the JSON key
+// order byte-for-byte identical to before this migration. Shared by every
+// function below that returns a full part_stock row.
+function toPhysicalOrder(s) {
+  if (!s) return s;
+  return {
+    stock_id: s.stock_id,
+    part_type_id: s.part_type_id,
+    part_value: s.part_value,
+    status: s.status,
+    quantity: s.quantity,
+    remark: s.remark,
+    updated_at: s.updated_at,
+    location: s.location,
+    model_name: s.model_name,
+    model_number: s.model_number,
+    is_active: s.is_active,
+    disk_type: s.disk_type,
+    disk_interface: s.disk_interface,
+    ram_type: s.ram_type,
+  };
+}
+
 // "16", "16GB", "16gb", " 16 GB " all become "16 GB" - so the same real
 // value never fragments into different stock lines just because of how it
 // was typed in. Only a bare number or a GB-suffixed one is touched; a
@@ -205,24 +230,8 @@ async function findById(stockId) {
   });
   if (!row) return null;
   const { partType, ...s } = row.get({ plain: true });
-  // `s.*` in the original query returns columns in the table's own physical
-  // order, which doesn't match this model's attribute declaration order -
-  // reconstructed explicitly so the JSON key order matches byte-for-byte.
   return fixDates({
-    stock_id: s.stock_id,
-    part_type_id: s.part_type_id,
-    part_value: s.part_value,
-    status: s.status,
-    quantity: s.quantity,
-    remark: s.remark,
-    updated_at: s.updated_at,
-    location: s.location,
-    model_name: s.model_name,
-    model_number: s.model_number,
-    is_active: s.is_active,
-    disk_type: s.disk_type,
-    disk_interface: s.disk_interface,
-    ram_type: s.ram_type,
+    ...toPhysicalOrder(s),
     part_name: partType ? partType.part_name : null,
     is_countable: partType ? partType.is_countable : null,
   });
@@ -283,15 +292,21 @@ async function increment(partTypeId, partValue, status, qty, transaction, extra 
 // Takes from stock. Returns null when the line does not exist or is short,
 // rather than letting the quantity go negative - the caller turns that into a
 // clear message. Same external-transaction interop as increment() above
-// (partBorrowModel.js's create(), partModel.js's create()).
+// (partBorrowModel.js's create(), partModel.js's create()). The quantity
+// arithmetic itself (quantity - N) has no plain-column equivalent in
+// Sequelize's update(), so it goes through literal() for that one expression
+// - qty is always a plain number by the time it reaches here (Number()
+// guards it), never user-supplied SQL text, same as getSummary()'s CASE
+// expressions elsewhere in this file. A short/missing line simply matches no
+// row, same as the original WHERE quantity >= :qty - rows comes back empty
+// either way, same as an empty OUTPUT INSERTED.* did.
 async function decrement(stockId, qty, transaction) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.part_stock
-      SET quantity = quantity - :qty, updated_at = GETDATE()
-      OUTPUT INSERTED.*
-      WHERE stock_id = :id AND quantity >= :qty
-    `, { replacements: { id: stockId, qty: qty ?? 1 }, type: QueryTypes.SELECT, transaction });
-  return fixDates(row) || null;
+  const n = Number(qty ?? 1);
+  const [, rows] = await PartStock.update(
+    { quantity: sequelize.literal(`quantity - ${n}`), updated_at: fn('GETDATE') },
+    { where: { stock_id: stockId, quantity: { [Op.gte]: n } }, transaction, returning: true },
+  );
+  return rows && rows[0] ? fixDates(toPhysicalOrder(rows[0].get({ plain: true }))) : null;
 }
 
 // Puts quantity back on a specific line by id - a return, where the part is
@@ -300,13 +315,12 @@ async function decrement(stockId, qty, transaction) {
 // external-transaction interop as increment() above (partBorrowModel.js's
 // markReturned()/remove(), partModel.js's removeReplacement()).
 async function incrementById(stockId, qty, transaction) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.part_stock
-      SET quantity = quantity + :qty, updated_at = GETDATE()
-      OUTPUT INSERTED.*
-      WHERE stock_id = :id
-    `, { replacements: { id: stockId, qty: qty ?? 1 }, type: QueryTypes.SELECT, transaction });
-  return fixDates(row) || null;
+  const n = Number(qty ?? 1);
+  const [, rows] = await PartStock.update(
+    { quantity: sequelize.literal(`quantity + ${n}`), updated_at: fn('GETDATE') },
+    { where: { stock_id: stockId }, transaction, returning: true },
+  );
+  return rows && rows[0] ? fixDates(toPhysicalOrder(rows[0].get({ plain: true }))) : null;
 }
 
 // Manual correction - a stock take, or parts bought in. Self-contained, no
@@ -332,18 +346,16 @@ async function setQuantity(stockId, quantity) {
 // matching line instead: its quantity moves over and this row is removed.
 // Same behaviour increment() already uses when adding stock.
 //
-// Self-contained transaction (no external caller passes one in), so this
-// uses sequelize.transaction() - the individual statements stay raw
-// sequelize.query() calls since the clash-detection/merge logic doesn't map
-// onto plain ORM methods.
+// Self-contained transaction (no external caller passes one in). The
+// clash-detection/merge logic is an explicit lookup chain ahead of a plain
+// update-or-merge, same pattern as customFieldModel.setValues() and its
+// siblings elsewhere in this migration - not a single MERGE statement, so it
+// maps cleanly onto ORM calls rather than needing to stay raw.
 async function updateLine(stockId, d) {
   const normalizedPartValue = d.part_value === undefined ? undefined : normalizePartValue(d.part_value);
 
   return sequelize.transaction(async (transaction) => {
-    const [existing] = await sequelize.query(
-      'SELECT * FROM dbo.part_stock WHERE stock_id = :id',
-      { replacements: { id: stockId }, type: QueryTypes.SELECT, transaction },
-    );
+    const existing = await PartStock.findByPk(stockId, { transaction, raw: true });
     if (!existing) return null;
 
     const resulting = {
@@ -356,86 +368,58 @@ async function updateLine(stockId, d) {
       status: d.status ?? existing.status,
     };
 
-    const [clashRow] = await sequelize.query(`
-        SELECT TOP 1 stock_id FROM dbo.part_stock
-        WHERE stock_id <> :id
-          AND part_type_id = :part_type_id
-          AND ISNULL(part_value, '') = ISNULL(:part_value, '')
-          AND ISNULL(model_name, '') = ISNULL(:model_name, '')
-          AND ISNULL(model_number, '') = ISNULL(:model_number, '')
-          AND ISNULL(disk_type, '') = ISNULL(:disk_type, '')
-          AND ISNULL(disk_interface, '') = ISNULL(:disk_interface, '')
-          AND ISNULL(ram_type, '') = ISNULL(:ram_type, '')
-          AND status = :status
-      `, {
-      replacements: {
-        id: stockId,
+    // ISNULL(col,'') = ISNULL(:val,'') reimplemented as null-safe equality
+    // per column - real part_stock values are either NULL or an actual
+    // string in this data, never a stored empty string, so treating NULL as
+    // the only "nothing there" case is equivalent.
+    const nullSafe = (col, val) => ({ [col]: val === null || val === undefined ? null : val });
+
+    const clashRow = await PartStock.findOne({
+      where: {
+        stock_id: { [Op.ne]: stockId },
         part_type_id: existing.part_type_id,
-        part_value: resulting.part_value,
-        model_name: resulting.model_name,
-        model_number: resulting.model_number,
-        disk_type: resulting.disk_type,
-        disk_interface: resulting.disk_interface,
-        ram_type: resulting.ram_type,
+        ...nullSafe('part_value', resulting.part_value),
+        ...nullSafe('model_name', resulting.model_name),
+        ...nullSafe('model_number', resulting.model_number),
+        ...nullSafe('disk_type', resulting.disk_type),
+        ...nullSafe('disk_interface', resulting.disk_interface),
+        ...nullSafe('ram_type', resulting.ram_type),
         status: resulting.status,
       },
-      type: QueryTypes.SELECT,
+      attributes: ['stock_id'],
       transaction,
+      raw: true,
     });
 
     let result;
     if (clashRow) {
-      const [merged] = await sequelize.query(`
-          UPDATE dbo.part_stock
-          SET quantity = quantity + :qty, updated_at = GETDATE()
-          OUTPUT INSERTED.*
-          WHERE stock_id = :id
-        `, {
-        replacements: { id: clashRow.stock_id, qty: existing.quantity },
-        type: QueryTypes.SELECT,
-        transaction,
-      });
-      await sequelize.query(
-        'DELETE FROM dbo.part_stock WHERE stock_id = :id',
-        { replacements: { id: stockId }, transaction },
+      // existing.quantity is a plain integer straight from the DB, not
+      // user-supplied text - literal() here is the same safe pattern
+      // getSummary() already uses for its CASE expressions.
+      await PartStock.update(
+        { quantity: sequelize.literal(`quantity + ${Number(existing.quantity)}`), updated_at: fn('GETDATE') },
+        { where: { stock_id: clashRow.stock_id }, transaction },
       );
-      result = { ...fixDates(merged), merged_from: stockId };
+      const merged = await PartStock.findByPk(clashRow.stock_id, { transaction, raw: true });
+      await PartStock.destroy({ where: { stock_id: stockId }, transaction });
+      result = { ...toPhysicalOrder(fixDates(merged)), merged_from: stockId };
     } else {
-      const [updated] = await sequelize.query(`
-          UPDATE dbo.part_stock
-          SET quantity     = COALESCE(:quantity, quantity),
-              part_value   = COALESCE(:part_value, part_value),
-              model_name   = COALESCE(:model_name, model_name),
-              model_number = COALESCE(:model_number, model_number),
-              disk_type      = COALESCE(:disk_type, disk_type),
-              disk_interface = COALESCE(:disk_interface, disk_interface),
-              ram_type       = COALESCE(:ram_type, ram_type),
-              status       = COALESCE(:status, status),
-              location     = COALESCE(:location, location),
-              remark       = COALESCE(:remark, remark),
-              is_active    = COALESCE(:is_active, is_active),
-              updated_at   = GETDATE()
-          OUTPUT INSERTED.*
-          WHERE stock_id = :id
-        `, {
-        replacements: {
-          id: stockId,
-          quantity: d.quantity ?? null,
-          model_name: d.model_name ?? null,
-          model_number: d.model_number ?? null,
-          part_value: normalizedPartValue ?? null,
-          disk_type: d.disk_type ?? null,
-          disk_interface: d.disk_interface ?? null,
-          ram_type: d.ram_type ?? null,
-          status: d.status ?? null,
-          location: d.location ?? null,
-          remark: d.remark ?? null,
-          is_active: d.is_active === undefined ? null : (d.is_active ? 1 : 0),
-        },
-        type: QueryTypes.SELECT,
-        transaction,
-      });
-      result = fixDates(updated) || null;
+      const values = { updated_at: fn('GETDATE') };
+      if (d.quantity !== undefined && d.quantity !== null) values.quantity = d.quantity;
+      if (normalizedPartValue !== undefined && normalizedPartValue !== null) values.part_value = normalizedPartValue;
+      if (d.model_name !== undefined && d.model_name !== null) values.model_name = d.model_name;
+      if (d.model_number !== undefined && d.model_number !== null) values.model_number = d.model_number;
+      if (d.disk_type !== undefined && d.disk_type !== null) values.disk_type = d.disk_type;
+      if (d.disk_interface !== undefined && d.disk_interface !== null) values.disk_interface = d.disk_interface;
+      if (d.ram_type !== undefined && d.ram_type !== null) values.ram_type = d.ram_type;
+      if (d.status !== undefined && d.status !== null) values.status = d.status;
+      if (d.location !== undefined && d.location !== null) values.location = d.location;
+      if (d.remark !== undefined && d.remark !== null) values.remark = d.remark;
+      if (d.is_active !== undefined && d.is_active !== null) values.is_active = !!d.is_active;
+
+      await PartStock.update(values, { where: { stock_id: stockId }, transaction });
+      const updated = await PartStock.findByPk(stockId, { transaction, raw: true });
+      result = toPhysicalOrder(fixDates(updated));
     }
 
     return result;
@@ -449,16 +433,17 @@ async function updateLine(stockId, d) {
 // sequelize.transaction().
 async function remove(stockId) {
   return sequelize.transaction(async (transaction) => {
-    await sequelize.query(
-      'DELETE FROM dbo.part_stock_custom_value WHERE stock_id = :id',
-      { replacements: { id: stockId }, transaction },
-    );
+    // Lazy require - partCustomFieldModel.js imports PartStock from this
+    // file eagerly at its own top level, so this file's require of it back
+    // must be lazy (verified in both load orders, same technique used
+    // throughout this migration).
+    const { PartStockCustomValue } = require('./partCustomFieldModel');
+    await PartStockCustomValue.destroy({ where: { stock_id: stockId }, transaction });
 
-    const [row] = await sequelize.query(
-      'DELETE FROM dbo.part_stock OUTPUT DELETED.* WHERE stock_id = :id',
-      { replacements: { id: stockId }, type: QueryTypes.SELECT, transaction },
-    );
-    return fixDates(row) || null;
+    const row = await PartStock.findByPk(stockId, { transaction, raw: true });
+    if (!row) return null;
+    await PartStock.destroy({ where: { stock_id: stockId }, transaction });
+    return toPhysicalOrder(fixDates(row));
   });
 }
 
