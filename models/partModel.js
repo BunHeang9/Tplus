@@ -56,6 +56,23 @@ const PartReplacement = sequelize.define('PartReplacement', {
 PartReplacement.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
 PartReplacement.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
 
+// Which categories a part type applies to (dbo.part_type_category) -
+// composite primary key, no identity column of its own. No part_type_id
+// side association is declared here (PartType doesn't need to know about
+// this table for anything findAllTypes/findTypeById do), only the category
+// side, which findTypeCategories below needs.
+const PartTypeCategory = sequelize.define('PartTypeCategory', {
+  part_type_id: { type: DataTypes.INTEGER, primaryKey: true },
+  category_id: { type: DataTypes.INTEGER, primaryKey: true },
+  added_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'part_type_category',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+Category.hasMany(PartTypeCategory, { foreignKey: 'category_id', as: 'partTypeLinks' });
+
 // Raw queries with no model attribute definition return a plain string for a
 // DATE/DATETIME column; the driver this replaces returned a Date object for
 // the same column. Converting back keeps every response identical to before
@@ -139,15 +156,21 @@ async function findAllTypes(includeInactive = false, categoryId = null) {
 
 // Which categories a part applies to, plus the ones it could be added to.
 async function findTypeCategories(partTypeId) {
-  return sequelize.query(`
-      SELECT c.category_id, c.category_name,
-             CASE WHEN ptc.part_type_id IS NULL THEN 0 ELSE 1 END AS is_linked
-      FROM dbo.category c
-      LEFT JOIN dbo.part_type_category ptc
-             ON ptc.category_id = c.category_id AND ptc.part_type_id = :id
-      WHERE c.is_active = 1
-      ORDER BY c.category_name
-    `, { replacements: { id: partTypeId }, type: QueryTypes.SELECT });
+  const rows = await Category.findAll({
+    where: { is_active: true },
+    // required:false keeps this a LEFT JOIN; the part_type_id filter lives
+    // on the include (not a top-level where) so it narrows which link row
+    // matches without dropping a category that has no link at all - the
+    // same LEFT-JOIN-with-a-filter-in-the-ON-clause shape the original
+    // raw query used.
+    include: [{ model: PartTypeCategory, as: 'partTypeLinks', where: { part_type_id: partTypeId }, required: false }],
+    order: [['category_name', 'ASC']],
+  });
+
+  return rows.map((row) => {
+    const { category_id, category_name, partTypeLinks } = row.get({ plain: true });
+    return { category_id, category_name, is_linked: partTypeLinks && partTypeLinks.length > 0 ? 1 : 0 };
+  });
 }
 
 // Replaces the whole set in one transaction - a half-saved list would leave
@@ -174,28 +197,17 @@ async function setTypeCategories(partTypeId, categoryIds) {
   const customFieldModel = require('./customFieldModel');
 
   const result = await sequelize.transaction(async (transaction) => {
-    await sequelize.query(
-      'DELETE FROM dbo.part_type_category WHERE part_type_id = :id',
-      { replacements: { id: partTypeId }, transaction },
-    );
+    await PartTypeCategory.destroy({ where: { part_type_id: partTypeId }, transaction });
 
-    for (const categoryId of categoryIds || []) {
-      await sequelize.query(
-        'INSERT INTO dbo.part_type_category (part_type_id, category_id) VALUES (:part_type_id, :category_id)',
-        { replacements: { part_type_id: partTypeId, category_id: categoryId }, transaction },
-      );
-    }
-
-    let partType = null;
     if ((categoryIds || []).length > 0) {
-      const [row] = await sequelize.query(
-        'SELECT * FROM dbo.part_type WHERE part_type_id = :id',
-        { replacements: { id: partTypeId }, type: QueryTypes.SELECT, transaction },
+      await PartTypeCategory.bulkCreate(
+        categoryIds.map((categoryId) => ({ part_type_id: partTypeId, category_id: categoryId })),
+        { transaction },
       );
-      partType = row;
+      return PartType.findByPk(partTypeId, { transaction, raw: true });
     }
 
-    return partType;
+    return null;
   });
 
   if (result && !result.equipment_column) {
@@ -227,15 +239,12 @@ async function setTypeCategories(partTypeId, categoryIds) {
 // Guards the replacement itself: offering RAM on a camera in the form is one
 // mistake, but accepting it would put a value on a device that cannot have one.
 async function partAppliesToCategory(partTypeId, categoryId) {
-  const [row] = await sequelize.query(`
-      SELECT
-        (SELECT COUNT(*) FROM dbo.part_type_category
-          WHERE part_type_id = :part_type_id) AS total_links,
-        (SELECT COUNT(*) FROM dbo.part_type_category
-          WHERE part_type_id = :part_type_id AND category_id = :category_id) AS linked_here
-    `, { replacements: { part_type_id: partTypeId, category_id: categoryId }, type: QueryTypes.SELECT });
+  const [totalLinks, linkedHere] = await Promise.all([
+    PartTypeCategory.count({ where: { part_type_id: partTypeId } }),
+    PartTypeCategory.count({ where: { part_type_id: partTypeId, category_id: categoryId } }),
+  ]);
   // No links at all means it applies everywhere.
-  return row.total_links === 0 || row.linked_here > 0;
+  return totalLinks === 0 || linkedHere > 0;
 }
 
 async function findTypeById(id) {
