@@ -1,12 +1,35 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { Equipment } = require('./equipmentModel');
+const { Category } = require('./categoryModel');
+const { Employee } = require('./employeeModel');
 
 // Software licences and which devices they are installed on.
 //
 // A device can hold several licences and a licence can cover several devices,
 // so the link lives in dbo.equipment_software_license rather than a column on
-// either table.
+// either table. Not required by equipmentModel.js, so (like borrowModel.js/
+// deviceReplacementModel.js) it's safe for this file to import Equipment and
+// build associations onto it.
+
+// dbo.software_license's real columns, declared in their actual physical
+// column order (not insertion order - an old ALTER TABLE history left
+// date_expire/status/remark before date_start/license_type).
+const SoftwareLicense = sequelize.define('SoftwareLicense', {
+  license_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  product_name: { type: DataTypes.STRING(100), allowNull: false },
+  product_type: { type: DataTypes.STRING(20), allowNull: false },
+  date_expire: { type: DataTypes.DATEONLY, allowNull: true },
+  status: { type: DataTypes.STRING(20), allowNull: true },
+  remark: { type: DataTypes.STRING(255), allowNull: true },
+  date_start: { type: DataTypes.DATEONLY, allowNull: true },
+  license_type: { type: DataTypes.STRING(50), allowNull: false },
+}, {
+  tableName: 'software_license',
+  schema: 'dbo',
+  timestamps: false,
+});
 
 // Which devices a license is installed on - composite primary key
 // (equipment_id, license_id), mirroring equipment_category_field.
@@ -25,24 +48,34 @@ const EquipmentSoftwareLicense = sequelize.define('EquipmentSoftwareLicense', {
   timestamps: false,
 });
 
+EquipmentSoftwareLicense.belongsTo(SoftwareLicense, { foreignKey: 'license_id', as: 'license' });
+EquipmentSoftwareLicense.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
+SoftwareLicense.hasMany(EquipmentSoftwareLicense, { foreignKey: 'license_id', as: 'installs' });
+
 // Status is worked out in SQL once here, reused by every query in this file
 // (list, single-license lookup, create, update) - two separate
 // implementations of the same rule eventually disagree, and then the
 // licence list and a single license's page show different things for the
 // same row. 'near expire' has a space, not 'near_expire' - keep it that way
-// everywhere this value is compared against.
-const STATUS_CASE = `
+// everywhere this value is compared against. Parameterized on the column
+// reference (a bare name for a plain findAll/findOne on SoftwareLicense
+// itself, an aliased one like 'license.date_expire' when read through an
+// include) rather than duplicated per call site, so it's still one rule, not
+// several that can quietly drift apart.
+function statusCaseSql(licenseTypeCol, dateExpireCol) {
+  return `
       CASE
-        WHEN sl.license_type IN ('Free', 'Perpetual') THEN 'active'
-        WHEN sl.license_type = 'Annual Subscription' THEN
+        WHEN ${licenseTypeCol} IN ('Free', 'Perpetual') THEN 'active'
+        WHEN ${licenseTypeCol} = 'Annual Subscription' THEN
           CASE
-            WHEN sl.date_expire IS NULL THEN 'unknown'
-            WHEN sl.date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
-            WHEN sl.date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
+            WHEN ${dateExpireCol} IS NULL THEN 'unknown'
+            WHEN ${dateExpireCol} < CAST(GETDATE() AS DATE) THEN 'expired'
+            WHEN ${dateExpireCol} <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
             ELSE 'active'
           END
         ELSE 'unknown'
       END`;
+}
 
 // Raw queries with no model attribute definition return a plain 'YYYY-MM-DD'
 // string for a DATE column; the driver this replaces returned a Date object
@@ -63,70 +96,85 @@ function fixDates(row) {
 // frontend show "Office 365 (12 devices)" so an admin can see what is already
 // in heavy use.
 async function getAllLicenses() {
-  const rows = await sequelize.query(`
-    SELECT
-      sl.license_id,
-      sl.product_name,
-      sl.product_type,
-      sl.license_type,
-      sl.date_start,
-      sl.date_expire,
-      sl.remark,
-      ${STATUS_CASE} AS status,
-      (SELECT COUNT(*) FROM dbo.equipment_software_license l
-        WHERE l.license_id = sl.license_id) AS install_count
-    FROM dbo.software_license sl
-    ORDER BY sl.product_name ASC
-  `, { type: QueryTypes.SELECT });
+  const rows = await SoftwareLicense.findAll({
+    attributes: [
+      'license_id', 'product_name', 'product_type', 'license_type', 'date_start', 'date_expire', 'remark',
+      [sequelize.literal(statusCaseSql('license_type', 'date_expire')), 'status'],
+      [sequelize.fn('COUNT', sequelize.col('installs.equipment_id')), 'install_count'],
+    ],
+    include: [{ model: EquipmentSoftwareLicense, as: 'installs', attributes: [] }],
+    group: [
+      'SoftwareLicense.license_id', 'SoftwareLicense.product_name', 'SoftwareLicense.product_type',
+      'SoftwareLicense.license_type', 'SoftwareLicense.date_start', 'SoftwareLicense.date_expire',
+      'SoftwareLicense.remark',
+    ],
+    order: [['product_name', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
   return rows.map(fixDates);
 }
 
 // All licences on one device. Returns an array - a laptop may have Office and
 // Adobe and an antivirus product at once.
 async function getEquipmentLicenses(equipmentId) {
-  const rows = await sequelize.query(`
-      SELECT
-        sl.license_id,
-        sl.product_name,
-        sl.product_type,
-        sl.license_type,
-        sl.date_start,
-        sl.date_expire,
-        sl.remark,
-        ${STATUS_CASE} AS status,
-        l.installed_date,
-        l.remark AS install_remark
-      FROM dbo.equipment_software_license l
-      JOIN dbo.software_license sl ON l.license_id = sl.license_id
-      WHERE l.equipment_id = :equipment_id
-      ORDER BY sl.product_name
-    `, { replacements: { equipment_id: equipmentId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await EquipmentSoftwareLicense.findAll({
+    where: { equipment_id: equipmentId },
+    include: [{
+      model: SoftwareLicense, as: 'license', required: true,
+      attributes: [
+        'license_id', 'product_name', 'product_type', 'license_type', 'date_start', 'date_expire', 'remark',
+        [sequelize.literal(statusCaseSql('license.license_type', 'license.date_expire')), 'status'],
+      ],
+    }],
+    order: [[{ model: SoftwareLicense, as: 'license' }, 'product_name', 'ASC']],
+  });
+  return rows.map((row) => {
+    const { license, ...l } = row.get({ plain: true });
+    return fixDates({
+      license_id: license.license_id,
+      product_name: license.product_name,
+      product_type: license.product_type,
+      license_type: license.license_type,
+      date_start: license.date_start,
+      date_expire: license.date_expire,
+      remark: license.remark,
+      status: license.status,
+      installed_date: l.installed_date,
+      install_remark: l.remark,
+    });
+  });
 }
 
 // The reverse: which devices a licence is installed on. Answers "we have 50
 // seats - how many are used, and by whom?"
 async function getLicenseEquipment(licenseId) {
-  const rows = await sequelize.query(`
-      SELECT
-        e.equipment_id,
-        e.device_name,
-        e.computer_name,
-        e.device_model,
-        e.asset_code,
-        e.status AS equipment_status,
-        c.category_name,
-        emp.full_name AS owner_name,
-        l.installed_date,
-        l.remark AS install_remark
-      FROM dbo.equipment_software_license l
-      JOIN dbo.equipment e ON l.equipment_id = e.equipment_id
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      WHERE l.license_id = :license_id
-      ORDER BY e.device_name, e.computer_name
-    `, { replacements: { license_id: licenseId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await EquipmentSoftwareLicense.findAll({
+    where: { license_id: licenseId },
+    include: [{
+      model: Equipment, as: 'equipment', required: true,
+      include: [{ model: Category, as: 'category' }, { model: Employee, as: 'owner' }],
+    }],
+    order: [
+      [{ model: Equipment, as: 'equipment' }, 'device_name', 'ASC'],
+      [{ model: Equipment, as: 'equipment' }, 'computer_name', 'ASC'],
+    ],
+  });
+  return rows.map((row) => {
+    const { equipment, ...l } = row.get({ plain: true });
+    return fixDates({
+      equipment_id: equipment.equipment_id,
+      device_name: equipment.device_name,
+      computer_name: equipment.computer_name,
+      device_model: equipment.device_model,
+      asset_code: equipment.asset_code,
+      equipment_status: equipment.status,
+      category_name: equipment.category ? equipment.category.category_name : null,
+      owner_name: equipment.owner ? equipment.owner.full_name : null,
+      installed_date: l.installed_date,
+      install_remark: l.remark,
+    });
+  });
 }
 
 // Adds a licence to a device, leaving any others in place.
@@ -196,31 +244,47 @@ async function setEquipmentLicenses(equipmentId, licenseIds) {
 async function getLicensesForMany(equipmentIds) {
   if (!equipmentIds || equipmentIds.length === 0) return {};
 
-  const rows = await sequelize.query(`
-    SELECT l.equipment_id, sl.license_id, sl.product_name, sl.license_type,
-           sl.date_start, sl.date_expire,
-           ${STATUS_CASE} AS status
-    FROM dbo.equipment_software_license l
-    JOIN dbo.software_license sl ON l.license_id = sl.license_id
-    WHERE l.equipment_id IN (:ids)
-    ORDER BY sl.product_name
-  `, { replacements: { ids: equipmentIds }, type: QueryTypes.SELECT });
+  const rows = await EquipmentSoftwareLicense.findAll({
+    where: { equipment_id: { [Op.in]: equipmentIds } },
+    attributes: ['equipment_id'],
+    include: [{
+      model: SoftwareLicense, as: 'license', required: true,
+      attributes: [
+        'license_id', 'product_name', 'license_type', 'date_start', 'date_expire',
+        [sequelize.literal(statusCaseSql('license.license_type', 'license.date_expire')), 'status'],
+      ],
+    }],
+    order: [[{ model: SoftwareLicense, as: 'license' }, 'product_name', 'ASC']],
+  });
 
   const byEquipment = {};
   for (const row of rows) {
-    fixDates(row);
-    if (!byEquipment[row.equipment_id]) byEquipment[row.equipment_id] = [];
-    byEquipment[row.equipment_id].push(row);
+    const { license, equipment_id } = row.get({ plain: true });
+    const shaped = fixDates({
+      equipment_id,
+      license_id: license.license_id,
+      product_name: license.product_name,
+      license_type: license.license_type,
+      date_start: license.date_start,
+      date_expire: license.date_expire,
+      status: license.status,
+    });
+    if (!byEquipment[equipment_id]) byEquipment[equipment_id] = [];
+    byEquipment[equipment_id].push(shaped);
   }
   return byEquipment;
 }
 
 async function findLicenseById(licenseId) {
-  const rows = await sequelize.query(`
-      SELECT sl.*, ${STATUS_CASE} AS calculated_status
-      FROM dbo.software_license sl WHERE sl.license_id = :license_id
-    `, { replacements: { license_id: licenseId }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
+  const row = await SoftwareLicense.findOne({
+    where: { license_id: licenseId },
+    attributes: [
+      'license_id', 'product_name', 'product_type', 'date_expire', 'status', 'remark', 'date_start', 'license_type',
+      [sequelize.literal(statusCaseSql('license_type', 'date_expire')), 'calculated_status'],
+    ],
+    raw: true,
+  });
+  return fixDates(row) || null;
 }
 
 // --- license definitions (create/edit/delete the product itself, as
