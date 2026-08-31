@@ -19,7 +19,11 @@ const { ApiUser } = require('./userModel');
 // item, and bolting a quantity onto it would leave every existing row and
 // query implicitly assuming 1 anyway.
 
-const AVAILABLE_STATUS = 'Working - IT Stock';
+// Borrow eligibility used to be a hardcoded "status must equal exactly
+// 'Working - IT Stock'" check - now driven by part_stock_status.is_borrowable
+// instead (partStatusModel.js), the same way equipment's own borrow
+// eligibility already works off equipment_status.is_borrowable. See
+// partBorrowController.js's borrow() for where that's actually checked.
 
 // Defined here (not in partStockModel.js) and pointing outward at
 // PartStock/Employee/ApiUser via belongsTo only - same reasoning as
@@ -441,7 +445,6 @@ async function remove(borrowId) {
 }
 
 module.exports = {
-  AVAILABLE_STATUS,
   findStockForBorrow,
   create,
   findById,

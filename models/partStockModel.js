@@ -1,6 +1,7 @@
 const { DataTypes, Op, fn } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { PartStockStatus } = require('./partStatusModel');
 
 // Leaf models for dbo.part_type and dbo.part_stock - partModel.js only ever
 // requires this file lazily (inside functions, to dodge a load-time cycle),
@@ -52,6 +53,12 @@ const PartStock = sequelize.define('PartStock', {
 });
 
 PartStock.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
+// part_stock.status is a foreign key straight to part_stock_status.status_name
+// (see partStatusModel.js's own comment for why: no status_id + denormalized
+// text pair the way equipment does it, since a rename cascades on its own at
+// the database level here). targetKey rather than the default (the target's
+// primary key) because the FK points at status_name, not status_id.
+PartStock.belongsTo(PartStockStatus, { foreignKey: 'status', targetKey: 'status_name', as: 'statusInfo' });
 
 // Spare parts held in stock.
 //
@@ -61,15 +68,10 @@ PartStock.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
 //
 // Working and broken are separate lines of the same part, so a faulty module
 // is never offered for fitting.
-
-// The only two states a spare part can be in on the shelf. Equipment has more
-// (Installed, Borrowed, Working/Using...) because a device is in active
-// service; a loose part sitting in a box either still works or it doesn't.
 //
-// 'Working/Using' (a part still good but already earmarked for a different
-// device) was tried and reverted - confused people in practice, especially
-// around how it interacted with the replace workflow.
-const STATUSES = ['Working - IT Stock', 'Broken - IT Stock'];
+// The allowed status values themselves now live in dbo.part_stock_status
+// (partStatusModel.js), managed like equipment's own statuses - no more
+// hardcoded list here.
 
 // Raw queries with no model attribute definition return a plain string for a
 // DATETIME column; the driver this replaces returned a Date object for the
@@ -487,7 +489,6 @@ async function getSummary() {
 
 module.exports = {
   PartStock, PartType,
-  STATUSES,
   parseNumericPartValue,
   findAll, findAvailable, findById,
   increment, decrement, incrementById, setQuantity, updateLine, remove, getSummary,

@@ -1,5 +1,6 @@
 const partBorrowModel = require('../models/partBorrowModel');
 const partStockModel = require('../models/partStockModel');
+const partStatusModel = require('../models/partStatusModel');
 
 // Temporary loans of individual parts out of stock - RAM, CPU, Bag, Mouse...
 // Separate from /api/borrow, which loans a whole piece of equipment (always
@@ -35,9 +36,10 @@ async function borrow(req, res, next) {
     if (!stock) {
       return res.status(404).json({ error: `No stock line found with id ${stock_id}` });
     }
-    if (stock.status !== partBorrowModel.AVAILABLE_STATUS) {
+    const stockStatus = await partStatusModel.findByName(stock.status);
+    if (!stockStatus || !stockStatus.is_borrowable) {
       return res.status(409).json({
-        error: `Cannot borrow: this line's status is "${stock.status}", not "${partBorrowModel.AVAILABLE_STATUS}"`,
+        error: `Cannot borrow: this line's status is "${stock.status}", which is not borrowable`,
         current_status: stock.status,
       });
     }
@@ -94,10 +96,12 @@ async function returnItem(req, res, next) {
         returned_on: loan.return_date,
       });
     }
-    if (req.body.return_status && !partStockModel.STATUSES.includes(req.body.return_status)) {
-      return res.status(400).json({
-        error: `return_status must be one of: ${partStockModel.STATUSES.join(', ')}`,
-      });
+    if (req.body.return_status) {
+      const returnStatus = await partStatusModel.findByName(req.body.return_status);
+      if (!returnStatus) {
+        const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
+        return res.status(400).json({ error: `return_status must be one of: ${valid.join(', ')}` });
+      }
     }
 
     const updated = await partBorrowModel.markReturned(req.params.id, {

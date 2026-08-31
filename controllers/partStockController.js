@@ -1,5 +1,6 @@
 const partStockModel = require('../models/partStockModel');
 const partModel = require('../models/partModel');
+const partStatusModel = require('../models/partStatusModel');
 const partCustomFieldModel = require('../models/partCustomFieldModel');
 
 // Spare parts held in stock. Counted, not identified - "3 x 8GB working"
@@ -108,10 +109,12 @@ async function add(req, res, next) {
 
     // Checked here so a typo gets a useful message rather than surfacing as a
     // raw constraint violation from the database.
-    if (req.body.status && !partStockModel.STATUSES.includes(req.body.status)) {
-      return res.status(400).json({
-        error: `status must be one of: ${partStockModel.STATUSES.join(', ')}`,
-      });
+    if (req.body.status) {
+      const status = await partStatusModel.findByName(req.body.status);
+      if (!status) {
+        const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
+        return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}` });
+      }
     }
     if (req.body.disk_type && !['SSD', 'HDD'].includes(req.body.disk_type)) {
       return res.status(400).json({ error: "disk_type must be 'SSD' or 'HDD'" });
@@ -174,10 +177,12 @@ async function update(req, res, next) {
   if (quantity !== undefined && quantity < 0) {
     return res.status(400).json({ error: 'quantity cannot be negative' });
   }
-  if (status && !partStockModel.STATUSES.includes(status)) {
-    return res.status(400).json({
-      error: `status must be one of: ${partStockModel.STATUSES.join(', ')}`,
-    });
+  if (status) {
+    const statusRow = await partStatusModel.findByName(status);
+    if (!statusRow) {
+      const valid = (await partStatusModel.findAll()).map((s) => s.status_name);
+      return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}` });
+    }
   }
 
   try {
