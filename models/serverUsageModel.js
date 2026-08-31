@@ -42,6 +42,18 @@ ServerUsage.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' }
 
 const DATE_FIELDS = ['due_date'];
 
+// "5" (typed without a % sign, from either the admin form or the
+// self-service one) becomes "5%" - so the value is always usable
+// consistently wherever it's displayed, regardless of whether the caller
+// remembered to type the sign. Already-suffixed ("5%") and blank/null
+// values pass through unchanged - never double up to "5%%".
+function normalizePercent(value) {
+  if (value === null || value === undefined) return value;
+  const str = String(value).trim();
+  if (str === '' || str.endsWith('%')) return str;
+  return `${str}%`;
+}
+
 // Raw queries with no model attribute definition return a plain
 // 'YYYY-MM-DD' string for a DATE column; the driver this replaces returned
 // a Date object for the same column. Converting back keeps every response
@@ -121,8 +133,8 @@ async function upsertServerUsage(equipmentId, d) {
     replacements: {
       equipment_id: equipmentId,
       due_date: d.due_date ?? null,
-      cpu_usage_pct: d.cpu_usage_pct ?? null,
-      memory_usage_pct: d.memory_usage_pct ?? null,
+      cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? null,
+      memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? null,
       hdd_usage_gb: d.hdd_usage_gb ?? null,
       remark: d.remark ?? null,
     },
