@@ -1,6 +1,5 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Statuses a spare part (dbo.part_stock) can be in - the part-side twin of
 // statusModel.js's equipment_status, one level simpler: a loose component
@@ -33,28 +32,51 @@ const PartStockStatus = sequelize.define('PartStockStatus', {
   timestamps: false,
 });
 
-// Correlated subquery for stock_count - this file is required BY
-// partStockModel.js (for the belongsTo association declared there), so it
-// can never import PartStock back without a require cycle, the same
-// circularity statusModel.js has relative to equipmentModel.js.
+// stock_count needs PartStock, and partStockModel.js already imports
+// PartStockStatus from this file at ITS top level (for its own belongsTo) -
+// so this file importing PartStock back at ITS OWN top level would be a
+// real require cycle. Lazy instead (inside the function body, evaluated
+// only when the function actually runs, long after the whole app has
+// finished starting up and every model file is already loaded) - same
+// technique as statusModel.js/categoryModel.js/departmentModel.js's own
+// correlated counts.
+//
+// part_stock.status is a foreign key to status_name (not status_id), so
+// the join/count key is the name, not the id - see this file's own header
+// comment on PartStockStatus for why.
 async function findAll(includeInactive = false) {
-  let query = `
-    SELECT s.status_id, s.status_name, s.description, s.is_borrowable,
-           s.sort_order, s.is_active,
-           (SELECT COUNT(*) FROM dbo.part_stock p WHERE p.status = s.status_name) AS stock_count
-    FROM dbo.part_stock_status s
-  `;
-  if (!includeInactive) query += ' WHERE s.is_active = 1';
-  query += ' ORDER BY s.sort_order, s.status_id';
-  return sequelize.query(query, { type: QueryTypes.SELECT });
+  const { PartStock } = require('./partStockModel');
+
+  const counts = await PartStock.findAll({
+    attributes: ['status', [fn('COUNT', col('stock_id')), 'n']],
+    group: ['status'],
+    raw: true,
+  });
+  const countByStatusName = new Map(counts.map((r) => [r.status, r.n]));
+
+  const statuses = await PartStockStatus.findAll({
+    where: includeInactive ? {} : { is_active: true },
+    order: [['sort_order', 'ASC'], ['status_id', 'ASC']],
+    raw: true,
+  });
+  return statuses.map((s) => ({
+    status_id: s.status_id,
+    status_name: s.status_name,
+    description: s.description,
+    is_borrowable: s.is_borrowable,
+    sort_order: s.sort_order,
+    is_active: s.is_active,
+    stock_count: countByStatusName.get(s.status_name) || 0,
+  }));
 }
 
 async function findById(id) {
-  const [row] = await sequelize.query(`
-    SELECT s.*, (SELECT COUNT(*) FROM dbo.part_stock p WHERE p.status = s.status_name) AS stock_count
-    FROM dbo.part_stock_status s WHERE s.status_id = :id
-  `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row || null;
+  const { PartStock } = require('./partStockModel');
+
+  const row = await PartStockStatus.findByPk(id, { raw: true });
+  if (!row) return null;
+  const stock_count = await PartStock.count({ where: { status: row.status_name } });
+  return { ...row, stock_count };
 }
 
 async function findByName(name) {
@@ -92,12 +114,11 @@ async function update(id, d) {
 }
 
 async function countUsage(id) {
-  const [row] = await sequelize.query(`
-    SELECT COUNT(*) AS n FROM dbo.part_stock p
-    JOIN dbo.part_stock_status s ON p.status = s.status_name
-    WHERE s.status_id = :id
-  `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row.n;
+  const { PartStock } = require('./partStockModel');
+
+  const status = await PartStockStatus.findByPk(id, { attributes: ['status_name'], raw: true });
+  if (!status) return 0;
+  return PartStock.count({ where: { status: status.status_name } });
 }
 
 // Sequelize's destroy() doesn't return the deleted row - fetch first so the
