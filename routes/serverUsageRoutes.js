@@ -13,6 +13,18 @@ router.post(
   auditActivity('server_usage', 'set'),
   serverUsageController.setServerUsage,
 );
+
+// Self-service usage form - any signed-in user, not just admins. Deliberately
+// narrower than POST / above: only cpu_usage_pct/memory_usage_pct/hdd_usage_gb,
+// and only on a server_usage row that already exists (no create, no capacity/
+// due date/owner/remark) - see serverUsageModel.updateUsage()'s comment.
+router.patch(
+  '/:id/usage',
+  authenticate,
+  auditActivity('server_usage', 'update_usage'),
+  serverUsageController.updateUsage,
+);
+
 router.delete(
   '/:id',
   authenticate,

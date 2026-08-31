@@ -57,4 +57,23 @@ async function removeServerUsage(req, res, next) {
   }
 }
 
-module.exports = { getServerUsage, setServerUsage, removeServerUsage };
+// PATCH /api/server-usage/:id/usage  (any signed-in user)
+// The self-service form: cpu/memory/hdd usage only, on a row that already
+// exists - everything else (capacity, due date, owner, remark, and
+// creating a new row) stays admin-only through setServerUsage above. Any
+// other field sent in the body is silently ignored rather than validated
+// away, since this only ever forwards these three named fields.
+async function updateUsage(req, res, next) {
+  const { cpu_usage_pct, memory_usage_pct, hdd_usage_gb } = req.body;
+  try {
+    const usage = await serverUsageModel.updateUsage(req.params.id, {
+      cpu_usage_pct, memory_usage_pct, hdd_usage_gb,
+    });
+    if (!usage) return res.status(404).json({ error: 'Server usage record not found' });
+    res.json({ message: 'Usage updated', usage });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = { getServerUsage, setServerUsage, updateUsage, removeServerUsage };
