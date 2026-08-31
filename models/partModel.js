@@ -257,53 +257,58 @@ async function findTypeByName(name) {
   return fixDates(row) || null;
 }
 
+// PartType's own physical column order (confirmed against sys.columns,
+// same check that caught Equipment's create()/update() not matching its
+// declared attribute order): part_type_id, part_name, description,
+// equipment_column, tracks_value, sort_order, is_active, created_at,
+// is_countable, uses_model - reused below to keep the response shape
+// byte-for-byte identical to the original OUTPUT INSERTED.*.
+function partTypeInPhysicalOrder(row) {
+  if (!row) return row;
+  return {
+    part_type_id: row.part_type_id,
+    part_name: row.part_name,
+    description: row.description,
+    equipment_column: row.equipment_column,
+    tracks_value: row.tracks_value,
+    sort_order: row.sort_order,
+    is_active: row.is_active,
+    created_at: row.created_at,
+    is_countable: row.is_countable,
+    uses_model: row.uses_model,
+  };
+}
+
 async function createType(d) {
-  const [row] = await sequelize.query(`
-      INSERT INTO dbo.part_type
-        (part_name, description, equipment_column, tracks_value, is_countable, sort_order)
-      OUTPUT INSERTED.*
-      VALUES (:part_name, :description, :equipment_column, :tracks_value,
-              :is_countable, :sort_order)
-    `, {
-    replacements: {
-      part_name: d.part_name,
-      description: d.description || null,
-      equipment_column: d.equipment_column || null,
-      tracks_value: d.tracks_value === false ? 0 : 1,
-      is_countable: d.is_countable ? 1 : 0,
-      sort_order: d.sort_order ?? 99,
-    },
-    type: QueryTypes.SELECT,
+  const row = await PartType.create({
+    part_name: d.part_name,
+    description: d.description || null,
+    equipment_column: d.equipment_column || null,
+    tracks_value: d.tracks_value !== false,
+    is_countable: !!d.is_countable,
+    sort_order: d.sort_order ?? 99,
   });
-  return fixDates(row);
+  return fixDates(partTypeInPhysicalOrder(row.get({ plain: true })));
 }
 
 async function updateType(id, d) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.part_type
-      SET part_name        = COALESCE(:part_name, part_name),
-          description      = COALESCE(:description, description),
-          equipment_column = COALESCE(:equipment_column, equipment_column),
-          tracks_value     = COALESCE(:tracks_value, tracks_value),
-          is_countable     = COALESCE(:is_countable, is_countable),
-          sort_order       = COALESCE(:sort_order, sort_order),
-          is_active        = COALESCE(:is_active, is_active)
-      OUTPUT INSERTED.*
-      WHERE part_type_id = :id
-    `, {
-    replacements: {
-      id,
-      part_name: d.part_name ?? null,
-      description: d.description ?? null,
-      equipment_column: d.equipment_column ?? null,
-      tracks_value: d.tracks_value === undefined ? null : (d.tracks_value ? 1 : 0),
-      is_countable: d.is_countable === undefined ? null : (d.is_countable ? 1 : 0),
-      sort_order: d.sort_order ?? null,
-      is_active: d.is_active === undefined ? null : (d.is_active ? 1 : 0),
-    },
-    type: QueryTypes.SELECT,
-  });
-  return fixDates(row) || null;
+  const values = {};
+  if (d.part_name !== undefined && d.part_name !== null) values.part_name = d.part_name;
+  if (d.description !== undefined && d.description !== null) values.description = d.description;
+  if (d.equipment_column !== undefined && d.equipment_column !== null) values.equipment_column = d.equipment_column;
+  if (d.tracks_value !== undefined) values.tracks_value = !!d.tracks_value;
+  if (d.is_countable !== undefined) values.is_countable = !!d.is_countable;
+  if (d.sort_order !== undefined && d.sort_order !== null) values.sort_order = d.sort_order;
+  if (d.is_active !== undefined) values.is_active = !!d.is_active;
+
+  let row;
+  if (Object.keys(values).length === 0) {
+    row = await PartType.findByPk(id, { raw: true });
+  } else {
+    const [, rows] = await PartType.update(values, { where: { part_type_id: id }, returning: true });
+    row = rows && rows[0] ? rows[0].get({ plain: true }) : null;
+  }
+  return row ? fixDates(partTypeInPhysicalOrder(row)) : null;
 }
 
 async function countTypeUsage(id) {
