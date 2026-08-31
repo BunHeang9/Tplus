@@ -1,6 +1,5 @@
 const { DataTypes, fn, col, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const { PartStock } = require('./partStockModel');
 
 // Custom fields for part types (e.g. Battery -> "Color", "Serial Number"),
@@ -48,9 +47,7 @@ PartTypeCustomField.belongsTo(PartCustomField, { foreignKey: 'field_id', as: 'fi
 PartCustomField.hasMany(PartTypeCustomField, { foreignKey: 'field_id', as: 'partTypeLinks' });
 
 // dbo.part_stock_custom_value's own values (per stock line, not per part
-// type) - not modeled here as a Sequelize class since only its aggregate
-// count is ever needed (countValuesForPartType); getValues/getValuesForMany/
-// setValues below stay raw regardless.
+// type).
 const PartStockCustomValue = sequelize.define('PartStockCustomValue', {
   stock_id: { type: DataTypes.INTEGER, primaryKey: true },
   field_id: { type: DataTypes.INTEGER, primaryKey: true },
@@ -62,6 +59,7 @@ const PartStockCustomValue = sequelize.define('PartStockCustomValue', {
   timestamps: false,
 });
 PartStockCustomValue.belongsTo(PartStock, { foreignKey: 'stock_id', as: 'stock' });
+PartStockCustomValue.belongsTo(PartCustomField, { foreignKey: 'field_id', as: 'field' });
 
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
@@ -234,34 +232,47 @@ async function countValuesForPartType(partTypeId, fieldId) {
 
 // --- values ---
 
+// The join key (a specific stock line's part type, joined against its
+// stored values) isn't a plain FK a static association can express, so this
+// reuses findByPartType() above (every field attached to this line's part
+// type, already ORM) merged in JS with this one stock line's own stored
+// values - not a fan-out risk since both reads are scoped to exactly one
+// stock_id.
 async function getValues(stockId) {
-  return sequelize.query(`
-    SELECT f.field_key, f.field_label, f.field_type, v.field_value
-    FROM dbo.part_stock s
-    JOIN dbo.part_type_custom_field tf ON tf.part_type_id = s.part_type_id
-    JOIN dbo.part_custom_field f ON tf.field_id = f.field_id
-    LEFT JOIN dbo.part_stock_custom_value v
-           ON v.field_id = f.field_id AND v.stock_id = s.stock_id
-    WHERE s.stock_id = :stock_id
-    ORDER BY tf.sort_order, f.field_id
-  `, { replacements: { stock_id: stockId }, type: QueryTypes.SELECT });
+  const stock = await PartStock.findByPk(stockId, { attributes: ['part_type_id'], raw: true });
+  if (!stock) return [];
+
+  const [fields, values] = await Promise.all([
+    findByPartType(stock.part_type_id),
+    PartStockCustomValue.findAll({ where: { stock_id: stockId }, raw: true }),
+  ]);
+  const valueByFieldId = new Map(values.map((v) => [v.field_id, v.field_value]));
+
+  return fields.map((f) => ({
+    field_key: f.field_key,
+    field_label: f.field_label,
+    field_type: f.field_type,
+    field_value: valueByFieldId.has(f.field_id) ? valueByFieldId.get(f.field_id) : null,
+  }));
 }
 
 // One query for a whole stock list rather than one per row.
 async function getValuesForMany(stockIds) {
   if (!stockIds || stockIds.length === 0) return {};
 
-  const rows = await sequelize.query(`
-    SELECT v.stock_id, f.field_key, v.field_value
-    FROM dbo.part_stock_custom_value v
-    JOIN dbo.part_custom_field f ON v.field_id = f.field_id
-    WHERE v.stock_id IN (:ids)
-  `, { replacements: { ids: stockIds }, type: QueryTypes.SELECT });
+  // The original raw query had no ORDER BY, so its row/key order was
+  // already undefined - ordering here just makes this version deterministic.
+  const rows = await PartStockCustomValue.findAll({
+    where: { stock_id: { [Op.in]: stockIds } },
+    include: [{ model: PartCustomField, as: 'field', attributes: ['field_key'] }],
+    order: [['stock_id', 'ASC'], [{ model: PartCustomField, as: 'field' }, 'field_key', 'ASC']],
+  });
 
   const byStock = {};
   for (const row of rows) {
-    if (!byStock[row.stock_id]) byStock[row.stock_id] = {};
-    byStock[row.stock_id][row.field_key] = row.field_value;
+    const { stock_id, field, field_value } = row.get({ plain: true });
+    if (!byStock[stock_id]) byStock[stock_id] = {};
+    byStock[stock_id][field.field_key] = field_value;
   }
   return byStock;
 }
@@ -271,38 +282,42 @@ async function getValuesForMany(stockIds) {
 // part type, so a value cannot be stored against a field that part type does
 // not use.
 //
-// Accepts an optional external Sequelize transaction, same as its
-// equipment-side twin (customFieldModel.setValues) - for consistency and
-// forward compatibility even though today's callers (partStockController.js)
-// don't currently pass one.
+// The "field exists AND is attached to this line's part type" gate was one
+// atomic MERGE...USING before; here it's an explicit lookup chain (field ->
+// attachment -> existing value) ahead of a plain update-or-create, same
+// pattern as its equipment-side twin (customFieldModel.setValues). Accepts
+// an optional external Sequelize transaction, for consistency and forward
+// compatibility even though today's callers (partStockController.js) don't
+// currently pass one. updated_at is only set on the update branch, matching
+// the original MERGE's INSERT column list, which never included it.
 async function setValues(stockId, values, transaction) {
   const entries = Object.entries(values || {});
   if (entries.length === 0) return;
 
+  const stock = await PartStock.findByPk(stockId, { attributes: ['part_type_id'], transaction, raw: true });
+  if (!stock) return;
+
   for (const [key, value] of entries) {
-    await sequelize.query(`
-        MERGE dbo.part_stock_custom_value AS target
-        USING (
-            SELECT :stock_id AS stock_id, f.field_id
-            FROM dbo.part_custom_field f
-            JOIN dbo.part_type_custom_field tf ON tf.field_id = f.field_id
-            JOIN dbo.part_stock s ON s.part_type_id = tf.part_type_id
-            WHERE s.stock_id = :stock_id AND f.field_key = :field_key
-        ) AS source
-        ON target.stock_id = source.stock_id AND target.field_id = source.field_id
-        WHEN MATCHED THEN
-            UPDATE SET field_value = :field_value, updated_at = GETDATE()
-        WHEN NOT MATCHED THEN
-            INSERT (stock_id, field_id, field_value)
-            VALUES (source.stock_id, source.field_id, :field_value);
-      `, {
-      replacements: {
-        stock_id: stockId,
-        field_key: key,
-        field_value: value === null || value === undefined ? null : String(value),
-      },
-      transaction,
+    const field = await PartCustomField.findOne({
+      where: { field_key: key }, attributes: ['field_id'], transaction, raw: true,
     });
+    if (!field) continue;
+
+    const attached = await PartTypeCustomField.findOne({
+      where: { part_type_id: stock.part_type_id, field_id: field.field_id }, transaction, raw: true,
+    });
+    if (!attached) continue;
+
+    const field_value = value === null || value === undefined ? null : String(value);
+    const existing = await PartStockCustomValue.findOne({
+      where: { stock_id: stockId, field_id: field.field_id }, transaction,
+    });
+
+    if (existing) {
+      await existing.update({ field_value, updated_at: fn('GETDATE') }, { transaction });
+    } else {
+      await PartStockCustomValue.create({ stock_id: stockId, field_id: field.field_id, field_value }, { transaction });
+    }
   }
 }
 
