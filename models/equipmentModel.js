@@ -210,6 +210,50 @@ function fixDates(row) {
   return row;
 }
 
+// Sequelize's own attribute-declaration order doesn't match dbo.equipment's
+// actual physical column order (confirmed against sys.columns) for a
+// .create()/.update() result the way a plain read (.findAll()/.findByPk())
+// does - every raw-SQL write below this file's ORM rewrite used
+// `OUTPUT INSERTED.*`, which does follow physical order, so this
+// reconstructs a plain write result into that same order to keep every
+// response shape byte-for-byte identical to before.
+function toPhysicalOrder(row) {
+  if (!row) return row;
+  return {
+    equipment_id: row.equipment_id,
+    device_type: row.device_type,
+    device_model: row.device_model,
+    manufacturer: row.manufacturer,
+    serial_no: row.serial_no,
+    asset_code: row.asset_code,
+    mac_address: row.mac_address,
+    ip_address: row.ip_address,
+    owner_id: row.owner_id,
+    location: row.location,
+    purchase_date: row.purchase_date,
+    status: row.status,
+    remark: row.remark,
+    received_date: row.received_date,
+    assigned_date: row.assigned_date,
+    department_id: row.department_id,
+    category_id: row.category_id,
+    status_id: row.status_id,
+    computer_name: row.computer_name,
+    cpu: row.cpu,
+    ram: row.ram,
+    hd: row.hd,
+    os_type: row.os_type,
+    os_version: row.os_version,
+    windows_license: row.windows_license,
+    av_license: row.av_license,
+    service_tag: row.service_tag,
+    product_id: row.product_id,
+    device_name: row.device_name,
+    platform: row.platform,
+    server_type: row.server_type,
+  };
+}
+
 // This file is Category's own hub-side neighbour (Equipment.belongsTo
 // already points at it), so the reverse direction is safe to declare right
 // here, unlike the same count attempted from categoryModel.js itself, which
@@ -305,44 +349,7 @@ async function createStock(d) {
     remark: d.remark || null,
     owner_id: null,
   });
-  // Sequelize's own attribute-declaration order doesn't match this table's
-  // actual physical column order (confirmed against sys.columns) - the
-  // original `OUTPUT INSERTED.*` did, so the row is reconstructed here in
-  // that same physical order for a byte-for-byte identical response shape.
-  const e = row.get({ plain: true });
-  return fixDates({
-    equipment_id: e.equipment_id,
-    device_type: e.device_type,
-    device_model: e.device_model,
-    manufacturer: e.manufacturer,
-    serial_no: e.serial_no,
-    asset_code: e.asset_code,
-    mac_address: e.mac_address,
-    ip_address: e.ip_address,
-    owner_id: e.owner_id,
-    location: e.location,
-    purchase_date: e.purchase_date,
-    status: e.status,
-    remark: e.remark,
-    received_date: e.received_date,
-    assigned_date: e.assigned_date,
-    department_id: e.department_id,
-    category_id: e.category_id,
-    status_id: e.status_id,
-    computer_name: e.computer_name,
-    cpu: e.cpu,
-    ram: e.ram,
-    hd: e.hd,
-    os_type: e.os_type,
-    os_version: e.os_version,
-    windows_license: e.windows_license,
-    av_license: e.av_license,
-    service_tag: e.service_tag,
-    product_id: e.product_id,
-    device_name: e.device_name,
-    platform: e.platform,
-    server_type: e.server_type,
-  });
+  return fixDates(toPhysicalOrder(row.get({ plain: true })));
 }
 
 // Every device this employee owns, with raw equipment columns plus category
@@ -430,43 +437,7 @@ async function assign(id, d) {
 
   const [, rows] = await Equipment.update(values, { where: { equipment_id: id }, returning: true });
   if (!rows || !rows[0]) return null;
-  const row = rows[0].get({ plain: true });
-
-  // Same physical-column-order reconstruction as createStock()/update()
-  // above.
-  return fixDates({
-    equipment_id: row.equipment_id,
-    device_type: row.device_type,
-    device_model: row.device_model,
-    manufacturer: row.manufacturer,
-    serial_no: row.serial_no,
-    asset_code: row.asset_code,
-    mac_address: row.mac_address,
-    ip_address: row.ip_address,
-    owner_id: row.owner_id,
-    location: row.location,
-    purchase_date: row.purchase_date,
-    status: row.status,
-    remark: row.remark,
-    received_date: row.received_date,
-    assigned_date: row.assigned_date,
-    department_id: row.department_id,
-    category_id: row.category_id,
-    status_id: row.status_id,
-    computer_name: row.computer_name,
-    cpu: row.cpu,
-    ram: row.ram,
-    hd: row.hd,
-    os_type: row.os_type,
-    os_version: row.os_version,
-    windows_license: row.windows_license,
-    av_license: row.av_license,
-    service_tag: row.service_tag,
-    product_id: row.product_id,
-    device_name: row.device_name,
-    platform: row.platform,
-    server_type: row.server_type,
-  });
+  return fixDates(toPhysicalOrder(rows[0].get({ plain: true })));
 }
 
 //Unassign
@@ -475,24 +446,28 @@ async function assign(id, d) {
 // All three take an optional external Sequelize transaction - equipmentController.js's
 // unassign() opens one transaction covering "one, several, or all-by-owner"
 // in a single call, and rolls back if nothing matched.
+// Shared by all three below - the status_id lookup itself joins the same
+// transaction (when one is passed in) so it sees the same in-flight state
+// as the update it feeds, same as the original subquery running inside the
+// same statement/transaction.
+async function resolveStatusId(statusName, transaction) {
+  const row = await EquipmentStatus.findOne({
+    where: { status_name: statusName }, attributes: ['status_id'], raw: true, transaction,
+  });
+  return row ? row.status_id : null;
+}
+
 async function unassignById(
   equipmentId,
   status = "Working - IT Stock",
   transaction,
 ) {
-  const rows = await sequelize.query(`
-    UPDATE dbo.equipment
-    SET owner_id = NULL,
-        status = :status,
-        status_id = (
-          SELECT status_id
-          FROM dbo.equipment_status
-          WHERE status_name = :status
-        )
-    OUTPUT INSERTED.*
-    WHERE equipment_id = :id
-  `, { replacements: { id: equipmentId, status }, type: QueryTypes.SELECT, transaction });
-  return rows.map(fixDates);
+  const status_id = await resolveStatusId(status, transaction);
+  const [, rows] = await Equipment.update(
+    { owner_id: null, status, status_id },
+    { where: { equipment_id: equipmentId }, returning: true, transaction },
+  );
+  return (rows || []).map((r) => fixDates(toPhysicalOrder(r.get({ plain: true }))));
 }
 
 async function unassignByIds(
@@ -500,19 +475,12 @@ async function unassignByIds(
   status = "Working - IT Stock",
   transaction,
 ) {
-  const rows = await sequelize.query(`
-    UPDATE dbo.equipment
-    SET owner_id = NULL,
-        status = :status,
-        status_id = (
-          SELECT status_id
-          FROM dbo.equipment_status
-          WHERE status_name = :status
-        )
-    OUTPUT INSERTED.*
-    WHERE equipment_id IN (:ids)
-  `, { replacements: { ids: equipmentIds, status }, type: QueryTypes.SELECT, transaction });
-  return rows.map(fixDates);
+  const status_id = await resolveStatusId(status, transaction);
+  const [, rows] = await Equipment.update(
+    { owner_id: null, status, status_id },
+    { where: { equipment_id: { [Op.in]: equipmentIds } }, returning: true, transaction },
+  );
+  return (rows || []).map((r) => fixDates(toPhysicalOrder(r.get({ plain: true }))));
 }
 
 async function unassignByOwnerId(
@@ -520,19 +488,12 @@ async function unassignByOwnerId(
   status = "Working - IT Stock",
   transaction,
 ) {
-  const rows = await sequelize.query(`
-    UPDATE dbo.equipment
-    SET owner_id = NULL,
-        status = :status,
-        status_id = (
-          SELECT status_id
-          FROM dbo.equipment_status
-          WHERE status_name = :status
-        )
-    OUTPUT INSERTED.*
-    WHERE owner_id = :owner_id
-  `, { replacements: { owner_id: ownerId, status }, type: QueryTypes.SELECT, transaction });
-  return rows.map(fixDates);
+  const status_id = await resolveStatusId(status, transaction);
+  const [, rows] = await Equipment.update(
+    { owner_id: null, status, status_id },
+    { where: { owner_id: ownerId }, returning: true, transaction },
+  );
+  return (rows || []).map((r) => fixDates(toPhysicalOrder(r.get({ plain: true }))));
 }
 
 // What can actually be handed to an employee.
@@ -752,42 +713,7 @@ async function update(id, d) {
   }
   if (!row) return null;
 
-  // Same physical-column-order reconstruction as createStock() above -
-  // Sequelize's own attribute-declaration order doesn't match dbo.equipment's
-  // real column order, confirmed against sys.columns.
-  return fixDates({
-    equipment_id: row.equipment_id,
-    device_type: row.device_type,
-    device_model: row.device_model,
-    manufacturer: row.manufacturer,
-    serial_no: row.serial_no,
-    asset_code: row.asset_code,
-    mac_address: row.mac_address,
-    ip_address: row.ip_address,
-    owner_id: row.owner_id,
-    location: row.location,
-    purchase_date: row.purchase_date,
-    status: row.status,
-    remark: row.remark,
-    received_date: row.received_date,
-    assigned_date: row.assigned_date,
-    department_id: row.department_id,
-    category_id: row.category_id,
-    status_id: row.status_id,
-    computer_name: row.computer_name,
-    cpu: row.cpu,
-    ram: row.ram,
-    hd: row.hd,
-    os_type: row.os_type,
-    os_version: row.os_version,
-    windows_license: row.windows_license,
-    av_license: row.av_license,
-    service_tag: row.service_tag,
-    product_id: row.product_id,
-    device_name: row.device_name,
-    platform: row.platform,
-    server_type: row.server_type,
-  });
+  return fixDates(toPhysicalOrder(row));
 }
 
 // Counts everything pointing at this equipment. Delete is refused while any
