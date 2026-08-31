@@ -37,21 +37,29 @@ Employee.belongsTo(Department, { foreignKey: 'department_id', as: 'department' }
 // or borrow dropdown. Pass includeInactive to get everyone, e.g. for an admin
 // screen or when resolving a name on an old record.
 async function findAll(includeInactive = false) {
-  let query = `
-    SELECT emp.employee_id, emp.full_name, emp.staff_code, emp.phone, emp.sex,
-           emp.location, emp.position,
-           emp.department_id,
-           d.department_code,
-           d.department_name,
-           emp.is_active,
-           emp.left_date
-    FROM dbo.employee emp
-    LEFT JOIN dbo.department d ON emp.department_id = d.department_id
-  `;
-  if (!includeInactive) query += ' WHERE emp.is_active = 1';
-  query += ' ORDER BY emp.full_name';
+  const rows = await Employee.findAll({
+    where: includeInactive ? {} : { is_active: true },
+    include: [{ model: Department, as: 'department' }],
+    order: [['full_name', 'ASC']],
+  });
 
-  return sequelize.query(query, { type: QueryTypes.SELECT });
+  return rows.map((row) => {
+    const { department, ...emp } = row.get({ plain: true });
+    return {
+      employee_id: emp.employee_id,
+      full_name: emp.full_name,
+      staff_code: emp.staff_code,
+      phone: emp.phone,
+      sex: emp.sex,
+      location: emp.location,
+      position: emp.position,
+      department_id: emp.department_id,
+      department_code: department ? department.department_code : null,
+      department_name: department ? department.department_name : null,
+      is_active: emp.is_active,
+      left_date: emp.left_date,
+    };
+  });
 }
 
 // One row per employee per device they own (owner_id, not borrowing) - via
@@ -178,11 +186,11 @@ async function searchWithEquipment(name) {
 }
 
 async function findByName(fullName) {
-  const rows = await sequelize.query(`
-    SELECT employee_id, full_name, department_id, location, position
-    FROM dbo.employee WHERE full_name = :full_name
-  `, { replacements: { full_name: fullName }, type: QueryTypes.SELECT });
-  return rows[0] || null;
+  return Employee.findOne({
+    where: { full_name: fullName },
+    attributes: ['employee_id', 'full_name', 'department_id', 'location', 'position'],
+    raw: true,
+  });
 }
 
 // The assign page's employee dropdown: active employees, optionally narrowed
