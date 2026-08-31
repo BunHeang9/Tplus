@@ -1,4 +1,4 @@
-const { DataTypes, Op, fn, col, literal } = require('sequelize');
+const { DataTypes, Op, fn, col, literal, where: sequelizeWhere } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const { Category } = require('./categoryModel');
@@ -486,36 +486,68 @@ async function unassignByOwnerId(
 // Those carry status 'Installed' and are excluded, so the assign dropdown
 // only offers real stock.
 async function findAvailable(category, includeInstalled) {
-  let query = `
-    SELECT e.equipment_id, e.category_id, c.category_name AS category,
-           e.device_type, e.computer_name, e.device_model,
-           e.manufacturer, e.asset_code, e.service_tag, e.mac_address, e.ip_address,
-           e.cpu, e.ram, e.hd, e.purchase_date, e.received_date,
-           e.location, e.department_id, d.department_code AS department,
-           e.status, e.remark
-    FROM dbo.equipment e
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    LEFT JOIN dbo.department d ON e.department_id = d.department_id
-    LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-    WHERE e.owner_id IS NULL
-  `;
-  const replacements = {};
+  const where = { owner_id: null };
+  if (category) where['$category.category_name$'] = category;
 
   // Driven by the is_assignable flag on dbo.equipment_status rather than a
   // hardcoded list, so changing the rule is a data change, not a code change.
   // ?include_installed=true is an escape hatch for assigning an installed
-  // device to someone as its custodian.
+  // device to someone as its custodian. Same LEFT-JOIN-with-a-filter vs.
+  // plain-LEFT-JOIN distinction the original raw query made: filtering
+  // is_assignable on the joined table behaves like an inner join (a row
+  // with no status match fails the =1 test either way), so `required` only
+  // flips to true in that branch.
+  const equipmentStatusInclude = { model: EquipmentStatus, as: 'equipmentStatus', attributes: [] };
   if (includeInstalled !== 'true') {
-    query += ' AND st.is_assignable = 1';
+    equipmentStatusInclude.where = { is_assignable: true };
+    equipmentStatusInclude.required = true;
+  } else {
+    equipmentStatusInclude.required = false;
   }
-  if (category) {
-    query += ' AND c.category_name = :category';
-    replacements.category = category;
-  }
-  query += ' ORDER BY e.received_date DESC, e.equipment_id DESC';
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await Equipment.findAll({
+    where,
+    attributes: [
+      'equipment_id', 'category_id', 'device_type', 'computer_name', 'device_model',
+      'manufacturer', 'asset_code', 'service_tag', 'mac_address', 'ip_address',
+      'cpu', 'ram', 'hd', 'purchase_date', 'received_date',
+      'location', 'department_id', 'status', 'remark',
+    ],
+    include: [
+      { model: Category, as: 'category', attributes: ['category_name'] },
+      { model: Department, as: 'department', attributes: ['department_code'] },
+      equipmentStatusInclude,
+    ],
+    order: [['received_date', 'DESC'], ['equipment_id', 'DESC']],
+    subQuery: false,
+  });
+
+  return rows.map((row) => {
+    const { category: cat, department, equipmentStatus, ...e } = row.get({ plain: true });
+    return fixDates({
+      equipment_id: e.equipment_id,
+      category_id: e.category_id,
+      category: cat ? cat.category_name : null,
+      device_type: e.device_type,
+      computer_name: e.computer_name,
+      device_model: e.device_model,
+      manufacturer: e.manufacturer,
+      asset_code: e.asset_code,
+      service_tag: e.service_tag,
+      mac_address: e.mac_address,
+      ip_address: e.ip_address,
+      cpu: e.cpu,
+      ram: e.ram,
+      hd: e.hd,
+      purchase_date: e.purchase_date,
+      received_date: e.received_date,
+      location: e.location,
+      department_id: e.department_id,
+      department: department ? department.department_code : null,
+      status: e.status,
+      remark: e.remark,
+    });
+  });
 }
 
 // What can be picked from the assign page's device dropdown: unowned,
@@ -525,78 +557,92 @@ async function findAvailable(category, includeInstalled) {
 // filter set the assign form actually uses. Moved here from
 // assignController.js, which used to run this query itself.
 async function findAvailableForAssign({ q, category, status, location } = {}) {
-  let query = `
-    SELECT e.*,
-           c.category_name,
-           s.status_name,
-           -- Always null for stock, but present so the column set matches
-           -- the replacement page and one table component serves both.
-           CAST(NULL AS NVARCHAR(100)) AS owner_name,
-           CAST(NULL AS NVARCHAR(100)) AS owner_position,
-           CAST(NULL AS VARCHAR(20))   AS owner_department,
-           -- What the dropdown shows. Falls through name, hostname, model
-           -- and asset code so a device is never an unlabelled row.
-           COALESCE(e.computer_name, e.device_name, e.device_model, e.asset_code,
-                    CONCAT('Equipment ', e.equipment_id)) AS display_name
-    FROM dbo.equipment e
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    LEFT JOIN dbo.equipment_status s ON e.status_id = s.status_id
-    -- No owner is not enough: a wall-mounted camera has no owner either.
-    -- is_assignable marks what can actually be handed to a person.
-    WHERE e.owner_id IS NULL
-      AND s.is_assignable = 1
-  `;
-  const replacements = {};
-
+  // No owner is not enough: a wall-mounted camera has no owner either.
+  // is_assignable marks what can actually be handed to a person.
+  const where = { owner_id: null };
+  if (category) where['$category.category_name$'] = category;
+  if (status) where.status = status;
+  if (location) where.location = location;
   if (q) {
-    query += ` AND (
-      e.computer_name LIKE :q OR
-      e.device_name   LIKE :q OR
-      e.asset_code    LIKE :q OR
-      e.service_tag   LIKE :q OR
-      e.serial_no     LIKE :q OR
-      e.device_model  LIKE :q
-    )`;
-    replacements.q = `%${q}%`;
-  }
-  if (category) {
-    query += ' AND c.category_name = :category';
-    replacements.category = category;
-  }
-  if (status) {
-    query += ' AND e.status = :status';
-    replacements.status = status;
-  }
-  if (location) {
-    query += ' AND e.location = :location';
-    replacements.location = location;
+    const like = { [Op.like]: `%${q}%` };
+    where[Op.or] = [
+      { computer_name: like }, { device_name: like }, { asset_code: like },
+      { service_tag: like }, { serial_no: like }, { device_model: like },
+    ];
   }
 
-  query += ' ORDER BY c.category_name, display_name';
+  // What the dropdown shows. Falls through name, hostname, model and asset
+  // code so a device is never an unlabelled row - kept as a SQL expression
+  // (rather than computed only in JS) purely so ORDER BY sorts on exactly
+  // what SQL Server's COALESCE/CONCAT produce, with no risk of a JS string
+  // comparison disagreeing with it.
+  const displayNameSql = "COALESCE(computer_name, device_name, device_model, asset_code, CONCAT('Equipment ', equipment_id))";
 
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await Equipment.findAll({
+    where,
+    include: [
+      { model: Category, as: 'category' },
+      { model: EquipmentStatus, as: 'equipmentStatus', where: { is_assignable: true }, required: true },
+    ],
+    order: [
+      [{ model: Category, as: 'category' }, 'category_name', 'ASC'],
+      [literal(displayNameSql), 'ASC'],
+    ],
+    subQuery: false,
+  });
+
+  return rows.map((row) => {
+    const { category: cat, equipmentStatus, ...e } = row.get({ plain: true });
+    return fixDates({
+      ...e,
+      category_name: cat ? cat.category_name : null,
+      status_name: equipmentStatus ? equipmentStatus.status_name : null,
+      // Always null for stock, but present so the column set matches the
+      // replacement page and one table component serves both.
+      owner_name: null,
+      owner_position: null,
+      owner_department: null,
+      display_name: e.computer_name || e.device_name || e.device_model || e.asset_code || `Equipment ${e.equipment_id}`,
+    });
+  });
 }
 
 // Falls back to purchase_date where received_date was never recorded.
 async function findByDateRange(from, to) {
-  const rows = await sequelize.query(`
-      SELECT e.equipment_id, e.category_id, c.category_name AS category,
-             e.device_type, e.computer_name, e.device_model,
-             e.manufacturer, e.asset_code, e.service_tag,
-             e.purchase_date, e.received_date, e.assigned_date,
-             e.location, e.status,
-             emp.full_name AS owner_name,
-             emp.position  AS owner_position,
-             empd.department_code AS owner_department
-      FROM dbo.equipment e
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      WHERE COALESCE(e.received_date, e.purchase_date) BETWEEN :from AND :to
-      ORDER BY COALESCE(e.received_date, e.purchase_date), e.equipment_id
-    `, { replacements: { from, to }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const coalescedDate = fn('COALESCE', col('received_date'), col('purchase_date'));
+
+  const rows = await Equipment.findAll({
+    where: sequelizeWhere(coalescedDate, { [Op.between]: [from, to] }),
+    include: [
+      { model: Category, as: 'category' },
+      { model: Employee, as: 'owner', include: [{ model: Department, as: 'department' }] },
+    ],
+    order: [[coalescedDate, 'ASC'], ['equipment_id', 'ASC']],
+  });
+
+  return rows.map((row) => {
+    const { category, owner, ...e } = row.get({ plain: true });
+    const ownerDepartment = owner && owner.department;
+    return fixDates({
+      equipment_id: e.equipment_id,
+      category_id: e.category_id,
+      category: category ? category.category_name : null,
+      device_type: e.device_type,
+      computer_name: e.computer_name,
+      device_model: e.device_model,
+      manufacturer: e.manufacturer,
+      asset_code: e.asset_code,
+      service_tag: e.service_tag,
+      purchase_date: e.purchase_date,
+      received_date: e.received_date,
+      assigned_date: e.assigned_date,
+      location: e.location,
+      status: e.status,
+      owner_name: owner ? owner.full_name : null,
+      owner_position: owner ? owner.position : null,
+      owner_department: ownerDepartment ? ownerDepartment.department_code : null,
+    });
+  });
 }
 
 // Full detail update. COALESCE means only the fields actually supplied
