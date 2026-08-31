@@ -1,4 +1,4 @@
-const { DataTypes, Op } = require('sequelize');
+const { DataTypes, Op, fn } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 
@@ -304,15 +304,16 @@ async function incrementById(stockId, qty, transaction) {
 }
 
 // Manual correction - a stock take, or parts bought in. Self-contained, no
-// external transaction, so this one moved to a plain raw sequelize.query().
+// external transaction, plain single-column update - fn('GETDATE') rather
+// than a JS Date so the value is sent as a raw SQL function call, not one of
+// Sequelize's own formatted timestamps (which this table's legacy DATETIME
+// column would reject - see categoryModel.js's created_at comment).
 async function setQuantity(stockId, quantity) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.part_stock
-      SET quantity = :quantity, updated_at = GETDATE()
-      OUTPUT INSERTED.*
-      WHERE stock_id = :id
-    `, { replacements: { id: stockId, quantity }, type: QueryTypes.SELECT });
-  return fixDates(row) || null;
+  const [, rows] = await PartStock.update(
+    { quantity, updated_at: fn('GETDATE') },
+    { where: { stock_id: stockId }, returning: true },
+  );
+  return rows && rows[0] ? fixDates(rows[0].get({ plain: true })) : null;
 }
 
 // Edits a line: quantity, model details, status, remark or the active flag.
