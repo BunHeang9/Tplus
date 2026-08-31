@@ -110,13 +110,24 @@ async function getServerUsage() {
 // for that server, the same way part_stock's increment() spares the caller
 // from that. COALESCE keeps a field already recorded when this update
 // leaves it out, rather than blanking it back to null.
+//
+// due_date is no longer something a caller sets - it's "last recorded",
+// stamped to today automatically whenever any usage field
+// (cpu_usage_pct/memory_usage_pct/hdd_usage_gb) is actually supplied,
+// whether that's the admin's own form or the self-service one. A caller
+// can no longer set it directly; a due_date-only call (nothing else
+// supplied) leaves it exactly as it was, same as any other field nobody
+// touched. CAST(GETDATE() AS DATE) rather than a JS Date, so it's the
+// server's own clock, not something formatted client-side.
 async function upsertServerUsage(equipmentId, d) {
+  const usageTouched = d.cpu_usage_pct !== undefined || d.memory_usage_pct !== undefined || d.hdd_usage_gb !== undefined;
+
   const [row] = await sequelize.query(`
       MERGE dbo.server_usage AS target
       USING (SELECT :equipment_id AS equipment_id) AS source
       ON target.equipment_id = source.equipment_id
       WHEN MATCHED THEN UPDATE SET
-        due_date = COALESCE(:due_date, due_date),
+        due_date = CASE WHEN :usage_touched = 1 THEN CAST(GETDATE() AS DATE) ELSE due_date END,
         cpu_usage_pct = COALESCE(:cpu_usage_pct, cpu_usage_pct),
         memory_usage_pct = COALESCE(:memory_usage_pct, memory_usage_pct),
         hdd_usage_gb = COALESCE(:hdd_usage_gb, hdd_usage_gb),
@@ -125,14 +136,14 @@ async function upsertServerUsage(equipmentId, d) {
         equipment_id, due_date,
         cpu_usage_pct, memory_usage_pct, hdd_usage_gb, remark
       ) VALUES (
-        :equipment_id, :due_date,
+        :equipment_id, CASE WHEN :usage_touched = 1 THEN CAST(GETDATE() AS DATE) ELSE NULL END,
         :cpu_usage_pct, :memory_usage_pct, :hdd_usage_gb, :remark
       )
       OUTPUT INSERTED.*;
   `, {
     replacements: {
       equipment_id: equipmentId,
-      due_date: d.due_date ?? null,
+      usage_touched: usageTouched ? 1 : 0,
       cpu_usage_pct: normalizePercent(d.cpu_usage_pct) ?? null,
       memory_usage_pct: normalizePercent(d.memory_usage_pct) ?? null,
       hdd_usage_gb: d.hdd_usage_gb ?? null,
