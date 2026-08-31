@@ -263,7 +263,7 @@ async function findByServiceTag(tag) {
 async function createStock(d) {
   const [row] = await sequelize.query(`
       INSERT INTO dbo.equipment (
-        category_id, device_type, device_model, manufacturer,
+        category_id, device_type, device_name, server_type, device_model, manufacturer,
         asset_code, service_tag, serial_no, product_id,
         mac_address, ip_address, os_type, os_version,
         cpu, ram, hd, windows_license, av_license,
@@ -272,7 +272,7 @@ async function createStock(d) {
       )
       OUTPUT INSERTED.*
       VALUES (
-        :category_id, :device_type, :device_model, :manufacturer,
+        :category_id, :device_type, :device_name, :server_type, :device_model, :manufacturer,
         :asset_code, :service_tag, :serial_no, :product_id,
         :mac_address, :ip_address, :os_type, :os_version,
         :cpu, :ram, :hd, :windows_license, :av_license,
@@ -285,6 +285,8 @@ async function createStock(d) {
     replacements: {
       category_id: d.category_id,
       device_type: d.device_type || null,
+      device_name: d.device_name || null,
+      server_type: d.server_type || null,
       device_model: d.device_model || null,
       manufacturer: d.manufacturer || null,
       service_tag: d.service_tag || null,
@@ -652,6 +654,8 @@ async function update(id, d) {
       UPDATE dbo.equipment
       SET category_id     = COALESCE(:category_id, category_id),
           device_type     = COALESCE(:device_type, device_type),
+          device_name     = COALESCE(:device_name, device_name),
+          server_type     = COALESCE(:server_type, server_type),
           device_model    = COALESCE(:device_model, device_model),
           computer_name   = COALESCE(:computer_name, computer_name),
           manufacturer    = COALESCE(:manufacturer, manufacturer),
@@ -686,6 +690,8 @@ async function update(id, d) {
       id,
       category_id: d.category_id ?? null,
       device_type: d.device_type ?? null,
+      device_name: d.device_name ?? null,
+      server_type: d.server_type ?? null,
       device_model: d.device_model ?? null,
       computer_name: d.computer_name ?? null,
       manufacturer: d.manufacturer ?? null,
