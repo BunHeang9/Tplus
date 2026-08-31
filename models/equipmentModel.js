@@ -1,4 +1,4 @@
-const { DataTypes, Op } = require('sequelize');
+const { DataTypes, Op, fn, col, literal } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 const { Category } = require('./categoryModel');
@@ -210,46 +210,53 @@ function fixDates(row) {
   return row;
 }
 
+// This file is Category's own hub-side neighbour (Equipment.belongsTo
+// already points at it), so the reverse direction is safe to declare right
+// here, unlike the same count attempted from categoryModel.js itself, which
+// is required BY this file and so can never import Equipment back.
+Category.hasMany(Equipment, { foreignKey: 'category_id', as: 'items' });
+
 async function getCategorySummary() {
-  return sequelize.query(`
-    SELECT c.category_id,
-           c.category_name AS category,
-           COUNT(e.equipment_id) AS total_items,
-           SUM(CASE WHEN e.owner_id IS NULL     THEN 1 ELSE 0 END) AS no_owner,
-           SUM(CASE WHEN e.owner_id IS NOT NULL THEN 1 ELSE 0 END) AS has_owner
-    FROM dbo.category c
-    LEFT JOIN dbo.equipment e ON e.category_id = c.category_id
-    GROUP BY c.category_id, c.category_name
-    ORDER BY c.category_name
-  `, { type: QueryTypes.SELECT });
+  const rows = await Category.findAll({
+    attributes: [
+      'category_id', ['category_name', 'category'],
+      [fn('COUNT', col('items.equipment_id')), 'total_items'],
+      [fn('SUM', literal("CASE WHEN [items].[owner_id] IS NULL THEN 1 ELSE 0 END")), 'no_owner'],
+      [fn('SUM', literal("CASE WHEN [items].[owner_id] IS NOT NULL THEN 1 ELSE 0 END")), 'has_owner'],
+    ],
+    include: [{ model: Equipment, as: 'items', attributes: [], required: false }],
+    group: ['Category.category_id', 'Category.category_name'],
+    order: [['category_name', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
+  return rows;
 }
 
 async function updateOwner(id, ownerId) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.equipment
-      SET owner_id = :owner_id
-      OUTPUT INSERTED.*
-      WHERE equipment_id = :id
-    `, { replacements: { id, owner_id: ownerId || null }, type: QueryTypes.SELECT });
-  return fixDates(row) || null;
+  const [, rows] = await Equipment.update(
+    { owner_id: ownerId || null },
+    { where: { equipment_id: id }, returning: true },
+  );
+  return rows && rows[0] ? fixDates(rows[0].get({ plain: true })) : null;
 }
 
 // --- Stock workflow ---
 
 async function findByEquipmentCode(code) {
-  const rows = await sequelize.query(
-    'SELECT equipment_id, computer_name, device_model FROM dbo.equipment WHERE asset_code = :code',
-    { replacements: { code }, type: QueryTypes.SELECT },
-  );
-  return rows[0] || null;
+  return Equipment.findOne({
+    where: { asset_code: code },
+    attributes: ['equipment_id', 'computer_name', 'device_model'],
+    raw: true,
+  });
 }
 
 async function findByServiceTag(tag) {
-  const rows = await sequelize.query(
-    'SELECT equipment_id, computer_name FROM dbo.equipment WHERE service_tag = :tag',
-    { replacements: { tag }, type: QueryTypes.SELECT },
-  );
-  return rows[0] || null;
+  return Equipment.findOne({
+    where: { service_tag: tag },
+    attributes: ['equipment_id', 'computer_name'],
+    raw: true,
+  });
 }
 
 // New stock always starts with owner_id NULL - assignment is a separate step.
@@ -309,26 +316,37 @@ async function createStock(d) {
 // and status names attached. Used to build the per-category equipment cards
 // on an employee's page - one row per device, grouped by category downstream.
 async function findByOwner(ownerId) {
-  const rows = await sequelize.query(`
-      SELECT e.*, c.category_name, st.status_name
-      FROM dbo.equipment e
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-      WHERE e.owner_id = :owner_id
-      ORDER BY c.category_name, e.equipment_id
-    `, { replacements: { owner_id: ownerId }, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await Equipment.findAll({
+    where: { owner_id: ownerId },
+    include: [
+      { model: Category, as: 'category' },
+      { model: EquipmentStatus, as: 'equipmentStatus' },
+    ],
+    order: [
+      [{ model: Category, as: 'category' }, 'category_name', 'ASC'],
+      ['equipment_id', 'ASC'],
+    ],
+  });
+
+  return rows.map((row) => {
+    const { category, equipmentStatus, ...e } = row.get({ plain: true });
+    return fixDates({
+      ...e,
+      category_name: category ? category.category_name : null,
+      status_name: equipmentStatus ? equipmentStatus.status_name : null,
+    });
+  });
 }
 
 async function findWithOwnerName(id) {
-  const rows = await sequelize.query(`
-      SELECT e.equipment_id, e.owner_id, e.computer_name, e.device_model,
-             emp.full_name AS current_owner
-      FROM dbo.equipment e
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      WHERE e.equipment_id = :id
-    `, { replacements: { id }, type: QueryTypes.SELECT });
-  return rows[0] || null;
+  const row = await Equipment.findByPk(id, {
+    attributes: ['equipment_id', 'owner_id', 'computer_name', 'device_model'],
+    include: [{ model: Employee, as: 'owner', attributes: ['full_name'] }],
+  });
+  if (!row) return null;
+
+  const { owner, ...e } = row.get({ plain: true });
+  return { ...e, current_owner: owner ? owner.full_name : null };
 }
 
 // Assigns a device to an employee, inheriting department and location from
