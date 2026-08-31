@@ -1,14 +1,20 @@
 const serverUsageModel = require('../models/serverUsageModel');
 const equipmentModel = require('../models/equipmentModel');
 
-// GET /api/server-usage?from=YYYY-MM-DD&to=YYYY-MM-DD
-// Both optional - with neither, each server shows its latest entry ever
-// recorded (today's view). With a range, each server shows its latest
-// entry that falls within it - "what was recorded sometime between the
-// 1st and the 31st" - for the calendar history view, not just "right now".
+// GET /api/server-usage                          - today's view: one row
+//   per server, its latest entry ever.
+// GET /api/server-usage?from=...&to=...           - the calendar/history
+//   view: every entry actually recorded in that range, so a server edited
+//   twice in the window shows up twice, and one untouched in the window
+//   doesn't show up at all. Genuinely different from the plain view, not
+//   the same query with a filter bolted on.
 async function getServerUsage(req, res, next) {
   try {
-    res.json(await serverUsageModel.getServerUsage(req.query.from, req.query.to));
+    const { from, to } = req.query;
+    const usage = (from || to)
+      ? await serverUsageModel.getServerUsageHistory(from, to)
+      : await serverUsageModel.getServerUsage();
+    res.json(usage);
   } catch (err) {
     next(err);
   }

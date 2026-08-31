@@ -77,21 +77,19 @@ function fixDates(row) {
 // server_usage entry - a server nobody has filled usage in for yet still
 // needs to show up here (with blank usage fields) so there's somewhere to
 // find it and fill it in, rather than only listing what already exists.
+// Always "right now": one row per server, its single latest entry ever -
+// the calendar/history view is a separate function below, not this one
+// with a date range bolted on, because they show fundamentally different
+// things (current state vs. a log of what happened).
 //
 // Each equipment can now have many server_usage rows (a history log, not
-// one row per server), so this needs "the single latest one, optionally
-// only counting entries within a date range" - a real top-1-per-group
-// query, not the "business rule guarantees at most one" shortcut used
-// elsewhere in this migration. No clean Sequelize include expresses that,
-// so this one stays raw SQL (OUTER APPLY TOP 1) - same reasoning already
-// applied to borrowModel.findAvailableToBorrow's NOT EXISTS, viewColumnModel
-// listViews()'s item_count, etc.
-//
-// from/to (optional, 'YYYY-MM-DD') scope which entries count as
-// candidates for "latest" - e.g. from=2026-08-01&to=2026-08-31 answers
-// "what was each server's usage as of some point in August", not
-// literally only entries recorded on a single exact day.
-async function getServerUsage(from, to) {
+// one row per server), so "just the latest one" needs a real
+// top-1-per-group query, not the "business rule guarantees at most one"
+// shortcut used elsewhere in this migration - no clean Sequelize include
+// expresses that, so this stays raw SQL (OUTER APPLY TOP 1), same
+// reasoning already applied to borrowModel.findAvailableToBorrow's NOT
+// EXISTS, viewColumnModel listViews()'s item_count, etc.
+async function getServerUsage() {
   const rows = await sequelize.query(`
     SELECT e.equipment_id, e.device_name, e.ip_address, e.owner_id,
            emp.full_name AS owner_name,
@@ -107,11 +105,35 @@ async function getServerUsage(from, to) {
       SELECT TOP 1 s.usage_id, s.due_date, s.cpu_usage_pct, s.memory_usage_pct, s.hdd_usage_gb, s.remark
       FROM dbo.server_usage s
       WHERE s.equipment_id = e.equipment_id
-        AND (:from IS NULL OR s.due_date >= :from)
-        AND (:to   IS NULL OR s.due_date <= :to)
       ORDER BY s.due_date DESC, s.usage_id DESC
     ) su
     ORDER BY e.device_name, e.equipment_id
+  `, { type: QueryTypes.SELECT });
+  return rows.map(fixDates);
+}
+
+// The calendar/history view: every entry actually recorded within
+// [from, to] - if a server was edited twice in the window, both entries
+// come back, not just the latest one squashed down to a single row. A
+// server untouched during the window simply doesn't appear at all here -
+// unlike getServerUsage() above, this isn't "every server, blank or not",
+// it's a log of what happened, so nothing happening means nothing to show.
+async function getServerUsageHistory(from, to) {
+  const rows = await sequelize.query(`
+    SELECT su.usage_id, e.equipment_id, e.device_name, e.ip_address, e.owner_id,
+           emp.full_name AS owner_name,
+           su.due_date,
+           TRY_CAST(e.cpu AS INT) AS cpu_core_total,
+           TRY_CAST(e.ram AS INT) AS memory_gb_total,
+           TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
+           su.cpu_usage_pct, su.memory_usage_pct, su.hdd_usage_gb, su.remark
+    FROM dbo.server_usage su
+    JOIN dbo.equipment e ON su.equipment_id = e.equipment_id
+    JOIN dbo.category c  ON e.category_id = c.category_id AND c.category_name = 'Server'
+    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
+    WHERE (:from IS NULL OR su.due_date >= :from)
+      AND (:to   IS NULL OR su.due_date <= :to)
+    ORDER BY su.due_date DESC, e.device_name ASC, su.usage_id DESC
   `, {
     replacements: { from: from || null, to: to || null },
     type: QueryTypes.SELECT,
@@ -161,4 +183,4 @@ async function removeServerUsage(usageId) {
   return fixDates(row);
 }
 
-module.exports = { getServerUsage, upsertServerUsage, removeServerUsage };
+module.exports = { getServerUsage, getServerUsageHistory, upsertServerUsage, removeServerUsage };
