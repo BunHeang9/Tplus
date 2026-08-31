@@ -1,6 +1,5 @@
 const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const { Equipment } = require('./equipmentModel');
 const { Employee } = require('./employeeModel');
 const { Department } = require('./departmentModel');
@@ -379,32 +378,53 @@ async function findReturns(filters = {}) {
 }
 
 // What can be borrowed right now: correct status, and not already out. The
-// NOT EXISTS correlated subquery stays raw - it's a negative-existence
-// check across the whole borrow_record table, not a fit for an association.
+// "not already out" check is a NOT EXISTS correlated subquery in the
+// original against the whole borrow_record table - fetched separately here
+// (every equipment_id currently on an open loan) and excluded via
+// Op.notIn, same "merge separate ORM reads in JS" pattern used throughout
+// this migration for a correlated check that isn't a fit for a plain join.
 async function findAvailableToBorrow(category) {
-  let query = `
-    SELECT e.equipment_id, e.category_id, c.category_name,
-           e.device_type, e.computer_name, e.device_model, e.manufacturer,
-           e.asset_code, e.service_tag, e.location, e.status
-    FROM dbo.equipment e
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    JOIN dbo.equipment_status st ON e.status_id = st.status_id
-    WHERE st.is_borrowable = 1
-      AND NOT EXISTS (
-          SELECT 1 FROM dbo.borrow_record b
-          WHERE b.equipment_id = e.equipment_id AND b.return_date IS NULL
-      )
-  `;
-  const replacements = {};
+  const openLoans = await BorrowRecord.findAll({
+    where: { return_date: null }, attributes: ['equipment_id'], raw: true,
+  });
+  const borrowedIds = openLoans.map((r) => r.equipment_id);
 
+  const where = {};
+  if (borrowedIds.length > 0) where.equipment_id = { [Op.notIn]: borrowedIds };
+
+  const categoryInclude = { model: Category, as: 'category', attributes: ['category_name'] };
   if (category) {
-    query += ' AND c.category_name = :category';
-    replacements.category = category;
+    categoryInclude.where = { category_name: category };
+    categoryInclude.required = true;
   }
 
-  query += ' ORDER BY c.category_name, e.equipment_id';
+  const rows = await Equipment.findAll({
+    where,
+    attributes: ['equipment_id', 'category_id', 'device_type', 'computer_name', 'device_model', 'manufacturer', 'asset_code', 'service_tag', 'location', 'status'],
+    include: [
+      categoryInclude,
+      { model: EquipmentStatus, as: 'equipmentStatus', attributes: [], where: { is_borrowable: true }, required: true },
+    ],
+    order: [[{ model: Category, as: 'category' }, 'category_name', 'ASC'], ['equipment_id', 'ASC']],
+    subQuery: false,
+  });
 
-  return sequelize.query(query, { replacements, type: QueryTypes.SELECT });
+  return rows.map((row) => {
+    const { category: cat, equipmentStatus, ...e } = row.get({ plain: true });
+    return {
+      equipment_id: e.equipment_id,
+      category_id: e.category_id,
+      category_name: cat ? cat.category_name : null,
+      device_type: e.device_type,
+      computer_name: e.computer_name,
+      device_model: e.device_model,
+      manufacturer: e.manufacturer,
+      asset_code: e.asset_code,
+      service_tag: e.service_tag,
+      location: e.location,
+      status: e.status,
+    };
+  });
 }
 
 async function findByBorrower(borrowerId, openOnly) {
