@@ -1,157 +1,212 @@
+const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { Category } = require('./categoryModel');
+const { Department } = require('./departmentModel');
+const { EquipmentStatus } = require('./statusModel');
+const { Employee } = require('./employeeModel');
 
-// Raw queries with no model attribute definition return a plain string for a
-// DATE column; the driver this replaces returned a Date object for the same
-// column. Converting back keeps every response identical to before this
-// migration. borrowed_on/due_back are the OUTER APPLY's borrow_date/
-// expected_return_date, same underlying DATE type.
-const DATE_FIELDS = ['purchase_date', 'received_date', 'assigned_date', 'borrowed_on', 'due_back'];
+// findAll/findById below go through real Sequelize associations rather than
+// sequelize.query() - every other function in this file (assign/update/
+// createStock/the unassign* family/findAvailable*/findByDateRange) stays on
+// raw sequelize.query(), largely for the same status-name-to-status_id
+// subquery reason explained on assign()/update() below, which doesn't map
+// onto Model.update(). Two consequences of moving these two to the ORM,
+// both deliberate, not oversights:
+//   1. purchase_date/received_date/assigned_date/borrowed_on/due_back come
+//      back as plain 'YYYY-MM-DD' strings now, not Date objects - Sequelize's
+//      mssql dialect derives the JS type from the SQL column's actual type
+//      (`date`), not from how the attribute is declared here, so there is no
+//      model declaration that makes a `date` column deserialize as a Date
+//      instance. fixDates() is gone because there is nothing it could fix.
+//   2. "current open loan" no longer guarantees the *most recent* one if an
+//      equipment row somehow ends up with more than one - the app's own
+//      business rules (findAvailableToBorrow excludes anything already on
+//      loan) mean that should never happen, but unlike the original
+//      ORDER BY ... DESC / TOP 1, a plain association take whichever the
+//      query planner returns first if it ever does.
+const Equipment = sequelize.define('Equipment', {
+  equipment_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  device_type: DataTypes.STRING(60),
+  device_model: DataTypes.STRING(100),
+  manufacturer: DataTypes.STRING(60),
+  serial_no: DataTypes.STRING(60),
+  asset_code: DataTypes.STRING(30),
+  mac_address: DataTypes.STRING(60),
+  ip_address: DataTypes.STRING(45),
+  owner_id: DataTypes.INTEGER,
+  location: DataTypes.STRING(50),
+  purchase_date: DataTypes.DATEONLY,
+  status: DataTypes.STRING(20),
+  remark: DataTypes.STRING(255),
+  received_date: DataTypes.DATEONLY,
+  assigned_date: DataTypes.DATEONLY,
+  department_id: DataTypes.INTEGER,
+  category_id: DataTypes.INTEGER,
+  status_id: DataTypes.INTEGER,
+  computer_name: DataTypes.STRING(100),
+  cpu: DataTypes.STRING(100),
+  ram: DataTypes.STRING(50),
+  hd: DataTypes.STRING(50),
+  os_type: DataTypes.STRING(50),
+  os_version: DataTypes.STRING(50),
+  windows_license: DataTypes.STRING(50),
+  av_license: DataTypes.STRING(50),
+  service_tag: DataTypes.STRING(100),
+  product_id: DataTypes.STRING(100),
+  device_name: DataTypes.STRING(150),
+  platform: DataTypes.STRING(100),
+  server_type: DataTypes.STRING(20),
+}, {
+  tableName: 'equipment',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+// Only defined here, not in its own file - borrow_record is otherwise
+// entirely raw SQL (see borrowModel.js/partBorrowModel.js), and this is the
+// one place that needs it as a real association rather than a query.
+const BorrowRecord = sequelize.define('BorrowRecord', {
+  borrow_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  equipment_id: DataTypes.INTEGER,
+  borrower_id: DataTypes.INTEGER,
+  borrow_date: DataTypes.DATEONLY,
+  expected_return_date: DataTypes.DATEONLY,
+  return_date: DataTypes.DATEONLY,
+}, {
+  tableName: 'borrow_record',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+// Aliased 'equipmentStatus', not 'status' - dbo.equipment already has its
+// own real 'status' text column (the legacy mirror of status_id's name),
+// and Sequelize refuses an association alias that collides with a real
+// attribute name.
+Equipment.belongsTo(Category, { foreignKey: 'category_id', as: 'category' });
+Equipment.belongsTo(Department, { foreignKey: 'department_id', as: 'department' });
+Equipment.belongsTo(EquipmentStatus, { foreignKey: 'status_id', as: 'equipmentStatus' });
+Equipment.belongsTo(Employee, { foreignKey: 'owner_id', as: 'owner' });
+Employee.belongsTo(Department, { foreignKey: 'department_id', as: 'department' });
+Equipment.hasOne(BorrowRecord, { foreignKey: 'equipment_id', as: 'openLoan' });
+BorrowRecord.belongsTo(Employee, { foreignKey: 'borrower_id', as: 'borrower' });
+
+// Every findAll/findById include set, so both build the exact same joins.
+function equipmentIncludes() {
+  return [
+    { model: Category, as: 'category' },
+    { model: Department, as: 'department' },
+    { model: EquipmentStatus, as: 'equipmentStatus' },
+    { model: Employee, as: 'owner', include: [{ model: Department, as: 'department' }] },
+    {
+      model: BorrowRecord,
+      as: 'openLoan',
+      required: false, // LEFT JOIN - a `where` on an include defaults to
+      // required: true (INNER JOIN) otherwise, which would silently drop
+      // every equipment row with no open loan, i.e. most of them.
+      where: { return_date: null },
+      include: [{ model: Employee, as: 'borrower' }],
+    },
+  ];
+}
+
+// Flattens the nested association data Sequelize returns back into the
+// same flat field names (owner_name, current_borrow_id, ...) the API
+// contract has always used - so callers of findAll()/findById() see no
+// difference beyond the date-format change noted above.
+function shapeEquipmentRow(instance) {
+  const { category, department, equipmentStatus, owner, openLoan, ...rest } = instance.get({ plain: true });
+  const ownerDepartment = owner && owner.department;
+
+  return {
+    ...rest,
+    category_name: category ? category.category_name : null,
+    department_code: department ? department.department_code : null,
+    department_name: department ? department.department_name : null,
+    status_name: equipmentStatus ? equipmentStatus.status_name : null,
+    is_assignable: equipmentStatus ? equipmentStatus.is_assignable : null,
+    is_borrowable: equipmentStatus ? equipmentStatus.is_borrowable : null,
+    owner_name: owner ? owner.full_name : null,
+    owner_position: owner ? owner.position : null,
+    owner_location: owner ? owner.location : null,
+    owner_staff_code: owner ? owner.staff_code : null,
+    owner_sex: owner ? owner.sex : null,
+    owner_department: ownerDepartment ? ownerDepartment.department_code : null,
+    owner_department_name: ownerDepartment ? ownerDepartment.department_name : null,
+    current_borrow_id: openLoan ? openLoan.borrow_id : null,
+    current_borrower: openLoan && openLoan.borrower ? openLoan.borrower.full_name : null,
+    borrowed_on: openLoan ? openLoan.borrow_date : null,
+    due_back: openLoan ? openLoan.expected_return_date : null,
+  };
+}
+
+// Builds the WHERE clause dynamically from whichever filters were supplied.
+// Conditions on an included association's column use Sequelize's
+// '$alias.column$' syntax rather than a raw string, so nothing is ever
+// concatenated into the query - the same injection-safety the old named
+// replacements gave, just via the ORM's own escaping instead.
+async function findAll(filters = {}) {
+  const { category, unowned, location, department, status, q } = filters;
+
+  const conditions = [];
+
+  // Accepts either ?category=Laptop (name) or ?category_id=5
+  if (category) conditions.push({ '$category.category_name$': category });
+  if (filters.category_id) conditions.push({ category_id: filters.category_id });
+  if (unowned === 'true') conditions.push({ owner_id: null });
+  if (location) conditions.push({ location });
+  if (department) conditions.push({ '$department.department_code$': department });
+  if (filters.department_id) conditions.push({ department_id: filters.department_id });
+  // Accepts either ?status=Working - IT Stock (name) or ?status_id=2
+  if (status) conditions.push({ '$equipmentStatus.status_name$': status });
+  if (filters.status_id) conditions.push({ status_id: filters.status_id });
+  if (q) {
+    // device_name and serial_no matter as much as computer_name/service_tag -
+    // a server row typically has device_name set and computer_name null, the
+    // opposite of a laptop, so leaving either out silently misses whichever
+    // category relies on it.
+    const like = { [Op.like]: `%${q}%` };
+    conditions.push({
+      [Op.or]: [
+        { computer_name: like },
+        { device_name: like },
+        { device_model: like },
+        { asset_code: like },
+        { serial_no: like },
+        { service_tag: like },
+        { mac_address: like },
+        { ip_address: like },
+        { manufacturer: like },
+        { '$owner.full_name$': like },
+      ],
+    });
+  }
+
+  const rows = await Equipment.findAll({
+    where: conditions.length ? { [Op.and]: conditions } : undefined,
+    include: equipmentIncludes(),
+    order: [[{ model: Category, as: 'category' }, 'category_name', 'ASC'], ['equipment_id', 'ASC']],
+  });
+  return rows.map(shapeEquipmentRow);
+}
+
+async function findById(id) {
+  const row = await Equipment.findByPk(id, { include: equipmentIncludes() });
+  return row ? shapeEquipmentRow(row) : null;
+}
+
+// Used by every function below - these are all still raw sequelize.query()
+// (see the comment above findAll for why), where an unmapped DATE column
+// still comes back as a string and needs converting back to a Date object
+// to match their existing behavior. Only findAll/findById went through the
+// ORM-association rewrite and dropped this - everything below is unchanged.
+const DATE_FIELDS = ['purchase_date', 'received_date', 'assigned_date'];
 function fixDates(row) {
   if (!row) return row;
   for (const f of DATE_FIELDS) {
     if (row[f]) row[f] = new Date(row[f]);
   }
   return row;
-}
-
-// Builds the WHERE clause dynamically from whichever filters were supplied.
-// Every value goes through a named replacement so nothing is ever string-
-// concatenated into the SQL - that's what keeps this safe from injection.
-async function findAll(filters = {}) {
-  const { category, unowned, location, department, status, q } = filters;
-
-  let query = `
-    SELECT e.*,
-           c.category_name,
-           d.department_code,
-           d.department_name,
-           st.status_name,
-           st.is_assignable,
-           st.is_borrowable,
-           emp.full_name  AS owner_name,
-           emp.position   AS owner_position,
-           emp.location   AS owner_location,
-           emp.staff_code AS owner_staff_code,
-           emp.sex        AS owner_sex,
-           empd.department_code AS owner_department,
-           empd.department_name AS owner_department_name,
-           loan.borrow_id            AS current_borrow_id,
-           br.full_name              AS current_borrower,
-           loan.borrow_date          AS borrowed_on,
-           loan.expected_return_date AS due_back
-    FROM dbo.equipment e
-    LEFT JOIN dbo.category c ON e.category_id = c.category_id
-    LEFT JOIN dbo.department d ON e.department_id = d.department_id
-    LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-    LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-    LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-    OUTER APPLY (
-      SELECT TOP 1 b.borrow_id, b.borrow_date, b.expected_return_date, b.borrower_id
-      FROM dbo.borrow_record b
-      WHERE b.equipment_id = e.equipment_id AND b.return_date IS NULL
-      ORDER BY b.borrow_date DESC
-    ) AS loan
-    LEFT JOIN dbo.employee br ON loan.borrower_id = br.employee_id
-    WHERE 1=1
-  `;
-  const replacements = {};
-
-  // Accepts either ?category=Laptop (name) or ?category_id=5
-  if (category) {
-    query += ' AND c.category_name = :category';
-    replacements.category = category;
-  }
-  if (filters.category_id) {
-    query += ' AND e.category_id = :category_id';
-    replacements.category_id = filters.category_id;
-  }
-  if (unowned === 'true') {
-    query += ' AND e.owner_id IS NULL';
-  }
-  if (location) {
-    query += ' AND e.location = :location';
-    replacements.location = location;
-  }
-  if (department) {
-    query += ' AND d.department_code = :department';
-    replacements.department = department;
-  }
-  if (filters.department_id) {
-    query += ' AND e.department_id = :department_id';
-    replacements.department_id = filters.department_id;
-  }
-  // Accepts either ?status=Working - IT Stock (name) or ?status_id=2
-  if (status) {
-    query += ' AND st.status_name = :status';
-    replacements.status = status;
-  }
-  if (filters.status_id) {
-    query += ' AND e.status_id = :status_id';
-    replacements.status_id = filters.status_id;
-  }
-  if (q) {
-    // device_name and serial_no matter as much as computer_name/service_tag -
-    // a server row typically has device_name set and computer_name null, the
-    // opposite of a laptop, so leaving either out silently misses whichever
-    // category relies on it.
-    query += ` AND (
-      e.computer_name  LIKE :q OR
-      e.device_name    LIKE :q OR
-      e.device_model   LIKE :q OR
-      e.asset_code LIKE :q OR
-      e.serial_no      LIKE :q OR
-      e.service_tag    LIKE :q OR
-      e.mac_address    LIKE :q OR
-      e.ip_address     LIKE :q OR
-      e.manufacturer   LIKE :q OR
-      emp.full_name    LIKE :q
-    )`;
-    replacements.q = `%${q}%`;
-  }
-
-  query += ' ORDER BY c.category_name, e.equipment_id';
-
-  const rows = await sequelize.query(query, { replacements, type: QueryTypes.SELECT });
-  return rows.map(fixDates);
-}
-
-async function findById(id) {
-  const rows = await sequelize.query(`
-      SELECT e.*,
-             c.category_name,
-             d.department_code,
-             d.department_name,
-             st.status_name,
-             st.is_assignable,
-             st.is_borrowable,
-             emp.full_name  AS owner_name,
-             emp.position   AS owner_position,
-             emp.location   AS owner_location,
-             emp.staff_code AS owner_staff_code,
-             emp.sex        AS owner_sex,
-             empd.department_code AS owner_department,
-             empd.department_name AS owner_department_name,
-             loan.borrow_id            AS current_borrow_id,
-             br.full_name              AS current_borrower,
-             loan.borrow_date          AS borrowed_on,
-             loan.expected_return_date AS due_back
-      FROM dbo.equipment e
-      LEFT JOIN dbo.category c ON e.category_id = c.category_id
-      LEFT JOIN dbo.department d ON e.department_id = d.department_id
-      LEFT JOIN dbo.equipment_status st ON e.status_id = st.status_id
-      LEFT JOIN dbo.employee emp ON e.owner_id = emp.employee_id
-      LEFT JOIN dbo.department empd ON emp.department_id = empd.department_id
-      OUTER APPLY (
-        SELECT TOP 1 b.borrow_id, b.borrow_date, b.expected_return_date, b.borrower_id
-        FROM dbo.borrow_record b
-        WHERE b.equipment_id = e.equipment_id AND b.return_date IS NULL
-        ORDER BY b.borrow_date DESC
-      ) AS loan
-      LEFT JOIN dbo.employee br ON loan.borrower_id = br.employee_id
-      WHERE e.equipment_id = :id
-    `, { replacements: { id }, type: QueryTypes.SELECT });
-  return fixDates(rows[0]) || null;
 }
 
 async function getCategorySummary() {

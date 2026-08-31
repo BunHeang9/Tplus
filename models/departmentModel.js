@@ -109,4 +109,8 @@ async function remove(id, actor) {
   });
 }
 
-module.exports = { findAll, findById, findByCode, create, update, countUsage, remove };
+module.exports = {
+  Department, // exported so equipmentModel.js can build associations against
+  // this same table definition rather than defining it twice.
+  findAll, findById, findByCode, create, update, countUsage, remove,
+};

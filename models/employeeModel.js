@@ -354,6 +354,8 @@ async function remove(id, fullName, actor) {
 }
 
 module.exports = {
+  Employee, // exported so equipmentModel.js can build associations against
+  // this same table definition rather than defining it twice.
   findAll,
   findAllWithEquipment,
   countReferences,

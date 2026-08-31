@@ -130,6 +130,8 @@ async function remove(id) {
 }
 
 module.exports = {
+  EquipmentStatus, // exported so equipmentModel.js can build associations
+  // against this same table definition rather than defining it twice.
   findAll,
   findById,
   findByName,
