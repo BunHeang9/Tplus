@@ -1,5 +1,8 @@
+const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { Equipment } = require('./equipmentModel');
+const { Employee } = require('./employeeModel');
 
 // The capacity-planning calculation sheet ("Plan optimize"): Total Capacity
 // vs Usage, one row per server. This is deliberately separate from "server"
@@ -14,10 +17,28 @@ const { QueryTypes } = require('sequelize');
 // plan_date and the reducing/after-reducing columns were dropped - no
 // longer tracked here.
 //
+// Not required by equipmentModel.js, so (like borrowModel.js/
+// softwareLicenseModel.js) it's safe for this file to import Equipment and
+// build an association onto it.
+const ServerUsage = sequelize.define('ServerUsage', {
+  usage_id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
+  equipment_id: { type: DataTypes.INTEGER, allowNull: false },
+  cpu_usage_pct: { type: DataTypes.STRING(10), allowNull: true },
+  memory_usage_pct: { type: DataTypes.STRING(10), allowNull: true },
+  hdd_usage_gb: { type: DataTypes.DECIMAL, allowNull: true },
+  remark: { type: DataTypes.STRING(255), allowNull: true },
+  due_date: { type: DataTypes.DATEONLY, allowNull: true },
+}, {
+  tableName: 'server_usage',
+  schema: 'dbo',
+  timestamps: false,
+});
+
+ServerUsage.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
+
 // upsertServerUsage's MERGE with COALESCE-per-field doesn't map onto
 // Sequelize's upsert() (which would null out any field left unprovided,
-// not keep the existing value) - raw queries throughout this file rather
-// than a half-ORM, half-raw model for the sake of consistency.
+// not keep the existing value), so that one stays a raw query.
 
 const DATE_FIELDS = ['due_date'];
 
@@ -34,28 +55,42 @@ function fixDates(row) {
 }
 
 async function getServerUsage() {
-  const rows = await sequelize.query(`
-    SELECT
-      su.usage_id,
-      su.equipment_id,
-      e.device_name,
-      e.ip_address,
-      e.owner_id,
-      emp.full_name AS owner_name,
-      su.due_date,
-      TRY_CAST(e.cpu AS INT) AS cpu_core_total,
-      TRY_CAST(e.ram AS INT) AS memory_gb_total,
-      TRY_CAST(e.hd  AS INT) AS hdd_gb_total,
-      su.cpu_usage_pct,
-      su.memory_usage_pct,
-      su.hdd_usage_gb,
-      su.remark
-    FROM dbo.server_usage su
-    LEFT JOIN dbo.equipment e   ON su.equipment_id = e.equipment_id
-    LEFT JOIN dbo.employee emp  ON e.owner_id = emp.employee_id
-    ORDER BY e.device_name, su.usage_id
-  `, { type: QueryTypes.SELECT });
-  return rows.map(fixDates);
+  const rows = await ServerUsage.findAll({
+    include: [{
+      model: Equipment, as: 'equipment', required: false,
+      attributes: [
+        'device_name', 'ip_address', 'owner_id',
+        [sequelize.literal('TRY_CAST(equipment.cpu AS INT)'), 'cpu_core_total'],
+        [sequelize.literal('TRY_CAST(equipment.ram AS INT)'), 'memory_gb_total'],
+        [sequelize.literal('TRY_CAST(equipment.hd AS INT)'), 'hdd_gb_total'],
+      ],
+      include: [{ model: Employee, as: 'owner', attributes: ['full_name'], required: false }],
+    }],
+    order: [
+      [{ model: Equipment, as: 'equipment' }, 'device_name', 'ASC'],
+      ['usage_id', 'ASC'],
+    ],
+  });
+
+  return rows.map((row) => {
+    const { equipment, ...su } = row.get({ plain: true });
+    return fixDates({
+      usage_id: su.usage_id,
+      equipment_id: su.equipment_id,
+      device_name: equipment ? equipment.device_name : null,
+      ip_address: equipment ? equipment.ip_address : null,
+      owner_id: equipment ? equipment.owner_id : null,
+      owner_name: equipment && equipment.owner ? equipment.owner.full_name : null,
+      due_date: su.due_date,
+      cpu_core_total: equipment ? equipment.cpu_core_total : null,
+      memory_gb_total: equipment ? equipment.memory_gb_total : null,
+      hdd_gb_total: equipment ? equipment.hdd_gb_total : null,
+      cpu_usage_pct: su.cpu_usage_pct,
+      memory_usage_pct: su.memory_usage_pct,
+      hdd_usage_gb: su.hdd_usage_gb,
+      remark: su.remark,
+    });
+  });
 }
 
 // Sets the calculation fields for one equipment - MERGE so an
@@ -96,12 +131,13 @@ async function upsertServerUsage(equipmentId, d) {
   return fixDates(row);
 }
 
+// Sequelize's destroy() doesn't return the deleted row - fetch first so the
+// caller still gets back what was removed.
 async function removeServerUsage(usageId) {
-  const [row] = await sequelize.query(
-    'DELETE FROM dbo.server_usage OUTPUT DELETED.* WHERE usage_id = :id',
-    { replacements: { id: usageId }, type: QueryTypes.SELECT },
-  );
-  return fixDates(row) || null;
+  const row = await ServerUsage.findByPk(usageId, { raw: true });
+  if (!row) return null;
+  await ServerUsage.destroy({ where: { usage_id: usageId } });
+  return fixDates(row);
 }
 
 module.exports = { getServerUsage, upsertServerUsage, removeServerUsage };
