@@ -1,6 +1,5 @@
 const { DataTypes } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 const { Category } = require('./categoryModel');
 
 // Which columns each category's view shows (dbo.category_view_column).
@@ -90,23 +89,29 @@ const DERIVED_FIELDS = [
 // up on its own - no entry needed.
 
 // Every field an admin can choose from, read live from the schema so a column
-// added later shows up without touching this file. INFORMATION_SCHEMA
-// introspection - raw query, not something an ORM model represents.
-async function getAvailableFields() {
-  const cols = await sequelize.query(`
-    SELECT COLUMN_NAME, DATA_TYPE
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo'
-    ORDER BY ORDINAL_POSITION
-  `, { type: QueryTypes.SELECT });
+// added later shows up without touching this file. No Sequelize model maps
+// 1:1 onto "every column of an arbitrary table" the way describeTable() does,
+// so this uses that Sequelize QueryInterface API (introspection through the
+// ORM, not a hand-written SELECT) rather than INFORMATION_SCHEMA directly.
+// describeTable()'s key order matches ORDINAL_POSITION (confirmed live,
+// same as partStockColumnModel.js's twin of this function), and its "type"
+// comes back as e.g. "NVARCHAR(150)" where the old INFORMATION_SCHEMA.
+// DATA_TYPE gave "nvarchar" - normalized (strip length/precision, lowercase)
+// to keep the same data_type strings any existing caller already depends on.
+async function describeEquipmentColumns() {
+  return sequelize.getQueryInterface().describeTable({ tableName: 'equipment', schema: 'dbo' });
+}
 
-  const direct = cols
-    .filter((c) => !HIDDEN_FROM_PICKER.has(c.COLUMN_NAME))
-    .map((c) => ({
-      field: c.COLUMN_NAME,
-      suggested_header: SUGGESTED_HEADERS[c.COLUMN_NAME]
-        || c.COLUMN_NAME.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()),
-      data_type: c.DATA_TYPE,
+async function getAvailableFields() {
+  const desc = await describeEquipmentColumns();
+
+  const direct = Object.keys(desc)
+    .filter((name) => !HIDDEN_FROM_PICKER.has(name))
+    .map((name) => ({
+      field: name,
+      suggested_header: SUGGESTED_HEADERS[name]
+        || name.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()),
+      data_type: desc[name].type.split('(')[0].toLowerCase(),
       source: 'equipment',
     }));
 
@@ -118,11 +123,8 @@ async function getAvailableFields() {
 async function isValidField(fieldName) {
   if (DERIVED_FIELDS.some((f) => f.field === fieldName)) return true;
 
-  const [row] = await sequelize.query(`
-    SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'equipment' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME = :field
-  `, { replacements: { field: fieldName }, type: QueryTypes.SELECT });
-  return !!row;
+  const desc = await describeEquipmentColumns();
+  return Object.prototype.hasOwnProperty.call(desc, fieldName);
 }
 
 async function findByCategory(categoryId) {
