@@ -1,6 +1,5 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Reference table: dbo.department
 // Departments used to be free text on employee/equipment; they now live
@@ -20,16 +19,52 @@ const Department = sequelize.define('Department', {
   timestamps: false,
 });
 
-// Two correlated subqueries (employee_count, equipment_count) - reporting
-// read, raw query through Sequelize rather than .findAll().
+// employee_count/equipment_count come from two other tables, which would
+// normally mean Department needs Employee/Equipment associations - but
+// equipmentModel.js/employeeModel.js already import Department from this
+// file at their own top level (to build their own belongsTo), so this file
+// requiring either of them back at ITS top level would be a real require
+// cycle. The fix isn't "stay raw forever" though: both requires below are
+// lazy (inside the function body, evaluated only when the function actually
+// runs) - by the time any request handler calls findAll(), the whole app
+// has already finished starting up and every model file has already loaded
+// once, so the require just returns the cached, fully-built module. Same
+// technique already used by customFieldModel.js/partModel.js for the same
+// kind of cycle.
+//
+// Two separate GROUP BY aggregates merged in JS, not one query joining both
+// Employee and Equipment at once - joining both together on the same
+// department would fan out (a department with 3 employees and 5 equipment
+// becomes 15 joined rows before any COUNT), corrupting both counts.
 async function findAll() {
-  return sequelize.query(`
-    SELECT d.department_id, d.department_code, d.department_name, d.is_active,
-           (SELECT COUNT(*) FROM dbo.employee  e WHERE e.department_id = d.department_id) AS employee_count,
-           (SELECT COUNT(*) FROM dbo.equipment q WHERE q.department_id = d.department_id) AS equipment_count
-    FROM dbo.department d
-    ORDER BY d.department_code
-  `, { type: QueryTypes.SELECT });
+  const { Employee } = require('./employeeModel');
+  const { Equipment } = require('./equipmentModel');
+
+  const [employeeCounts, equipmentCounts, departments] = await Promise.all([
+    Employee.findAll({
+      attributes: ['department_id', [fn('COUNT', col('employee_id')), 'n']],
+      group: ['department_id'],
+      raw: true,
+    }),
+    Equipment.findAll({
+      attributes: ['department_id', [fn('COUNT', col('equipment_id')), 'n']],
+      group: ['department_id'],
+      raw: true,
+    }),
+    Department.findAll({ order: [['department_code', 'ASC']], raw: true }),
+  ]);
+
+  const employeeCountByDept = new Map(employeeCounts.map((r) => [r.department_id, r.n]));
+  const equipmentCountByDept = new Map(equipmentCounts.map((r) => [r.department_id, r.n]));
+
+  return departments.map((d) => ({
+    department_id: d.department_id,
+    department_code: d.department_code,
+    department_name: d.department_name,
+    is_active: d.is_active,
+    employee_count: employeeCountByDept.get(d.department_id) || 0,
+    equipment_count: equipmentCountByDept.get(d.department_id) || 0,
+  }));
 }
 
 async function findById(id) {
@@ -65,13 +100,16 @@ async function update(id, { department_code, department_name, is_active }) {
 
 // Refuses to delete a department that is still referenced, so we never
 // leave employees or equipment pointing at a row that no longer exists.
+// Same lazy-require reasoning as findAll() above.
 async function countUsage(id) {
-  const [row] = await sequelize.query(`
-    SELECT
-      (SELECT COUNT(*) FROM dbo.employee  WHERE department_id = :id) AS employee_count,
-      (SELECT COUNT(*) FROM dbo.equipment WHERE department_id = :id) AS equipment_count
-  `, { replacements: { id }, type: QueryTypes.SELECT });
-  return row;
+  const { Employee } = require('./employeeModel');
+  const { Equipment } = require('./equipmentModel');
+
+  const [employee_count, equipment_count] = await Promise.all([
+    Employee.count({ where: { department_id: id } }),
+    Equipment.count({ where: { department_id: id } }),
+  ]);
+  return { employee_count, equipment_count };
 }
 
 // Captures the row into the recycle bin before removing it, both in one
