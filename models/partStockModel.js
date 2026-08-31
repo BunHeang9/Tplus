@@ -62,10 +62,14 @@ PartStock.belongsTo(PartType, { foreignKey: 'part_type_id', as: 'partType' });
 // Working and broken are separate lines of the same part, so a faulty module
 // is never offered for fitting.
 
-// The only two states a spare part can be in on the shelf. Equipment has more
-// (Installed, Borrowed, Working/Using...) because a device is in active
-// service; a loose part sitting in a box either still works or it doesn't.
-const STATUSES = ['Working - IT Stock', 'Broken - IT Stock'];
+// A spare part is usually just "on the shelf, working" or "on the shelf,
+// broken" - but a part removed from one device sometimes already has a
+// destination (going straight into a different device) rather than
+// actually sitting in stock waiting to be picked. 'Working/Using' is for
+// that case: still good, just not idle shelf stock - findAvailable()
+// correctly leaves it out of what can be freely fitted, the same way it
+// already excludes 'Broken - IT Stock'.
+const STATUSES = ['Working - IT Stock', 'Broken - IT Stock', 'Working/Using'];
 
 // Raw queries with no model attribute definition return a plain string for a
 // DATETIME column; the driver this replaces returned a Date object for the
