@@ -1,6 +1,7 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
+const { PartStock } = require('./partStockModel');
 
 // Custom fields for part types (e.g. Battery -> "Color", "Serial Number"),
 // shown when adding/editing a part_stock line.
@@ -44,6 +45,23 @@ const PartTypeCustomField = sequelize.define('PartTypeCustomField', {
 });
 
 PartTypeCustomField.belongsTo(PartCustomField, { foreignKey: 'field_id', as: 'field' });
+PartCustomField.hasMany(PartTypeCustomField, { foreignKey: 'field_id', as: 'partTypeLinks' });
+
+// dbo.part_stock_custom_value's own values (per stock line, not per part
+// type) - not modeled here as a Sequelize class since only its aggregate
+// count is ever needed (countValuesForPartType); getValues/getValuesForMany/
+// setValues below stay raw regardless.
+const PartStockCustomValue = sequelize.define('PartStockCustomValue', {
+  stock_id: { type: DataTypes.INTEGER, primaryKey: true },
+  field_id: { type: DataTypes.INTEGER, primaryKey: true },
+  field_value: { type: DataTypes.STRING(500), allowNull: true },
+  updated_at: { type: DataTypes.DATE, allowNull: true },
+}, {
+  tableName: 'part_stock_custom_value',
+  schema: 'dbo',
+  timestamps: false,
+});
+PartStockCustomValue.belongsTo(PartStock, { foreignKey: 'stock_id', as: 'stock' });
 
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
@@ -61,14 +79,20 @@ function toKey(label) {
 // Every field that exists, with how many part types use it. Feeds the
 // picker, so an admin can reuse a field rather than recreating it.
 async function findAll() {
-  return sequelize.query(`
-    SELECT f.field_id, f.field_key, f.field_label, f.field_type,
-           f.created_at, f.created_by,
-           (SELECT COUNT(*) FROM dbo.part_type_custom_field tf
-             WHERE tf.field_id = f.field_id) AS used_by_part_types
-    FROM dbo.part_custom_field f
-    ORDER BY f.field_label
-  `, { type: QueryTypes.SELECT });
+  return PartCustomField.findAll({
+    attributes: [
+      'field_id', 'field_key', 'field_label', 'field_type', 'created_at', 'created_by',
+      [fn('COUNT', col('partTypeLinks.field_id')), 'used_by_part_types'],
+    ],
+    include: [{ model: PartTypeCustomField, as: 'partTypeLinks', attributes: [] }],
+    group: [
+      'PartCustomField.field_id', 'PartCustomField.field_key', 'PartCustomField.field_label',
+      'PartCustomField.field_type', 'PartCustomField.created_at', 'PartCustomField.created_by',
+    ],
+    order: [['field_label', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
 }
 
 async function findById(fieldId) {
@@ -106,13 +130,11 @@ async function update(fieldId, { fieldLabel, fieldType }) {
 // Deleting a shared field affects every part type using it, so the caller
 // needs to know the scale before confirming.
 async function countUsage(fieldId) {
-  const [row] = await sequelize.query(`
-    SELECT
-      (SELECT COUNT(*) FROM dbo.part_type_custom_field WHERE field_id = :id) AS part_type_count,
-      (SELECT COUNT(*) FROM dbo.part_stock_custom_value
-        WHERE field_id = :id AND field_value IS NOT NULL) AS value_count
-  `, { replacements: { id: fieldId }, type: QueryTypes.SELECT });
-  return row;
+  const [part_type_count, value_count] = await Promise.all([
+    PartTypeCustomField.count({ where: { field_id: fieldId } }),
+    PartStockCustomValue.count({ where: { field_id: fieldId, field_value: { [Op.ne]: null } } }),
+  ]);
+  return { part_type_count, value_count };
 }
 
 // Sequelize's destroy() doesn't return the deleted row - fetch first so the
@@ -150,19 +172,25 @@ async function findByPartType(partTypeId) {
 async function findByPartTypes(partTypeIds) {
   if (!partTypeIds || partTypeIds.length === 0) return {};
 
-  const rows = await sequelize.query(`
-    SELECT tf.part_type_id, f.field_id, f.field_key, f.field_label, f.field_type,
-           tf.sort_order, tf.is_required
-    FROM dbo.part_type_custom_field tf
-    JOIN dbo.part_custom_field f ON tf.field_id = f.field_id
-    WHERE tf.part_type_id IN (:ids)
-    ORDER BY tf.sort_order, f.field_id
-  `, { replacements: { ids: partTypeIds }, type: QueryTypes.SELECT });
+  const rows = await PartTypeCustomField.findAll({
+    where: { part_type_id: { [Op.in]: partTypeIds } },
+    include: [{ model: PartCustomField, as: 'field', required: true }],
+    order: [['sort_order', 'ASC'], [{ model: PartCustomField, as: 'field' }, 'field_id', 'ASC']],
+  });
 
   const byPartType = {};
   for (const row of rows) {
-    if (!byPartType[row.part_type_id]) byPartType[row.part_type_id] = [];
-    byPartType[row.part_type_id].push(row);
+    const { field, part_type_id, sort_order, is_required } = row.get({ plain: true });
+    if (!byPartType[part_type_id]) byPartType[part_type_id] = [];
+    byPartType[part_type_id].push({
+      part_type_id,
+      field_id: field.field_id,
+      field_key: field.field_key,
+      field_label: field.field_label,
+      field_type: field.field_type,
+      sort_order,
+      is_required,
+    });
   }
   return byPartType;
 }
@@ -198,14 +226,10 @@ async function detachFromPartType(partTypeId, fieldId) {
 }
 
 async function countValuesForPartType(partTypeId, fieldId) {
-  const [row] = await sequelize.query(`
-    SELECT COUNT(*) AS value_count
-    FROM dbo.part_stock_custom_value v
-    JOIN dbo.part_stock s ON v.stock_id = s.stock_id
-    WHERE v.field_id = :field_id AND s.part_type_id = :part_type_id
-      AND v.field_value IS NOT NULL
-  `, { replacements: { part_type_id: partTypeId, field_id: fieldId }, type: QueryTypes.SELECT });
-  return row.value_count;
+  return PartStockCustomValue.count({
+    where: { field_id: fieldId, field_value: { [Op.ne]: null } },
+    include: [{ model: PartStock, as: 'stock', attributes: [], where: { part_type_id: partTypeId }, required: true }],
+  });
 }
 
 // --- values ---
