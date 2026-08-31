@@ -77,6 +77,40 @@ function statusCaseSql(licenseTypeCol, dateExpireCol) {
       END`;
 }
 
+// The DB server's own clock, not a JS Date() - matches partBorrowModel.js's
+// own justified today's-date fetch (no table involved at all, so there is
+// nothing for an ORM model to read this through) rather than risking a
+// timezone/clock-skew mismatch between this app server and the database.
+async function getServerToday(transaction) {
+  const [{ today }] = await sequelize.query(
+    'SELECT CAST(GETDATE() AS DATE) AS today', { type: QueryTypes.SELECT, transaction },
+  );
+  return today; // 'YYYY-MM-DD'
+}
+
+function addMonthsToIsoDate(isoDate, months) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1 + months, d)).toISOString().slice(0, 10);
+}
+
+// JS mirror of statusCaseSql() above, for createLicense()/updateLicense()
+// below - one rule expressed twice (SQL for reads, JS for these two writes)
+// rather than the three separate copies the original had (statusCaseSql()
+// for reads, plus a duplicated inline CASE in each of createLicense's INSERT
+// and updateLicense's UPDATE). `today` must be a 'YYYY-MM-DD' string from
+// getServerToday() above, compared lexicographically exactly the way SQL
+// Server's own DATE comparison would (ISO dates sort the same both ways).
+function computeStatus(licenseType, dateExpire, today) {
+  if (licenseType === 'Free' || licenseType === 'Perpetual') return 'active';
+  if (licenseType === 'Annual Subscription') {
+    if (!dateExpire) return 'unknown';
+    if (dateExpire < today) return 'expired';
+    if (dateExpire <= addMonthsToIsoDate(today, 1)) return 'near expire';
+    return 'active';
+  }
+  return 'unknown';
+}
+
 // Raw queries with no model attribute definition return a plain 'YYYY-MM-DD'
 // string for a DATE column; the driver this replaces returned a Date object
 // for the same column. Converting back keeps every response identical to
@@ -179,30 +213,31 @@ async function getLicenseEquipment(licenseId) {
 
 // Adds a licence to a device, leaving any others in place.
 //
-// MERGE rather than INSERT so assigning the same licence twice updates the
-// install date instead of failing on the primary key - a frontend that
-// re-submits a form should not produce an error. COALESCE-per-field on the
-// UPDATE branch, not a real upsert, so this stays a raw query rather than
-// Sequelize's upsert() (which would overwrite rather than merge).
+// Assigning the same licence twice updates the install date instead of
+// failing on the primary key - a frontend that re-submits a form should not
+// produce an error. The MERGE's COALESCE-per-field UPDATE branch (keep
+// whatever wasn't supplied) is an explicit lookup chain here instead - same
+// pattern as customFieldModel.setValues() and its siblings elsewhere in
+// this migration - rather than Sequelize's upsert() (which would overwrite
+// rather than merge).
 async function assignLicenseToEquipment(equipmentId, licenseId, { installedDate, remark } = {}) {
-  await sequelize.query(`
-      MERGE dbo.equipment_software_license AS target
-      USING (SELECT :equipment_id AS equipment_id, :license_id AS license_id) AS source
-      ON target.equipment_id = source.equipment_id AND target.license_id = source.license_id
-      WHEN MATCHED THEN
-        UPDATE SET installed_date = COALESCE(:installed_date, target.installed_date),
-                   remark = COALESCE(:remark, target.remark)
-      WHEN NOT MATCHED THEN
-        INSERT (equipment_id, license_id, installed_date, remark)
-        VALUES (:equipment_id, :license_id, :installed_date, :remark);
-    `, {
-    replacements: {
+  const existing = await EquipmentSoftwareLicense.findOne({
+    where: { equipment_id: equipmentId, license_id: licenseId },
+  });
+
+  if (existing) {
+    const values = {};
+    if (installedDate) values.installed_date = installedDate;
+    if (remark) values.remark = remark;
+    if (Object.keys(values).length > 0) await existing.update(values);
+  } else {
+    await EquipmentSoftwareLicense.create({
       equipment_id: equipmentId,
       license_id: licenseId,
       installed_date: installedDate || null,
       remark: remark || null,
-    },
-  });
+    });
+  }
 
   return getEquipmentLicenses(equipmentId);
 }
@@ -296,10 +331,9 @@ async function findLicenseById(licenseId) {
 // STATUS_CASE every other query here uses, so this can never disagree with
 // what the license list shows for the same row.
 //
-// Still a raw query, not Sequelize .create(): status is computed by a SQL
-// CASE against GETDATE() at insert time, same as STATUS_CASE everywhere
-// else in this file - reimplementing that date math in JS would risk a
-// subtle mismatch with what every read query here calculates.
+// status is computed via computeStatus() above (the same rule statusCaseSql()
+// expresses in SQL for every read in this file) against the DB server's own
+// clock (getServerToday()), not a JS Date() - see the comments on both.
 async function createLicense(data) {
   const { product_name, product_type, license_type, date_start, date_expire, remark } = data;
 
@@ -314,78 +348,66 @@ async function createLicense(data) {
     throw new Error('date_expire is required for Annual Subscription licenses');
   }
 
-  const [row] = await sequelize.query(`
-      INSERT INTO dbo.software_license (product_name, product_type, license_type, date_start, date_expire, status, remark)
-      OUTPUT INSERTED.license_id, INSERTED.product_name, INSERTED.product_type,
-             INSERTED.license_type, INSERTED.date_start, INSERTED.date_expire, INSERTED.remark, INSERTED.status
-      VALUES (
-        :product_name, :product_type, :license_type, :date_start, :date_expire,
-        CASE
-          WHEN :license_type IN ('Free', 'Perpetual') THEN 'active'
-          WHEN :license_type = 'Annual Subscription' THEN
-            CASE
-              WHEN :date_expire IS NULL THEN 'unknown'
-              WHEN :date_expire < CAST(GETDATE() AS DATE) THEN 'expired'
-              WHEN :date_expire <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
-              ELSE 'active'
-            END
-          ELSE 'unknown'
-        END,
-        :remark
-      )
-    `, {
-    replacements: {
-      product_name,
-      product_type: product_type || null,
-      license_type,
-      date_start: date_start || null,
-      date_expire: date_expire || null,
-      remark: remark || null,
-    },
-    type: QueryTypes.SELECT,
+  const today = await getServerToday();
+  const row = await SoftwareLicense.create({
+    product_name,
+    product_type: product_type || null,
+    license_type,
+    date_start: date_start || null,
+    date_expire: date_expire || null,
+    status: computeStatus(license_type, date_expire || null, today),
+    remark: remark || null,
   });
-  return fixDates(row);
+  const plain = row.get({ plain: true });
+  // The original OUTPUT INSERTED column list was an explicit subset in a
+  // specific order, not INSERTED.* - reconstructed here rather than relying
+  // on either physical-column order or .create()'s own key order.
+  return fixDates({
+    license_id: plain.license_id,
+    product_name: plain.product_name,
+    product_type: plain.product_type,
+    license_type: plain.license_type,
+    date_start: plain.date_start,
+    date_expire: plain.date_expire,
+    remark: plain.remark,
+    status: plain.status,
+  });
 }
 
 // Partial update - COALESCE keeps existing values for anything not supplied.
-// Status is always recomputed from license_type and dates, never set directly.
-// Raw query for the same reason as createLicense above.
+// Status is always recomputed from license_type and dates, never set
+// directly, via computeStatus() (see createLicense() above for why).
 async function updateLicense(id, data) {
-  const [row] = await sequelize.query(`
-      UPDATE dbo.software_license
-      SET product_name = COALESCE(:product_name, product_name),
-          product_type = COALESCE(:product_type, product_type),
-          license_type = COALESCE(:license_type, license_type),
-          date_start   = COALESCE(:date_start, date_start),
-          date_expire  = COALESCE(:date_expire, date_expire),
-          remark       = COALESCE(:remark, remark),
-          status = CASE
-            WHEN COALESCE(:license_type, license_type) IN ('Free', 'Perpetual') THEN 'active'
-            WHEN COALESCE(:license_type, license_type) = 'Annual Subscription' THEN
-              CASE
-                WHEN COALESCE(:date_expire, date_expire) IS NULL THEN 'unknown'
-                WHEN COALESCE(:date_expire, date_expire) < CAST(GETDATE() AS DATE) THEN 'expired'
-                WHEN COALESCE(:date_expire, date_expire) <= DATEADD(MONTH, 1, CAST(GETDATE() AS DATE)) THEN 'near expire'
-                ELSE 'active'
-              END
-            ELSE 'unknown'
-          END
-      OUTPUT INSERTED.license_id, INSERTED.product_name, INSERTED.product_type,
-             INSERTED.license_type, INSERTED.date_start, INSERTED.date_expire, INSERTED.remark, INSERTED.status
-      WHERE license_id = :id
-    `, {
-    replacements: {
-      id,
-      product_name: data.product_name || null,
-      product_type: data.product_type || null,
-      license_type: data.license_type || null,
-      date_start: data.date_start || null,
-      date_expire: data.date_expire || null,
-      remark: data.remark || null,
-    },
-    type: QueryTypes.SELECT,
+  const existing = await SoftwareLicense.findByPk(id, { raw: true });
+  if (!existing) return null;
+
+  const resulting = {
+    product_name: data.product_name || existing.product_name,
+    product_type: data.product_type || existing.product_type,
+    license_type: data.license_type || existing.license_type,
+    date_start: data.date_start || existing.date_start,
+    date_expire: data.date_expire || existing.date_expire,
+    remark: data.remark || existing.remark,
+  };
+
+  const today = await getServerToday();
+  const [, rows] = await SoftwareLicense.update(
+    { ...resulting, status: computeStatus(resulting.license_type, resulting.date_expire, today) },
+    { where: { license_id: id }, returning: true },
+  );
+  const plain = rows && rows[0] ? rows[0].get({ plain: true }) : null;
+  if (!plain) return null;
+  // Same explicit OUTPUT-column-list reconstruction as createLicense() above.
+  return fixDates({
+    license_id: plain.license_id,
+    product_name: plain.product_name,
+    product_type: plain.product_type,
+    license_type: plain.license_type,
+    date_start: plain.date_start,
+    date_expire: plain.date_expire,
+    remark: plain.remark,
+    status: plain.status,
   });
-  return fixDates(row) || null;
 }
 
 // Deletes the license definition itself (not just one device's assignment
@@ -398,12 +420,9 @@ async function removeLicense(id, actor) {
   const recycleBinModel = require('./recycleBinModel');
 
   return sequelize.transaction(async (transaction) => {
-    const [license] = await sequelize.query(
-      'SELECT * FROM dbo.software_license WHERE license_id = :id',
-      { replacements: { id }, type: QueryTypes.SELECT, transaction },
-    );
-    if (!license) return null;
-    fixDates(license);
+    const row = await SoftwareLicense.findByPk(id, { transaction, raw: true });
+    if (!row) return null;
+    const license = fixDates(row);
 
     await recycleBinModel.create(
       {
@@ -417,10 +436,7 @@ async function removeLicense(id, actor) {
       transaction,
     );
 
-    await sequelize.query(
-      'DELETE FROM dbo.software_license WHERE license_id = :id',
-      { replacements: { id }, transaction },
-    );
+    await SoftwareLicense.destroy({ where: { license_id: id }, transaction });
 
     return license;
   });
