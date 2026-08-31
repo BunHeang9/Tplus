@@ -1,4 +1,4 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, fn, col, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
 const { QueryTypes } = require('sequelize');
 
@@ -58,6 +58,15 @@ const EquipmentCustomValue = sequelize.define('EquipmentCustomValue', {
 });
 
 EquipmentCategoryField.belongsTo(EquipmentCustomField, { foreignKey: 'field_id', as: 'field' });
+EquipmentCustomField.hasMany(EquipmentCategoryField, { foreignKey: 'field_id', as: 'categoryLinks' });
+
+// Equipment.remove() only ever requires this file lazily (inside the
+// function body, to dodge a load-time cycle) - never at module top level -
+// so this file importing Equipment here is safe in either load order: by
+// the time anyone actually calls equipmentModel.remove(), both modules are
+// already fully loaded regardless of which one Node reached first.
+const { Equipment } = require('./equipmentModel');
+EquipmentCustomValue.belongsTo(Equipment, { foreignKey: 'equipment_id', as: 'equipment' });
 
 const FIELD_TYPES = ['text', 'number', 'date', 'boolean'];
 
@@ -73,17 +82,22 @@ function toKey(label) {
 // --- definitions ---
 
 // Every field that exists, with how many categories use it. Feeds the picker,
-// so an admin can reuse a field rather than recreating it. Correlated
-// subquery - raw query through Sequelize.
+// so an admin can reuse a field rather than recreating it.
 async function findAll() {
-  return sequelize.query(`
-    SELECT f.field_id, f.field_key, f.field_label, f.field_type,
-           f.created_at, f.created_by,
-           (SELECT COUNT(*) FROM dbo.equipment_category_field cf
-             WHERE cf.field_id = f.field_id) AS used_by_categories
-    FROM dbo.equipment_custom_field f
-    ORDER BY f.field_label
-  `, { type: QueryTypes.SELECT });
+  return EquipmentCustomField.findAll({
+    attributes: [
+      'field_id', 'field_key', 'field_label', 'field_type', 'created_at', 'created_by',
+      [fn('COUNT', col('categoryLinks.field_id')), 'used_by_categories'],
+    ],
+    include: [{ model: EquipmentCategoryField, as: 'categoryLinks', attributes: [] }],
+    group: [
+      'EquipmentCustomField.field_id', 'EquipmentCustomField.field_key', 'EquipmentCustomField.field_label',
+      'EquipmentCustomField.field_type', 'EquipmentCustomField.created_at', 'EquipmentCustomField.created_by',
+    ],
+    order: [['field_label', 'ASC']],
+    subQuery: false,
+    raw: true,
+  });
 }
 
 async function findById(fieldId) {
@@ -119,15 +133,15 @@ async function update(fieldId, { fieldLabel, fieldType }) {
 }
 
 // Deleting a shared field affects every category using it, so the caller needs
-// to know the scale before confirming.
+// to know the scale before confirming. Two independent counts merged in JS
+// rather than one query - same "single-row lookup, not a list" reasoning as
+// borrowModel.findEquipmentForBorrow.
 async function countUsage(fieldId) {
-  const [row] = await sequelize.query(`
-    SELECT
-      (SELECT COUNT(*) FROM dbo.equipment_category_field WHERE field_id = :id) AS category_count,
-      (SELECT COUNT(*) FROM dbo.equipment_custom_value
-        WHERE field_id = :id AND field_value IS NOT NULL) AS value_count
-  `, { replacements: { id: fieldId }, type: QueryTypes.SELECT });
-  return row;
+  const [category_count, value_count] = await Promise.all([
+    EquipmentCategoryField.count({ where: { field_id: fieldId } }),
+    EquipmentCustomValue.count({ where: { field_id: fieldId, field_value: { [Op.ne]: null } } }),
+  ]);
+  return { category_count, value_count };
 }
 
 // Sequelize's destroy() doesn't return the deleted row - fetch first so the
@@ -193,14 +207,10 @@ async function detachFromCategory(categoryId, fieldId) {
 }
 
 async function countValuesInCategory(categoryId, fieldId) {
-  const [row] = await sequelize.query(`
-    SELECT COUNT(*) AS value_count
-    FROM dbo.equipment_custom_value v
-    JOIN dbo.equipment e ON v.equipment_id = e.equipment_id
-    WHERE v.field_id = :field_id AND e.category_id = :category_id
-      AND v.field_value IS NOT NULL
-  `, { replacements: { category_id: categoryId, field_id: fieldId }, type: QueryTypes.SELECT });
-  return row.value_count;
+  return EquipmentCustomValue.count({
+    where: { field_id: fieldId, field_value: { [Op.ne]: null } },
+    include: [{ model: Equipment, as: 'equipment', attributes: [], where: { category_id: categoryId }, required: true }],
+  });
 }
 
 // --- values ---
