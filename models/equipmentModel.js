@@ -233,12 +233,18 @@ async function getCategorySummary() {
   return rows;
 }
 
+// Returns the same full shape findById()/findAll() give (owner_name,
+// category_name, ...), not just the bare updated row - a caller showing
+// "assigned to X" right after this call would otherwise have owner_id (a
+// number) and nothing to display a name with, forcing a second fetch just
+// to get the name back.
 async function updateOwner(id, ownerId) {
-  const [, rows] = await Equipment.update(
+  const [count] = await Equipment.update(
     { owner_id: ownerId || null },
-    { where: { equipment_id: id }, returning: true },
+    { where: { equipment_id: id } },
   );
-  return rows && rows[0] ? fixDates(rows[0].get({ plain: true })) : null;
+  if (count === 0) return null;
+  return findById(id);
 }
 
 // --- Stock workflow ---
