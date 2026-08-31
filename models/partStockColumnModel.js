@@ -1,6 +1,5 @@
 const { DataTypes, Op } = require('sequelize');
 const sequelize = require('../config/sequelize');
-const { QueryTypes } = require('sequelize');
 
 // Which part_stock columns each part type's Add/Edit Stock form shows
 // (dbo.part_type_stock_column).
@@ -43,31 +42,35 @@ const SUGGESTED_HEADERS = {
 
 // Every part_stock column an admin can choose from, read live from the
 // schema so a column added later shows up without touching this file.
-// INFORMATION_SCHEMA introspection - raw query, not an ORM model.
+// No Sequelize model maps 1:1 onto "every column of an arbitrary table" the
+// way describeTable() does, so this uses that Sequelize QueryInterface API
+// (introspection through the ORM, not a hand-written SELECT) rather than
+// INFORMATION_SCHEMA directly. describeTable()'s key order matches
+// ORDINAL_POSITION (confirmed live), and its "type" comes back as e.g.
+// "NVARCHAR(100)" where the old INFORMATION_SCHEMA.DATA_TYPE gave "nvarchar"
+// - normalized (strip the length/precision, lowercase) to keep the same
+// data_type strings any existing caller already depends on.
+async function describePartStockColumns() {
+  return sequelize.getQueryInterface().describeTable({ tableName: 'part_stock', schema: 'dbo' });
+}
+
 async function validStockFields() {
-  const cols = await sequelize.query(`
-    SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'part_stock' AND TABLE_SCHEMA = 'dbo'
-    ORDER BY ORDINAL_POSITION
-  `, { type: QueryTypes.SELECT });
-  return cols
-    .filter((c) => !HIDDEN_FROM_PICKER.has(c.COLUMN_NAME))
-    .map((c) => ({
-      field: c.COLUMN_NAME,
-      suggested_header: SUGGESTED_HEADERS[c.COLUMN_NAME]
-        || c.COLUMN_NAME.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()),
-      data_type: c.DATA_TYPE,
+  const desc = await describePartStockColumns();
+  return Object.keys(desc)
+    .filter((name) => !HIDDEN_FROM_PICKER.has(name))
+    .map((name) => ({
+      field: name,
+      suggested_header: SUGGESTED_HEADERS[name]
+        || name.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()),
+      data_type: desc[name].type.split('(')[0].toLowerCase(),
     }));
 }
 
 // Used to reject a field_name that is not a real column - without this a
 // typo would produce a form whose every save silently drops that field.
 async function isValidStockField(fieldName) {
-  const [row] = await sequelize.query(`
-    SELECT 1 AS ok FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_NAME = 'part_stock' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME = :field
-  `, { replacements: { field: fieldName }, type: QueryTypes.SELECT });
-  return !!row;
+  const desc = await describePartStockColumns();
+  return Object.prototype.hasOwnProperty.call(desc, fieldName);
 }
 
 async function findByPartType(partTypeId) {
