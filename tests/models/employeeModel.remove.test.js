@@ -43,6 +43,10 @@ afterAll(async () => {
 describe('employeeModel.remove()', () => {
   test('removing an employee with no borrow history succeeds', async () => {
     const emp = await employeeModel.create({ full_name: 'TEST-JEST-NOBORROW-' + Date.now() });
+    // remove() always writes a recycle_bin snapshot even though the
+    // employee row itself is deleted here - track the id so afterAll's
+    // recycle_bin cleanup (below) catches it too, not just dbo.employee.
+    scratchEmployeeIds.push(emp.employee_id);
     const removed = await employeeModel.remove(emp.employee_id, emp.full_name, { user_id: 1, username: 'jest', role: 'admin' });
     expect(removed).toBe(true);
 
