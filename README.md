@@ -7,7 +7,7 @@ REST API over the `Tplus` SQL Server database, organised as **MVC**.
 ```
 tplus-api/
 ├── config/
-│   └── db.js                  Database connection pool
+│   └── sequelize.js           Sequelize connection - every model goes through this
 ├── models/                    ALL SQL lives here - nothing else touches the database
 │   ├── employeeModel.js
 │   ├── equipmentModel.js
