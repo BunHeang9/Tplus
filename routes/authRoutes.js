@@ -6,6 +6,7 @@ const { authenticate, requireAdmin } = require('../middleware/auth');
 router.post('/login', authController.login);
 router.post('/signup', authController.signup);   // public - always creates a viewer
 router.get('/me', authenticate, authController.me);
+router.post('/change-password', authenticate, authController.changePassword);
 router.post('/register', authenticate, requireAdmin, authController.register);
 
 module.exports = router;

@@ -176,10 +176,27 @@ Signup is throttled to 5 attempts per hour per IP.
 | Approve a signup | `PUT /api/users/:id` with `{ "is_active": true }` |
 | Change someone's role | `PUT /api/users/:id` with `{ "role": "admin" }` |
 | Deactivate an account | `PUT /api/users/:id` with `{ "is_active": false }` |
-| Reset a forgotten password | `POST /api/users/:id/reset-password` with `{ "new_password": "..." }` |
+| Reset someone else's forgotten password | `POST /api/users/:id/reset-password` with `{ "new_password": "..." }` - deliberately doesn't require their old one, since the whole point is they've forgotten it |
 
 `GET /api/users` includes a `pending_approval` count, so the UI can badge the
 Users menu when someone is waiting.
+
+### Changing your own password
+
+Not the admin reset above - any logged-in user, viewer or admin, changes
+their own password:
+
+```json
+POST /api/auth/change-password
+{ "current_password": "...", "new_password": "..." }
+```
+
+Requires `current_password` to match what's on file first (401 if it
+doesn't) - unlike the admin reset, which skips that check because an admin
+resetting someone else's forgotten password can't know it. Only ever acts on
+the caller's own account: there's no `user_id` this endpoint reads from the
+body or URL at all, so there's no way to reach anyone else's password
+through it no matter what a request tries to send.
 
 Password hashes are never returned by any user endpoint - the queries omit the
 column rather than relying on the controller to strip it.
@@ -198,6 +215,7 @@ Grouped by domain. "Any user" means any authenticated account, viewer or admin.
 | POST | `/api/auth/login` | Public |
 | POST | `/api/auth/signup` | Public |
 | GET | `/api/auth/me` | Any user |
+| POST | `/api/auth/change-password` | Any user - own account only |
 | POST | `/api/auth/register` | Admin |
 | GET | `/api/users` | Admin |
 | GET | `/api/users/:id` | Admin |

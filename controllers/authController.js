@@ -64,6 +64,44 @@ async function login(req, res, next) {
   }
 }
 
+// Self-service - any logged-in user changes their own password. Deliberately
+// never takes a user_id from the body or URL: it only ever acts on
+// req.user (set by the authenticate middleware from the credentials the
+// caller just proved they know), so there is no way to reach another
+// account's password through this endpoint no matter what the request
+// body says. Unlike userController.resetPassword (admin-only, for a
+// forgotten password), this requires current_password precisely because
+// the caller isn't an admin acting on someone else's behalf.
+async function changePassword(req, res, next) {
+  const { current_password, new_password } = req.body;
+
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: 'current_password and new_password are required' });
+  }
+  if (new_password.length < 8) {
+    return res.status(400).json({ error: 'new_password must be at least 8 characters' });
+  }
+
+  try {
+    // Re-fetched rather than trusting req.user - authenticate() strips
+    // password_hash off before attaching req.user, and this is the one
+    // place in the app that needs it again.
+    const user = await userModel.findByUsername(req.user.username);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const matches = await bcrypt.compare(current_password, user.password_hash);
+    if (!matches) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    const hash = await bcrypt.hash(new_password, SALT_ROUNDS);
+    await userModel.setPassword(user.user_id, hash);
+    res.json({ message: 'Password changed' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Admin-only: create another login account.
 async function register(req, res, next) {
   const { new_username, new_password, full_name, role } = req.body;
@@ -144,4 +182,4 @@ function me(req, res) {
   res.json(req.user);
 }
 
-module.exports = { login, register, signup, me };
+module.exports = { login, register, signup, me, changePassword };
