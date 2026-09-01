@@ -2,6 +2,36 @@
 
 REST API over the `Tplus` SQL Server database, organised as **MVC**, on **Sequelize**.
 
+## Tech stack
+
+| | |
+|---|---|
+| **Runtime** | Node.js |
+| **Framework** | [Express](https://expressjs.com/) 4 |
+| **Database** | SQL Server, via [Sequelize](https://sequelize.org/) 6 ([tedious](https://github.com/tediousjs/tedious) as the driver underneath) |
+| **Auth** | [bcryptjs](https://github.com/dcodeIO/bcrypt.js) for password hashing - Basic Auth on every request (see Authentication below), no session/token layer |
+| **Testing** | [Jest](https://jestjs.io/) - see Testing below |
+| **Exports** | [exceljs](https://github.com/exceljs/exceljs) (`.xlsx`) and [pdfkit](http://pdfkit.org/) (`.pdf`) for `/api/reports/*` |
+| **Dev** | [nodemon](https://nodemon.io/) for auto-restart, [dotenv](https://github.com/motdotla/dotenv) + `.env` for config, [cors](https://github.com/expressjs/cors) |
+
+That's the whole list - `package.json` has 8 runtime dependencies and 2 dev
+ones, on purpose. No ORM plugins, no validation framework, no logging
+library: request validation is hand-written per controller, and there is
+currently no structured logger (see "What's not here yet" below).
+
+No TypeScript - this is plain JavaScript (CommonJS, `require`/`module.exports`)
+throughout.
+
+### What's not here yet
+
+Worth knowing if you're picking this up fresh: no CI pipeline, no linter
+config, no `helmet` security headers beyond `cors`, and `console.log`/
+`console.error` rather than a structured logger. Rate limiting exists only as
+a narrow, hand-rolled, in-memory throttle on `/api/auth/signup` (see below) -
+nothing app-wide, and nothing that would survive a restart or work across
+more than one process. None of these block running the app - they're the
+natural next layer of maturity, not missing pieces the app depends on.
+
 ## Project structure
 
 ```
@@ -869,5 +899,7 @@ something else, or none of the stored columns still exist on the table
 ## Reports
 
 `/api/reports/*` - equipment, employees, borrow history, and part stock,
-exported as Excel workbooks (`exceljs`) for anyone who needs the data outside
-the API itself.
+exported as a file download for anyone who needs the data outside the API
+itself. `?format=xlsx` (the default, via `exceljs`) or `?format=pdf` (via
+`pdfkit`, hand-drawn table layout since pdfkit has no table primitive of its
+own) - any other value is rejected with a 400 listing the two valid ones.
