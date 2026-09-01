@@ -12,6 +12,14 @@ const userModel = require('../models/userModel');
 // logs, browser history, and proxy caches, and they never expire. A token-based
 // approach (which this replaced) avoids those issues. Documented here so whoever
 // maintains this later understands the tradeoff that was chosen.
+//
+// The identifier (whichever of the three ways above it arrived by) accepts
+// either a username or an email - see userModel.findByUsernameOrEmail()'s
+// own comment. This has to match authController.login()'s own resolution
+// exactly: since credentials are re-sent on every request rather than
+// exchanged for a token once, a login that succeeded by matching an email
+// would otherwise have every subsequent request from the same frontend
+// fail here, the moment this function looked up by username alone.
 async function authenticate(req, res, next) {
   let username;
   let password;
@@ -39,7 +47,7 @@ async function authenticate(req, res, next) {
   }
 
   try {
-    const user = await userModel.findByUsername(username);
+    const user = await userModel.findByUsernameOrEmail(username);
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });
@@ -57,6 +65,7 @@ async function authenticate(req, res, next) {
       user_id: user.user_id,
       username: user.username,
       full_name: user.full_name,
+      email: user.email,
       role: user.role,
     };
 

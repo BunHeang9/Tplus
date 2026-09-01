@@ -13,9 +13,10 @@ REST API over the `Tplus` SQL Server database, organised as **MVC**, on **Sequel
 | **Testing** | [Jest](https://jestjs.io/) - see Testing below |
 | **Exports** | [exceljs](https://github.com/exceljs/exceljs) (`.xlsx`) and [pdfkit](http://pdfkit.org/) (`.pdf`) for `/api/reports/*` |
 | **Security headers** | [helmet](https://helmetjs.github.io/) |
+| **Email** | [nodemailer](https://nodemailer.com/) for password-reset emails (see `SMTP_*` in `.env.example` - unconfigured, it logs the reset link instead of sending) |
 | **Dev** | [nodemon](https://nodemon.io/) for auto-restart, [dotenv](https://github.com/motdotla/dotenv) + `.env` for config, [cors](https://github.com/expressjs/cors) (see `CORS_ORIGIN` in `.env.example`) |
 
-That's the whole list - `package.json` has 9 runtime dependencies and 2 dev
+That's the whole list - `package.json` has 10 runtime dependencies and 2 dev
 ones, on purpose. No ORM plugins, no validation framework, no logging
 library: request validation is hand-written per controller, and there is
 currently no structured logger (see "What's not here yet" below).
@@ -115,7 +116,11 @@ in the suite follows that discipline.
 
 ## Authentication
 
-Every endpoint except `/api/auth/login` needs credentials on **each** request:
+Every endpoint needs credentials on **each** request, except the three public
+ones - `/api/auth/login`, `/api/auth/signup`, and the password-reset pair
+(`/api/auth/forgot-password`/`/api/auth/reset-password`, which don't take
+credentials at all - see Password reset below for how those are secured
+instead):
 
 ```
 ?username=Tplus&password=Tplus123%4099        (the @ becomes %40 in a URL)
@@ -124,6 +129,12 @@ or
 ```
 Authorization: Basic <base64 of "username:password">
 ```
+
+The identifier accepts either a real username or an email address - both
+`login` and every other request's credential check resolve it the same way
+(`userModel.findByUsernameOrEmail()`), so whichever one a user's frontend
+account uses stays working consistently across the whole session, not just
+at the login call.
 
 ```js
 fetch(`${API}/api/employees/search?name=Fongmoua`, {
@@ -177,6 +188,7 @@ Signup is throttled to 5 attempts per hour per IP.
 | Change someone's role | `PUT /api/users/:id` with `{ "role": "admin" }` |
 | Deactivate an account | `PUT /api/users/:id` with `{ "is_active": false }` |
 | Reset someone else's forgotten password | `POST /api/users/:id/reset-password` with `{ "new_password": "..." }` - deliberately doesn't require their old one, since the whole point is they've forgotten it |
+| Set or change someone's email | `PUT /api/users/:id` with `{ "email": "..." }` - same call as changing their role or name, just another field |
 | Permanently delete an account | `DELETE /api/users/:id` |
 
 `GET /api/users` includes a `pending_approval` count, so the UI can badge the
@@ -216,6 +228,61 @@ column rather than relying on the controller to strip it.
 **Last-admin guard:** demoting or deactivating the only remaining active admin
 is refused, since it would leave nobody able to manage the system.
 
+### Password reset
+
+For when a user can't log in at all, so `change-password` above (which
+requires knowing the current password) doesn't help. Two public,
+unauthenticated calls:
+
+```json
+POST /api/auth/forgot-password
+{ "username": "somchai" }
+```
+
+`username` here accepts a real username or an email address, same as login.
+The response is always the same, regardless of whether the account exists,
+has no email on file, or was just throttled:
+
+```json
+{ "message": "If an account exists, a reset link has been sent." }
+```
+
+That's deliberate - the response itself must never be how someone finds out
+which usernames or emails are registered. Behind that unchanging response,
+a reset email only actually goes out when the account exists, is active, and
+has an email address on file; otherwise the call quietly does nothing and
+still returns the same message. Requests are throttled to 5 per hour per IP,
+and even a throttled request gets the generic response rather than a 429 -
+a distinct throttle response would itself leak information.
+
+The email contains a link built from `FRONTEND_URL` (falls back to this
+API's own `localhost:<PORT>` if unset) with a one-time token:
+
+```
+{FRONTEND_URL}/reset-password?token=<token>
+```
+
+The frontend reads `token` off that URL and submits it here along with the
+new password:
+
+```json
+POST /api/auth/reset-password
+{ "token": "...", "new_password": "..." }
+```
+
+Token security mirrors how passwords themselves are handled: the raw token
+is only ever in the email and the frontend's URL - the database stores just
+a SHA-256 hash of it, so a database leak alone can't be used to reset
+anyone's password. A token expires 1 hour after it's issued and can only be
+redeemed once; a second attempt with the same token, or an already-expired
+one, is rejected with 400.
+
+**No SMTP configured yet.** Without `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD`
+set in `.env`, `utils/mailer.js` doesn't fail - it logs the would-be email
+(subject and reset link included) to the server console instead, so the
+whole flow is testable end to end before real email credentials exist. Set
+those variables (see `.env.example`) to actually send mail.
+
 ## Endpoints
 
 Grouped by domain. "Any user" means any authenticated account, viewer or admin.
@@ -228,6 +295,8 @@ Grouped by domain. "Any user" means any authenticated account, viewer or admin.
 | POST | `/api/auth/signup` | Public |
 | GET | `/api/auth/me` | Any user |
 | POST | `/api/auth/change-password` | Any user - own account only |
+| POST | `/api/auth/forgot-password` | Public |
+| POST | `/api/auth/reset-password` | Public - authenticated by the token itself |
 | POST | `/api/auth/register` | Admin |
 | GET | `/api/users` | Admin |
 | GET | `/api/users/:id` | Admin |

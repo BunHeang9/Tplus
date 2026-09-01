@@ -16,6 +16,7 @@
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "helmet": "^8.3.0",
+    "nodemailer": "^9.1.0",
     "pdfkit": "^0.19.1",
     "sequelize": "^6.37.8",
     "tedious": "^20.0.0"

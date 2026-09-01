@@ -1,4 +1,4 @@
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op, fn, literal } = require('sequelize');
 const sequelize = require('../config/sequelize');
 
 // Login accounts for the API itself (dbo.api_user) - separate from dbo.employee.
@@ -14,27 +14,48 @@ const ApiUser = sequelize.define('ApiUser', {
   // categoryModel/auditLogModel: let the DB default handle it rather than
   // have Sequelize generate an incompatible timestamp format).
   created_at: { type: DataTypes.DATE, allowNull: true },
+  email: { type: DataTypes.STRING(255), allowNull: true },
+  // Never returned by any read below (not in SAFE_FIELDS) - same treatment
+  // as password_hash. Only ever a SHA-256 hash of the real token, which
+  // itself only ever exists in the reset-link email - see authController.js
+  // forgotPassword()/resetPasswordWithToken() for why.
+  reset_token_hash: { type: DataTypes.STRING(64), allowNull: true },
+  reset_token_expires_at: { type: DataTypes.DATE, allowNull: true },
 }, {
   tableName: 'api_user',
   schema: 'dbo',
   timestamps: false,
 });
 
-const SAFE_FIELDS = ['user_id', 'username', 'full_name', 'role', 'is_active', 'created_at'];
+const SAFE_FIELDS = ['user_id', 'username', 'full_name', 'email', 'role', 'is_active', 'created_at'];
+
+const AUTH_ATTRIBUTES = ['user_id', 'username', 'password_hash', 'full_name', 'email', 'role', 'is_active'];
 
 async function findByUsername(username) {
-  return ApiUser.findOne({
-    where: { username },
-    attributes: ['user_id', 'username', 'password_hash', 'full_name', 'role', 'is_active'],
-    raw: true,
-  });
+  return ApiUser.findOne({ where: { username }, attributes: AUTH_ATTRIBUTES, raw: true });
 }
 
-async function create({ username, passwordHash, fullName, role, isActive }) {
+// The frontend's Sign In form now sends an email address in the same
+// `username` field it always used - this resolves that value against
+// EITHER column. Username is checked first and only falls back to email if
+// nothing matched: a raw `WHERE username = ? OR email = ?` would leave which
+// row wins undefined in the (currently hypothetical, but not impossible)
+// case where one account's real email happens to equal a different
+// account's literal username string - checking username first eliminates
+// that ambiguity outright rather than leaving it to whatever order SQL
+// Server happens to return matching rows in.
+async function findByUsernameOrEmail(identifier) {
+  const byUsername = await findByUsername(identifier);
+  if (byUsername) return byUsername;
+  return ApiUser.findOne({ where: { email: identifier }, attributes: AUTH_ATTRIBUTES, raw: true });
+}
+
+async function create({ username, passwordHash, fullName, email, role, isActive }) {
   const row = await ApiUser.create({
     username,
     password_hash: passwordHash,
     full_name: fullName || null,
+    email: email || null,
     role: role || 'viewer',
     is_active: isActive === undefined ? true : isActive,
   });
@@ -60,9 +81,10 @@ async function findById(id) {
 }
 
 // Note: password_hash is deliberately never returned by findAll or findById.
-async function update(id, { full_name, role, is_active }) {
+async function update(id, { full_name, email, role, is_active }) {
   const values = {};
   if (full_name !== undefined && full_name !== null) values.full_name = full_name;
+  if (email !== undefined && email !== null) values.email = email;
   if (role !== undefined && role !== null) values.role = role;
   if (is_active !== undefined && is_active !== null) values.is_active = is_active;
 
@@ -119,7 +141,6 @@ async function remove(id) {
 }
 
 async function countAdmins(excludeUserId) {
-  const { Op } = require('sequelize');
   return ApiUser.count({
     where: {
       role: 'admin',
@@ -129,8 +150,53 @@ async function countAdmins(excludeUserId) {
   });
 }
 
+// forgot-password: sets a new outstanding token, overwriting whatever
+// (if anything) was there before - only ever one live reset token per
+// account, so requesting a new link invalidates an older unused one.
+//
+// The expiry is computed in SQL (DATEADD off the DB server's own GETDATE()),
+// not passed in as a JS Date - two reasons. First, a plain JS Date sent to
+// this legacy DATETIME column gets serialized in a format SQL Server's
+// legacy datetime type rejects outright ("Conversion failed when converting
+// date and/or time from character string" - confirmed live), the same
+// class of issue this migration has hit before with legacy DATETIME columns
+// elsewhere in this app. Second, and independent of that bug, the DB
+// server's clock is the right source of truth here anyway - the *validity*
+// check in redeemResetToken() below already compares against GETDATE(), so
+// the expiry itself should come from the same clock, not the app server's.
+async function setResetToken(id, tokenHash, ttlMinutes) {
+  await ApiUser.update(
+    {
+      reset_token_hash: tokenHash,
+      reset_token_expires_at: fn('DATEADD', literal('MINUTE'), ttlMinutes, fn('GETDATE')),
+    },
+    { where: { user_id: id } },
+  );
+}
+
+// reset-password: one atomic UPDATE that both verifies the token (matches
+// AND not expired, compared against the DB server's own clock - not a JS
+// Date(), same reasoning as every other "is this still valid" comparison
+// elsewhere in this app) and immediately clears it as part of the same
+// statement. That's deliberate, not just tidiness: a second attempt to
+// redeem the same token - whether a genuine double-click or two concurrent
+// requests - finds no row matching the WHERE clause the moment the first
+// one succeeds, so the token is single-use by construction rather than by
+// a separate "mark used" step that a race could slip between.
+async function redeemResetToken(tokenHash, newPasswordHash) {
+  const [count, rows] = await ApiUser.update(
+    { password_hash: newPasswordHash, reset_token_hash: null, reset_token_expires_at: null },
+    {
+      where: { reset_token_hash: tokenHash, reset_token_expires_at: { [Op.gt]: fn('GETDATE') } },
+      returning: true,
+    },
+  );
+  if (count === 0) return null;
+  return rows[0].get({ plain: true });
+}
+
 module.exports = {
   ApiUser,
-  findByUsername, create, findAll, findById, update, setPassword, countAdmins,
-  countReferences, remove,
+  findByUsername, findByUsernameOrEmail, create, findAll, findById, update, setPassword, countAdmins,
+  countReferences, remove, setResetToken, redeemResetToken,
 };
