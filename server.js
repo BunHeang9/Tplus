@@ -34,7 +34,16 @@ const deviceReplacementRoutes = require("./routes/deviceReplacementRoutes");
 
 const app = express();
 
-app.use(helmet());
+// crossOriginResourcePolicy defaults to 'same-origin', which tells browsers
+// only a page on THIS origin may read the response - correct for an app
+// serving its own pages, wrong for an API whose entire purpose is being
+// called from a different origin (the frontend). Left at the default, every
+// request from the frontend would still reach this server and get a normal
+// 200 - curl would show nothing wrong - but the browser itself throws the
+// response away before the frontend's JS ever sees it. 'cross-origin' opts
+// back into normal cross-origin fetches; CORS (the block below) is still
+// what actually decides which origins are allowed.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 // CORS_ORIGIN in .env restricts which site(s) a browser will let call this
 // API from - comma-separated for more than one (e.g. a staging frontend and
