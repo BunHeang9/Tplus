@@ -81,6 +81,43 @@ async function setPassword(id, passwordHash) {
   return ApiUser.findByPk(id, { attributes: ['user_id', 'username'], raw: true });
 }
 
+// What still points at this account before it can be deleted. Only
+// part_borrow_record's issued_by_id/received_by_id are checked - audit_log
+// also stores actor_user_id, but it has no real foreign key to api_user at
+// all (confirmed against sys.foreign_keys) and already snapshots
+// actor_username/actor_name alongside it, so a deleted account's history
+// there stays fully readable on its own, the same way borrow_record.
+// borrower_name survives a deleted employee. part_borrow_record has no
+// equivalent name-snapshot column for issued_by/received_by, though - so
+// unlike employeeModel.remove() (which nulls the FK and keeps the name),
+// there is no way to null this FK without permanently losing who issued or
+// received that loan. Blocking the delete is the only option that doesn't
+// destroy history.
+//
+// Lazily required - partBorrowModel.js does not require this file at all,
+// but the lazy pattern is used here for consistency with the rest of this
+// migration's cross-model reference checks.
+async function countReferences(id) {
+  const { PartBorrowRecord } = require('./partBorrowModel');
+  const [issued, received] = await Promise.all([
+    PartBorrowRecord.count({ where: { issued_by_id: id } }),
+    PartBorrowRecord.count({ where: { received_by_id: id } }),
+  ]);
+  return { issued_part_loans: issued, received_part_loans: received };
+}
+
+// Permanent - no recycle_bin snapshot, unlike employee/equipment/department/
+// software_license. An account is credentials, not a business record with
+// history worth restoring; controllers/userController.js's own guards
+// (last-admin, self-delete, still-referenced) are what actually keep this
+// safe, not a recovery path.
+async function remove(id) {
+  const row = await ApiUser.findByPk(id, { attributes: SAFE_FIELDS, raw: true });
+  if (!row) return null;
+  await ApiUser.destroy({ where: { user_id: id } });
+  return row;
+}
+
 async function countAdmins(excludeUserId) {
   const { Op } = require('sequelize');
   return ApiUser.count({
@@ -95,4 +132,5 @@ async function countAdmins(excludeUserId) {
 module.exports = {
   ApiUser,
   findByUsername, create, findAll, findById, update, setPassword, countAdmins,
+  countReferences, remove,
 };

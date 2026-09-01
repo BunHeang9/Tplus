@@ -78,4 +78,47 @@ async function resetPassword(req, res, next) {
   } catch (err) { next(err); }
 }
 
-module.exports = { getAll, getById, update, resetPassword };
+// Permanent - no recycle bin for accounts (see userModel.remove()'s own
+// comment for why). Guarded the same way update()'s role-change/deactivate
+// path already is for the last-admin case, plus two more that don't apply
+// there: never your own account (this app re-validates credentials on every
+// request, so deleting yourself would lock you out immediately, not just on
+// next login), and never an account still referenced by part-loan history.
+async function remove(req, res, next) {
+  try {
+    const target = await userModel.findById(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+
+    if (Number(req.params.id) === req.user.user_id) {
+      return res.status(409).json({
+        error: 'You cannot delete your own account',
+        hint: 'Have another admin do it, or deactivate your account instead.',
+      });
+    }
+
+    if (target.role === 'admin') {
+      const othersLeft = await userModel.countAdmins(target.user_id);
+      if (othersLeft === 0) {
+        return res.status(409).json({
+          error: 'This is the only active admin account',
+          hint: 'Promote another user to admin first, otherwise nobody could manage the system.',
+        });
+      }
+    }
+
+    const refs = await userModel.countReferences(target.user_id);
+    const total = refs.issued_part_loans + refs.received_part_loans;
+    if (total > 0) {
+      return res.status(409).json({
+        error: `Cannot delete ${target.username}: they still have records attached`,
+        references: refs,
+        hint: 'Part-loan history records this account as who issued or received a loan, and cannot be reassigned - deactivate the account instead.',
+      });
+    }
+
+    await userModel.remove(target.user_id);
+    res.json({ message: `User "${target.username}" deleted` });
+  } catch (err) { next(err); }
+}
+
+module.exports = { getAll, getById, update, resetPassword, remove };

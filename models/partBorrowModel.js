@@ -445,6 +445,8 @@ async function remove(borrowId) {
 }
 
 module.exports = {
+  PartBorrowRecord, // exported so userModel.js can check references (issued_by_id/
+  // received_by_id) via a lazy require before deleting an api_user account.
   findStockForBorrow,
   create,
   findById,

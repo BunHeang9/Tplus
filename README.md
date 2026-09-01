@@ -177,9 +177,21 @@ Signup is throttled to 5 attempts per hour per IP.
 | Change someone's role | `PUT /api/users/:id` with `{ "role": "admin" }` |
 | Deactivate an account | `PUT /api/users/:id` with `{ "is_active": false }` |
 | Reset someone else's forgotten password | `POST /api/users/:id/reset-password` with `{ "new_password": "..." }` - deliberately doesn't require their old one, since the whole point is they've forgotten it |
+| Permanently delete an account | `DELETE /api/users/:id` |
 
 `GET /api/users` includes a `pending_approval` count, so the UI can badge the
 Users menu when someone is waiting.
+
+**Deleting an account is permanent** - unlike employee/equipment/department/
+software license, there's no recycle-bin snapshot for accounts (they're
+credentials, not a business record with history worth restoring). Refused
+with 409 in three cases:
+
+| Situation | Why |
+|---|---|
+| Deleting your own account | This app re-validates credentials on every request, so deleting yourself would lock you out immediately, not on next login |
+| The account is the only active admin | Same guard `PUT`'s role-change/deactivate path already has - nobody could manage the system afterward |
+| The account issued or received a loan in part-borrow history | `part_borrow_record` has no name-snapshot column the way `borrow_record` does for a deleted employee, so there is no way to remove the account without permanently losing who issued or received that loan - deactivate it instead |
 
 ### Changing your own password
 
@@ -221,6 +233,7 @@ Grouped by domain. "Any user" means any authenticated account, viewer or admin.
 | GET | `/api/users/:id` | Admin |
 | PUT | `/api/users/:id` | Admin |
 | POST | `/api/users/:id/reset-password` | Admin |
+| DELETE | `/api/users/:id` | Admin |
 
 </details>
 
