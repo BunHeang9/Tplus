@@ -12,9 +12,10 @@ REST API over the `Tplus` SQL Server database, organised as **MVC**, on **Sequel
 | **Auth** | [bcryptjs](https://github.com/dcodeIO/bcrypt.js) for password hashing - Basic Auth on every request (see Authentication below), no session/token layer |
 | **Testing** | [Jest](https://jestjs.io/) - see Testing below |
 | **Exports** | [exceljs](https://github.com/exceljs/exceljs) (`.xlsx`) and [pdfkit](http://pdfkit.org/) (`.pdf`) for `/api/reports/*` |
-| **Dev** | [nodemon](https://nodemon.io/) for auto-restart, [dotenv](https://github.com/motdotla/dotenv) + `.env` for config, [cors](https://github.com/expressjs/cors) |
+| **Security headers** | [helmet](https://helmetjs.github.io/) |
+| **Dev** | [nodemon](https://nodemon.io/) for auto-restart, [dotenv](https://github.com/motdotla/dotenv) + `.env` for config, [cors](https://github.com/expressjs/cors) (see `CORS_ORIGIN` in `.env.example`) |
 
-That's the whole list - `package.json` has 8 runtime dependencies and 2 dev
+That's the whole list - `package.json` has 9 runtime dependencies and 2 dev
 ones, on purpose. No ORM plugins, no validation framework, no logging
 library: request validation is hand-written per controller, and there is
 currently no structured logger (see "What's not here yet" below).
@@ -25,12 +26,14 @@ throughout.
 ### What's not here yet
 
 Worth knowing if you're picking this up fresh: no CI pipeline, no linter
-config, no `helmet` security headers beyond `cors`, and `console.log`/
-`console.error` rather than a structured logger. Rate limiting exists only as
-a narrow, hand-rolled, in-memory throttle on `/api/auth/signup` (see below) -
-nothing app-wide, and nothing that would survive a restart or work across
-more than one process. None of these block running the app - they're the
-natural next layer of maturity, not missing pieces the app depends on.
+config, and `console.log`/`console.error` (a small, deliberate footprint -
+7 call sites total, all in `server.js`/`config/sequelize.js`/`middleware/`)
+rather than a structured logger. Rate limiting exists only as a narrow,
+hand-rolled, in-memory throttle on `/api/auth/signup` (see below) - nothing
+app-wide, and nothing that would survive a restart or work across more than
+one process; `/api/auth/login` itself has none. None of these block running
+the app - they're the natural next layer of maturity, not missing pieces the
+app depends on.
 
 ## Project structure
 
@@ -131,10 +134,16 @@ fetch(`${API}/api/employees/search?name=Fongmoua`, {
 ### Security note
 
 Sending the password on every request means it's repeatedly transmitted and
-commonly ends up in server logs, browser history and proxy caches — and unlike a
-token it never expires. This was a deliberate simplicity tradeoff. If the API is
+commonly ends up in browser history and proxy caches — and unlike a token it
+never expires. This was a deliberate simplicity tradeoff. If the API is
 later exposed more widely or handles more sensitive data, moving to token or
 session auth would be worth revisiting.
+
+It no longer ends up in *this app's own* server logs, at least - the request
+logger in `server.js` strips the query string before logging, specifically
+because this auth scheme puts the password there. Nothing stops it from
+still showing up in browser history or an intermediate proxy's logs, which is
+the deeper reason token auth would be the real fix, not just a log tweak.
 
 ## Roles and accounts
 

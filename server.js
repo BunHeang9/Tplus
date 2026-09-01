@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 require('dotenv').config();
 
 const authRoutes = require('./routes/authRoutes');
@@ -33,12 +34,29 @@ const deviceReplacementRoutes = require("./routes/deviceReplacementRoutes");
 
 const app = express();
 
-app.use(cors());
+app.use(helmet());
+
+// CORS_ORIGIN in .env restricts which site(s) a browser will let call this
+// API from - comma-separated for more than one (e.g. a staging frontend and
+// a production one). Left unset, this falls back to allowing any origin
+// (Express's cors() default) - fine for local development against a frontend
+// whose URL isn't fixed yet, but this should be set once the real frontend's
+// address is known, per the security note further down.
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map((o) => o.trim())
+  : null;
+app.use(cors(allowedOrigins ? { origin: allowedOrigins } : {}));
+
 app.use(express.json());
 
-// Simple request log - handy in development
+// Simple request log - handy in development. The query string is stripped,
+// not just logged as-is: this API's auth accepts ?username=&password= on
+// every request (see the Authentication section in README.md), so logging
+// req.originalUrl verbatim would write every plaintext password straight
+// into the console/log file on every authenticated call.
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  const pathOnly = req.originalUrl.split('?')[0];
+  console.log(`${new Date().toISOString()} ${req.method} ${pathOnly}`);
   next();
 });
 
