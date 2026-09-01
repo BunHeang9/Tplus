@@ -224,7 +224,7 @@ async function redeemResetCode(identifier, codeHash, newPasswordHash, maxAttempt
       },
     },
   );
-  if (count > 0) return { user_id: user.user_id, username: user.username };
+  if (count > 0) return { user_id: user.user_id, username: user.username, email: user.email };
 
   // Wrong code (or nothing left to guess against) - only bump the counter
   // if there's still a live, unexpired code to protect; a wrong guess

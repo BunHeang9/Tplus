@@ -7,7 +7,10 @@
 // account the moment SMTP is genuinely configured, which is exactly what
 // happened live once real Gmail credentials were added - caught and fixed
 // here rather than left for the next test run to repeat.
-jest.mock('../../utils/mailer', () => ({ sendMail: jest.fn().mockResolvedValue({ sent: false, reason: 'test_mock' }) }));
+jest.mock('../../utils/mailer', () => ({
+  sendMail: jest.fn().mockResolvedValue({ sent: false, reason: 'test_mock' }),
+  notifyPasswordChanged: jest.fn().mockResolvedValue({ sent: false, reason: 'test_mock' }),
+}));
 
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
@@ -15,7 +18,7 @@ const { QueryTypes } = require('sequelize');
 const sequelize = require('../../config/sequelize');
 const authController = require('../../controllers/authController');
 const userModel = require('../../models/userModel');
-const { sendMail } = require('../../utils/mailer');
+const { sendMail, notifyPasswordChanged } = require('../../utils/mailer');
 
 function fakeRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
@@ -115,8 +118,9 @@ describe('forgotPassword', () => {
 });
 
 describe('resetPasswordWithCode', () => {
-  test('a valid code resets the password', async () => {
-    const account = await makeAccount({ email: 'jest-rp-' + Date.now() + '@example.com' });
+  test('a valid code resets the password and notifies the account email', async () => {
+    const email = 'jest-rp-' + Date.now() + '@example.com';
+    const account = await makeAccount({ email });
     const rawCode = '123456';
     const codeHash = crypto.createHash('sha256').update(rawCode).digest('hex');
     await userModel.setResetToken(account.user_id, codeHash, 10);
@@ -126,6 +130,7 @@ describe('resetPasswordWithCode', () => {
       fakeReq({ username: account.username, code: rawCode, new_password: 'ControllerNewPass1' }), res, () => {},
     );
     expect(res.body.message).toMatch(/password has been reset/i);
+    expect(notifyPasswordChanged).toHaveBeenCalledWith(email, 'using a password-reset code');
 
     const updated = await userModel.findByUsername(account.username);
     expect(await bcrypt.compare('ControllerNewPass1', updated.password_hash)).toBe(true);

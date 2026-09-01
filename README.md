@@ -284,6 +284,23 @@ so the whole flow is testable end to end before real email credentials
 exist. Set `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD` (see `.env.example`) to
 actually send mail.
 
+### "Your password was changed" notifications
+
+Whenever a password actually changes - by any of the three paths below -
+an email goes to that account's address saying so, naming how it happened.
+Same idea as the notice a bank or Gmail sends: if it wasn't really the
+account owner, they find out immediately instead of never.
+
+| How it changed | Email says |
+|---|---|
+| `POST /api/auth/reset-password` (the code above) | "...changed (using a password-reset code)" |
+| `POST /api/auth/change-password` (self-service) | "...changed (by you, from your account)" |
+| `POST /api/users/:id/reset-password` (admin-forced) | "...changed (by an administrator (*their username*))" |
+
+Best-effort and silent if the account has no email on file - it never
+blocks or fails the password change itself, same graceful-degradation
+treatment as everything else touching `utils/mailer.js`.
+
 ## Endpoints
 
 Grouped by domain. "Any user" means any authenticated account, viewer or admin.

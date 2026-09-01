@@ -48,4 +48,20 @@ async function sendMail({ to, subject, text }) {
   }
 }
 
-module.exports = { sendMail };
+// Fired after every successful password change, from all three places one
+// can happen (forgot/reset-code, self-service change-password, and an
+// admin's forced reset) - so the account owner finds out immediately if a
+// change wasn't actually them, the same "did you do this?" pattern most
+// real account systems use. Best-effort and silent when there's no email
+// on file - never blocks or fails the password change itself, matching
+// sendMail()'s own never-throws contract.
+async function notifyPasswordChanged(to, howChanged) {
+  if (!to) return { sent: false, reason: 'no_email' };
+  return sendMail({
+    to,
+    subject: 'Your Tplus password was changed',
+    text: `Your Tplus account password was just changed (${howChanged}). If this was you, no action is needed.\n\nIf it wasn't you, contact an administrator immediately - someone else may have access to your account.`,
+  });
+}
+
+module.exports = { sendMail, notifyPasswordChanged };

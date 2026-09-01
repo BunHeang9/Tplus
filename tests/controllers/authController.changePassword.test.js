@@ -5,11 +5,18 @@
 // server) - same approach used to verify the unhandled-rejection fix
 // elsewhere in this migration. What matters here is the logic inside
 // changePassword() itself, not Express's routing.
+//
+// utils/mailer.js is mocked regardless of real SMTP_* config - see
+// tests/controllers/authController.forgotPassword.test.js's own comment
+// for why tests must never depend on or trigger a real send.
+jest.mock('../../utils/mailer', () => ({ notifyPasswordChanged: jest.fn().mockResolvedValue({ sent: false, reason: 'test_mock' }) }));
+
 const bcrypt = require('bcryptjs');
 const { QueryTypes } = require('sequelize');
 const sequelize = require('../../config/sequelize');
 const authController = require('../../controllers/authController');
 const userModel = require('../../models/userModel');
+const { notifyPasswordChanged } = require('../../utils/mailer');
 
 function fakeRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
@@ -64,6 +71,31 @@ test('accepts the correct current_password and actually changes it', async () =>
   const matchesOld = await bcrypt.compare('OriginalPass123', updated.password_hash);
   expect(matchesNew).toBe(true);
   expect(matchesOld).toBe(false);
+
+  // scratchUser has no email on file - notifyPasswordChanged() is still
+  // called (best-effort, unconditionally attempted), but with a falsy
+  // recipient it's the mocked function's own job to no-op; this just
+  // confirms changePassword() actually calls it every time, not only when
+  // an email happens to be present.
+  expect(notifyPasswordChanged).toHaveBeenCalledWith(null, 'by you, from your account');
+});
+
+test('notifies the account email when one is on file', async () => {
+  const email = 'jest-changepw-notify-' + Date.now() + '@example.com';
+  const passwordHash = await bcrypt.hash('WithEmailPass123', 10);
+  const withEmail = await userModel.create({
+    username: 'TEST-JEST-CHANGEPW-EMAIL-' + Date.now(),
+    passwordHash, fullName: 'Test ChangePassword Email', email, role: 'viewer', isActive: true,
+  });
+
+  const req = { user: { user_id: withEmail.user_id, username: withEmail.username, role: 'viewer' }, body: { current_password: 'WithEmailPass123', new_password: 'NewWithEmailPass456' } };
+  const res = fakeRes();
+  await authController.changePassword(req, res, () => {});
+
+  expect(res.body.message).toBe('Password changed');
+  expect(notifyPasswordChanged).toHaveBeenCalledWith(email, 'by you, from your account');
+
+  await sequelize.query('DELETE FROM dbo.api_user WHERE user_id = :id', { replacements: { id: withEmail.user_id } });
 });
 
 test('a user_id in the body is ignored - only ever changes the caller\'s own account', async () => {

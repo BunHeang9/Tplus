@@ -1,7 +1,7 @@
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const userModel = require('../models/userModel');
-const { sendMail } = require('../utils/mailer');
+const { sendMail, notifyPasswordChanged } = require('../utils/mailer');
 
 const SALT_ROUNDS = 10;
 const RESET_CODE_TTL_MINUTES = 10; // short-lived - a 6-digit code is brute-forceable given enough time
@@ -110,6 +110,9 @@ async function changePassword(req, res, next) {
 
     const hash = await bcrypt.hash(new_password, SALT_ROUNDS);
     await userModel.setPassword(user.user_id, hash);
+    // Best-effort, doesn't block the response - see notifyPasswordChanged()'s
+    // own comment for why every password-change path does this.
+    await notifyPasswordChanged(user.email, 'by you, from your account');
     res.json({ message: 'Password changed' });
   } catch (err) {
     next(err);
@@ -283,6 +286,9 @@ async function resetPasswordWithCode(req, res, next) {
       });
     }
 
+    // Best-effort, doesn't block the response - see notifyPasswordChanged()'s
+    // own comment for why every password-change path does this.
+    await notifyPasswordChanged(result.email, 'using a password-reset code');
     res.json({ message: 'Password has been reset. You can log in with your new password now.' });
   } catch (err) {
     next(err);

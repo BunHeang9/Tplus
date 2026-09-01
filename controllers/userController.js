@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const userModel = require('../models/userModel');
+const { notifyPasswordChanged } = require('../utils/mailer');
 
 const SALT_ROUNDS = 10;
 
@@ -74,6 +75,11 @@ async function resetPassword(req, res, next) {
 
     const hash = await bcrypt.hash(new_password, SALT_ROUNDS);
     const result = await userModel.setPassword(req.params.id, hash);
+    // Best-effort, doesn't block the response - see
+    // utils/mailer.js's notifyPasswordChanged() for why every
+    // password-change path does this. req.user is the admin doing the
+    // resetting (from authenticate()), not the account being reset.
+    await notifyPasswordChanged(target.email, `by an administrator (${req.user.username})`);
     res.json({ message: `Password reset for ${result.username}` });
   } catch (err) { next(err); }
 }
