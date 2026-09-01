@@ -21,6 +21,11 @@ const ApiUser = sequelize.define('ApiUser', {
   // forgotPassword()/resetPasswordWithToken() for why.
   reset_token_hash: { type: DataTypes.STRING(64), allowNull: true },
   reset_token_expires_at: { type: DataTypes.DATE, allowNull: true },
+  // Counts wrong-code guesses since the last code was issued. A 6-digit
+  // code only has 1,000,000 possibilities (unlike the 32-byte link token
+  // this replaced), so unlike that token this needs an explicit brute-force
+  // cap - see redeemResetCode() below.
+  reset_token_attempts: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
 }, {
   tableName: 'api_user',
   schema: 'dbo',
@@ -169,34 +174,76 @@ async function setResetToken(id, tokenHash, ttlMinutes) {
     {
       reset_token_hash: tokenHash,
       reset_token_expires_at: fn('DATEADD', literal('MINUTE'), ttlMinutes, fn('GETDATE')),
+      // A fresh code always gets a fresh attempt count - otherwise a user
+      // who mistyped an old code a few times would start their new code
+      // already partway toward the lockout below.
+      reset_token_attempts: 0,
     },
     { where: { user_id: id } },
   );
 }
 
-// reset-password: one atomic UPDATE that both verifies the token (matches
-// AND not expired, compared against the DB server's own clock - not a JS
-// Date(), same reasoning as every other "is this still valid" comparison
-// elsewhere in this app) and immediately clears it as part of the same
-// statement. That's deliberate, not just tidiness: a second attempt to
-// redeem the same token - whether a genuine double-click or two concurrent
-// requests - finds no row matching the WHERE clause the moment the first
-// one succeeds, so the token is single-use by construction rather than by
-// a separate "mark used" step that a race could slip between.
-async function redeemResetToken(tokenHash, newPasswordHash) {
-  const [count, rows] = await ApiUser.update(
-    { password_hash: newPasswordHash, reset_token_hash: null, reset_token_expires_at: null },
+// reset-password: verifies a 6-digit code rather than the 32-byte link
+// token this replaced. A code that short (1,000,000 possibilities) is
+// guessable within its expiry window if attempts aren't capped, so unlike
+// redeemResetToken() before it, this can't be a single unconditional
+// lookup-by-hash - it needs to know *which* account's attempt count to
+// check and increment, hence the identifier argument.
+//
+// Two-phase, both against the DB server's own clock (GETDATE(), not a JS
+// Date - same reasoning as setResetToken() above):
+//   1. Try the atomic success path: matches the stored hash, not expired,
+//      and under the attempt cap, all in one UPDATE's WHERE clause, so
+//      (same as the token flow before it) a code is single-use by
+//      construction - a second concurrent redeem finds no row left
+//      matching once the first one clears the hash.
+//   2. If that touched zero rows, the guess was wrong (or the code was
+//      already expired/locked/absent) - bump the attempt counter for that
+//      account's still-active code, if it has one, so repeated wrong
+//      guesses eventually exceed maxAttempts and the code stops being
+//      checkable at all, without needing a separate lockout flag.
+const MAX_RESET_ATTEMPTS = 5;
+
+async function redeemResetCode(identifier, codeHash, newPasswordHash, maxAttempts = MAX_RESET_ATTEMPTS) {
+  const user = await findByUsernameOrEmail(identifier);
+  if (!user) return null;
+
+  const [count] = await ApiUser.update(
     {
-      where: { reset_token_hash: tokenHash, reset_token_expires_at: { [Op.gt]: fn('GETDATE') } },
-      returning: true,
+      password_hash: newPasswordHash,
+      reset_token_hash: null,
+      reset_token_expires_at: null,
+      reset_token_attempts: 0,
+    },
+    {
+      where: {
+        user_id: user.user_id,
+        reset_token_hash: codeHash,
+        reset_token_expires_at: { [Op.gt]: fn('GETDATE') },
+        reset_token_attempts: { [Op.lt]: maxAttempts },
+      },
     },
   );
-  if (count === 0) return null;
-  return rows[0].get({ plain: true });
+  if (count > 0) return { user_id: user.user_id, username: user.username };
+
+  // Wrong code (or nothing left to guess against) - only bump the counter
+  // if there's still a live, unexpired code to protect; a wrong guess
+  // against an already-expired or already-used code is a no-op either way.
+  await ApiUser.update(
+    { reset_token_attempts: literal('reset_token_attempts + 1') },
+    {
+      where: {
+        user_id: user.user_id,
+        reset_token_hash: { [Op.ne]: null },
+        reset_token_expires_at: { [Op.gt]: fn('GETDATE') },
+      },
+    },
+  );
+  return null;
 }
 
 module.exports = {
   ApiUser,
   findByUsername, findByUsernameOrEmail, create, findAll, findById, update, setPassword, countAdmins,
-  countReferences, remove, setResetToken, redeemResetToken,
+  countReferences, remove, setResetToken, redeemResetCode, MAX_RESET_ATTEMPTS,
 };

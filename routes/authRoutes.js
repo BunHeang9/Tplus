@@ -8,7 +8,7 @@ router.post('/signup', authController.signup);   // public - always creates a vi
 router.get('/me', authenticate, authController.me);
 router.post('/change-password', authenticate, authController.changePassword);
 router.post('/forgot-password', authController.forgotPassword); // public
-router.post('/reset-password', authController.resetPasswordWithToken); // public
+router.post('/reset-password', authController.resetPasswordWithCode); // public - authenticated by the emailed code, not credentials
 router.post('/register', authenticate, requireAdmin, authController.register);
 
 module.exports = router;

@@ -13,7 +13,7 @@ REST API over the `Tplus` SQL Server database, organised as **MVC**, on **Sequel
 | **Testing** | [Jest](https://jestjs.io/) - see Testing below |
 | **Exports** | [exceljs](https://github.com/exceljs/exceljs) (`.xlsx`) and [pdfkit](http://pdfkit.org/) (`.pdf`) for `/api/reports/*` |
 | **Security headers** | [helmet](https://helmetjs.github.io/) |
-| **Email** | [nodemailer](https://nodemailer.com/) for password-reset emails (see `SMTP_*` in `.env.example` - unconfigured, it logs the reset link instead of sending) |
+| **Email** | [nodemailer](https://nodemailer.com/) for password-reset emails (see `SMTP_*` in `.env.example` - unconfigured, it logs the reset code instead of sending) |
 | **Dev** | [nodemon](https://nodemon.io/) for auto-restart, [dotenv](https://github.com/motdotla/dotenv) + `.env` for config, [cors](https://github.com/expressjs/cors) (see `CORS_ORIGIN` in `.env.example`) |
 
 That's the whole list - `package.json` has 10 runtime dependencies and 2 dev
@@ -244,7 +244,7 @@ The response is always the same, regardless of whether the account exists,
 has no email on file, or was just throttled:
 
 ```json
-{ "message": "If an account exists, a reset link has been sent." }
+{ "message": "If an account exists, a reset code has been sent to its email." }
 ```
 
 That's deliberate - the response itself must never be how someone finds out
@@ -255,33 +255,34 @@ still returns the same message. Requests are throttled to 5 per hour per IP,
 and even a throttled request gets the generic response rather than a 429 -
 a distinct throttle response would itself leak information.
 
-The email contains a link built from `FRONTEND_URL` (falls back to this
-API's own `localhost:<PORT>` if unset) with a one-time token:
-
-```
-{FRONTEND_URL}/reset-password?token=<token>
-```
-
-The frontend reads `token` off that URL and submits it here along with the
-new password:
+The email contains a one-time 6-digit code (e.g. `042917`), not a link - the
+frontend needs its own "enter your code" form. The user submits it here
+along with their username (or email) and new password:
 
 ```json
 POST /api/auth/reset-password
-{ "token": "...", "new_password": "..." }
+{ "username": "somchai", "code": "042917", "new_password": "..." }
 ```
 
-Token security mirrors how passwords themselves are handled: the raw token
-is only ever in the email and the frontend's URL - the database stores just
-a SHA-256 hash of it, so a database leak alone can't be used to reset
-anyone's password. A token expires 1 hour after it's issued and can only be
-redeemed once; a second attempt with the same token, or an already-expired
-one, is rejected with 400.
+Code security mirrors how passwords themselves are handled: the raw code is
+only ever in the email - the database stores just a SHA-256 hash of it, so a
+database leak alone can't be used to reset anyone's password. A code expires
+10 minutes after it's issued and can only be redeemed once; a second attempt
+with the same code, or an already-expired one, is rejected with 400.
 
-**No SMTP configured yet.** Without `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD`
-set in `.env`, `utils/mailer.js` doesn't fail - it logs the would-be email
-(subject and reset link included) to the server console instead, so the
-whole flow is testable end to end before real email credentials exist. Set
-those variables (see `.env.example`) to actually send mail.
+**Guessing is capped, unlike the link-token approach this replaced.** A
+6-digit code only has 1,000,000 possibilities, far fewer than a 32-byte link
+token - so each wrong `code` counts against that account's outstanding
+reset, and the 6th wrong guess locks it out (400, same message as
+expired/wrong - requesting a new code via `forgot-password` is the only way
+forward at that point, same as an expired one). The counter resets to zero
+whenever a fresh code is issued.
+
+**If SMTP isn't configured**, `utils/mailer.js` doesn't fail - it logs the
+would-be email (subject and code included) to the server console instead,
+so the whole flow is testable end to end before real email credentials
+exist. Set `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD` (see `.env.example`) to
+actually send mail.
 
 ## Endpoints
 
@@ -296,7 +297,7 @@ Grouped by domain. "Any user" means any authenticated account, viewer or admin.
 | GET | `/api/auth/me` | Any user |
 | POST | `/api/auth/change-password` | Any user - own account only |
 | POST | `/api/auth/forgot-password` | Public |
-| POST | `/api/auth/reset-password` | Public - authenticated by the token itself |
+| POST | `/api/auth/reset-password` | Public - authenticated by the emailed code itself |
 | POST | `/api/auth/register` | Admin |
 | GET | `/api/users` | Admin |
 | GET | `/api/users/:id` | Admin |

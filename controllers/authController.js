@@ -4,7 +4,7 @@ const userModel = require('../models/userModel');
 const { sendMail } = require('../utils/mailer');
 
 const SALT_ROUNDS = 10;
-const RESET_TOKEN_TTL_MINUTES = 60; // 1 hour
+const RESET_CODE_TTL_MINUTES = 10; // short-lived - a 6-digit code is brute-forceable given enough time
 
 // New signups wait for admin approval by default. The API sits on a public URL,
 // so without this anyone who finds it could read the whole inventory.
@@ -202,11 +202,11 @@ function me(req, res) {
 // Always returns the same generic response regardless of whether the
 // username exists, has no email on file, or is inactive - the response
 // content must never be how someone finds out whether an account exists.
-// The token itself, the account lookup, and the email send all happen
-// (or don't) behind that single unchanging response.
+// The code itself, the account lookup, and the email send all happen (or
+// don't) behind that single unchanging response.
 async function forgotPassword(req, res, next) {
   const { username } = req.body;
-  const GENERIC_RESPONSE = { message: 'If an account exists, a reset link has been sent.' };
+  const GENERIC_RESPONSE = { message: 'If an account exists, a reset code has been sent to its email.' };
 
   if (tooManyForgotPasswords(req.ip)) {
     // Same generic response even when throttled - a distinct error here
@@ -224,20 +224,23 @@ async function forgotPassword(req, res, next) {
     // endpoint to reject that when login itself accepts it.
     const user = await userModel.findByUsernameOrEmail(username);
     if (user && user.is_active && user.email) {
-      // Only a hash of this ever reaches the database (userModel.
-      // setResetToken) - the raw token exists only in memory here and in
-      // the email itself, same reasoning as never storing a plaintext
-      // password.
-      const rawToken = crypto.randomBytes(32).toString('hex');
-      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-      await userModel.setResetToken(user.user_id, tokenHash, RESET_TOKEN_TTL_MINUTES);
+      // A 6-digit code, zero-padded (e.g. "042917") - crypto.randomInt is
+      // the same non-predictable source used everywhere else a secret is
+      // generated in this app, just over a much smaller range than a link
+      // token needs. Only a hash of it ever reaches the database
+      // (userModel.setResetToken) - the raw code exists only in memory
+      // here and in the email itself, same reasoning as never storing a
+      // plaintext password. Its small range is exactly why
+      // userModel.redeemResetCode() has to cap wrong guesses - see its
+      // own comment.
+      const rawCode = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
+      const codeHash = crypto.createHash('sha256').update(rawCode).digest('hex');
+      await userModel.setResetToken(user.user_id, codeHash, RESET_CODE_TTL_MINUTES);
 
-      const frontendUrl = process.env.FRONTEND_URL || `http://localhost:${process.env.PORT || 3000}`;
-      const resetLink = `${frontendUrl}/reset-password?token=${rawToken}`;
       await sendMail({
         to: user.email,
-        subject: 'Reset your Tplus password',
-        text: `Someone requested a password reset for your Tplus account. If this was you, use the link below - it expires in 1 hour and can only be used once:\n\n${resetLink}\n\nIf you didn't request this, you can safely ignore this email - your password has not been changed.`,
+        subject: 'Your Tplus password reset code',
+        text: `Someone requested a password reset for your Tplus account. If this was you, enter this code where prompted - it expires in ${RESET_CODE_TTL_MINUTES} minutes and can only be used once:\n\n${rawCode}\n\nIf you didn't request this, you can safely ignore this email - your password has not been changed.`,
       });
     }
     res.json(GENERIC_RESPONSE);
@@ -246,33 +249,37 @@ async function forgotPassword(req, res, next) {
   }
 }
 
-// Public, unauthenticated - the caller proves who they are with the token
-// from the email, not credentials. Named distinctly from userController.
-// resetPassword (the admin-only forced reset) to avoid confusion when
-// reading routes/authRoutes.js and routes/userRoutes.js side by side; the
-// two are unrelated flows serving different callers.
-async function resetPasswordWithToken(req, res, next) {
-  const { token, new_password } = req.body;
+// Public, unauthenticated - the caller proves who they are with the code
+// from the email, not credentials, so this needs the identifier too
+// (unlike the link-token version this replaced, a 6-digit code alone
+// isn't enough to look the account up unambiguously - see
+// userModel.redeemResetCode()'s own comment). Named distinctly from
+// userController.resetPassword (the admin-only forced reset) to avoid
+// confusion when reading routes/authRoutes.js and routes/userRoutes.js
+// side by side; the two are unrelated flows serving different callers.
+async function resetPasswordWithCode(req, res, next) {
+  const { username, code, new_password } = req.body;
 
-  if (!token || !new_password) {
-    return res.status(400).json({ error: 'token and new_password are required' });
+  if (!username || !code || !new_password) {
+    return res.status(400).json({ error: 'username, code, and new_password are required' });
   }
   if (new_password.length < 8) {
     return res.status(400).json({ error: 'new_password must be at least 8 characters' });
   }
 
   try {
-    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
     const hash = await bcrypt.hash(new_password, SALT_ROUNDS);
-    // One atomic UPDATE verifies the token (matches AND not expired) and
-    // clears it in the same statement - see userModel.redeemResetToken()'s
-    // own comment for why that makes it single-use by construction.
-    const updated = await userModel.redeemResetToken(tokenHash, hash);
+    // See userModel.redeemResetCode()'s own comment for how this verifies
+    // the code, enforces the attempt cap, and clears it atomically on
+    // success - a wrong guess here still counts toward that account's
+    // attempt limit even though this call fails.
+    const result = await userModel.redeemResetCode(username, codeHash, hash);
 
-    if (!updated) {
+    if (!result) {
       return res.status(400).json({
-        error: 'This reset link is invalid or has expired',
-        hint: 'Request a new password reset link.',
+        error: 'That code is incorrect, expired, or has been guessed wrong too many times',
+        hint: 'Request a new password reset code.',
       });
     }
 
@@ -282,4 +289,4 @@ async function resetPasswordWithToken(req, res, next) {
   }
 }
 
-module.exports = { login, register, signup, me, changePassword, forgotPassword, resetPasswordWithToken };
+module.exports = { login, register, signup, me, changePassword, forgotPassword, resetPasswordWithCode };
