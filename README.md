@@ -1,58 +1,59 @@
 # Tplus API
 
-REST API over the `Tplus` SQL Server database, organised as **MVC**.
+REST API over the `Tplus` SQL Server database, organised as **MVC**, on **Sequelize**.
 
 ## Project structure
 
 ```
 tplus-api/
 ├── config/
-│   └── sequelize.js           Sequelize connection - every model goes through this
-├── models/                    ALL SQL lives here - nothing else touches the database
+│   └── sequelize.js            The one connection every model goes through
+├── models/                     ALL SQL lives here - nothing else touches the database
 │   ├── employeeModel.js
 │   ├── equipmentModel.js
-│   ├── borrowModel.js         Temporary loans: dbo.borrow_record
-│   ├── statusModel.js         Reference table: dbo.equipment_status
-│   ├── departmentModel.js     Reference table: dbo.department
-│   ├── categoryModel.js       Reference table: dbo.category
-│   ├── userModel.js           Login accounts (dbo.api_user)
-│   ├── searchModel.js
-│   ├── filterModel.js
-│   └── miscModel.js           SSD, licences, servers, antivirus, cloud
-├── controllers/               Request validation and response shaping
-│   ├── employeeController.js
-│   ├── equipmentController.js
-│   ├── borrowController.js
-│   ├── statusController.js
-│   ├── departmentController.js
-│   ├── categoryController.js
-│   ├── authController.js
-│   ├── searchController.js
-│   ├── filterController.js
-│   ├── stockController.js
-│   └── miscController.js
-├── routes/                    Thin - just maps URLs to controller functions
-│   ├── employeeRoutes.js
-│   ├── equipmentRoutes.js
-│   ├── borrowRoutes.js
-│   ├── statusRoutes.js
-│   ├── departmentRoutes.js
-│   ├── categoryRoutes.js
-│   ├── authRoutes.js
-│   ├── searchRoutes.js
-│   ├── filterRoutes.js
-│   ├── stockRoutes.js
-│   └── miscRoutes.js
+│   ├── departmentModel.js      Reference table: dbo.department
+│   ├── categoryModel.js        Reference table: dbo.category
+│   ├── statusModel.js          Reference table: dbo.equipment_status
+│   ├── borrowModel.js          Equipment loans: dbo.borrow_record
+│   ├── deviceReplacementModel.js  Whole-device swaps: dbo.device_replacement
+│   ├── antivirusInstallModel.js
+│   ├── serverUsageModel.js     Capacity-planning history log
+│   ├── softwareLicenseModel.js
+│   ├── customFieldModel.js     Per-category custom attributes on equipment
+│   ├── viewColumnModel.js      Per-category configurable equipment table columns
+│   ├── partModel.js            Part types + fitting/replacing a part on a device
+│   ├── partStockModel.js       Spare-part inventory
+│   ├── partStatusModel.js      Reference table: dbo.part_stock_status
+│   ├── partStockColumnModel.js Per-part-type configurable stock form columns
+│   ├── partCustomFieldModel.js Per-part-type custom attributes
+│   ├── partBorrowModel.js      Loose-part loans (bags, mice, keyboards)
+│   ├── recycleBinModel.js      Soft-deleted records awaiting restore
+│   ├── auditModel.js           Who changed what, and when
+│   ├── userModel.js            Login accounts (dbo.api_user)
+│   ├── searchModel.js          Universal search across employees and equipment
+│   └── filterModel.js          Dropdown option lists for the equipment filters
+├── controllers/                Request validation and response shaping - never touches the database
+├── routes/                     Thin - just maps URLs to controller functions
 ├── middleware/
-│   ├── auth.js                Checks username/password on every request
-│   └── errorHandler.js        Central error handling + 404
-├── server.js                  Wires everything together
-└── create-admin.js            One-time script for the first admin account
+│   ├── auth.js                 Checks credentials on every request
+│   ├── auditActivity.js        Records successful updates/deletes to dbo.audit_log
+│   └── errorHandler.js         Central error handling + 404
+├── tests/                      See "Testing" below
+├── server.js                   Wires everything together
+└── create-admin.js             One-time script for the first admin account
 ```
+
+Every model file above has a matching `xController.js` and `xRoutes.js` - e.g.
+`partStockModel.js` → `partStockController.js` → `partStockRoutes.js`. That
+pairing is 1:1 throughout the app, so it isn't repeated here.
 
 ### Why this layout
 
-- **Models** are the only place that writes SQL. If a query needs changing, there's exactly one file to open.
+- **Models** are the only place that writes SQL - all of it through Sequelize now, with a
+  short, deliberate list of exceptions where the ORM genuinely can't express something (a
+  real time-of-check/time-of-use race, an atomic MERGE avoiding a duplicate-insert race, an
+  `IDENTITY_INSERT` restore, or a bare `SELECT GETDATE()`) - each one commented in place with
+  why. If a query needs changing, there's exactly one file to open.
 - **Controllers** never touch the database. They validate input, call a model, and choose a status code.
 - **Routes** contain no logic at all — you can read a route file and see every URL the API exposes in a few lines.
 
@@ -63,7 +64,21 @@ Adding a new endpoint means: add a model function, add a controller function, ad
 1. `npm install`
 2. Copy `.env.example` to `.env` and fill in your database details
 3. Create the first admin: `node create-admin.js Tplus Tplus123@99 "Tplus Admin"`
-4. `npm start`
+4. `npm start` (or `npm run dev` for auto-restart on file changes)
+
+## Testing
+
+```
+npm test
+```
+
+Runs the Jest suite in `tests/` - some of it pure-function unit tests (no
+database needed), some of it full lifecycle tests against real Sequelize
+models. **There is no separate test database** - `config/sequelize.js` points
+at one database, and any DB-backed test runs against that same one. See
+`tests/README.md` for the resulting rule: a test may only ever create and
+delete its own scratch rows, never touch a real record. Every test currently
+in the suite follows that discipline.
 
 ## Authentication
 
@@ -135,65 +150,239 @@ is refused, since it would leave nobody able to manage the system.
 
 ## Endpoints
 
+Grouped by domain. "Any user" means any authenticated account, viewer or admin.
+
+<details><summary><b>Auth &amp; users</b></summary>
+
 | Method | Endpoint | Access |
 |---|---|---|
 | POST | `/api/auth/login` | Public |
-| GET | `/api/auth/me` | Any user |
 | POST | `/api/auth/signup` | Public |
+| GET | `/api/auth/me` | Any user |
 | POST | `/api/auth/register` | Admin |
 | GET | `/api/users` | Admin |
 | GET | `/api/users/:id` | Admin |
 | PUT | `/api/users/:id` | Admin |
 | POST | `/api/users/:id/reset-password` | Admin |
+
+</details>
+
+<details><summary><b>Employees</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
 | GET | `/api/employees/search?name=X` | Any user |
 | GET | `/api/employees` | Any user |
 | GET | `/api/employees/:id` | Any user |
+| GET | `/api/employees/:id/full` | Any user |
 | GET | `/api/employees/:id/replacements` | Any user |
+| GET | `/api/employees/:id/part-replacements` | Any user |
 | POST | `/api/employees` | Admin |
-| PUT | `/api/employees/:id` | Admin |
-| DELETE | `/api/employees/:id` | Admin |
+| PUT | `/api/employees/:id` | Any user |
+| DELETE | `/api/employees/:id` | Any user |
+
+</details>
+
+<details><summary><b>Equipment</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
 | GET | `/api/equipment` | Any user |
 | GET | `/api/equipment/categories` | Any user |
+| GET | `/api/equipment/licenses` | Any user |
+| GET | `/api/equipment/licenses/:id/equipment` | Any user |
+| GET | `/api/equipment/views` | Any user |
+| POST | `/api/equipment/unassign` | Any user |
 | GET | `/api/equipment/:id` | Any user |
-| PUT | `/api/equipment/:id/owner` | Admin |
-| PUT | `/api/equipment/:id` | Admin |
+| GET | `/api/equipment/:id/licenses` | Any user |
+| POST | `/api/equipment/:id/licenses` | Admin |
+| DELETE | `/api/equipment/:id/licenses/:licenseId` | Admin |
+| GET | `/api/equipment/:id/part-replacements` | Any user |
+| POST | `/api/equipment/:id/part-replacements` | Admin |
+| DELETE | `/api/equipment/:id/part-replacements/:replacementId` | Admin |
+| PUT | `/api/equipment/:id/owner` | Any user |
+| PUT | `/api/equipment/:id` | Any user |
+| DELETE | `/api/equipment/:id` | Admin |
+| GET | `/api/equipment/:view` | Any user |
+| POST | `/api/equipment/:view` | Admin |
+| PUT | `/api/equipment/:view/:id` | Any user |
+
+`:view` is a category's `view_key` (see View columns below) - the same
+collection with per-category column configuration layered on top.
+
+</details>
+
+<details><summary><b>Stock &amp; assignment (equipment)</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
 | POST | `/api/stock/add` | Admin |
-| POST | `/api/stock/assign` | Admin |
+| POST | `/api/stock/assign` | Any user |
 | GET | `/api/stock/available` | Any user |
 | GET | `/api/stock/by-date` | Any user |
-| GET | `/api/search?q=X` | Any user |
-| GET | `/api/filters` | Any user |
-| GET | `/api/licenses` | Any user |
-| GET | `/api/server-usage` | Any user |
-| GET | `/api/antivirus` | Any user |
-| GET | `/api/replacements` | Any user |
+| GET | `/api/assign/form-data` | Any user |
+| GET | `/api/assign/available` | Any user |
+| GET | `/api/assign/employees` | Any user |
+| POST | `/api/assign` | Admin |
+
+</details>
+
+<details><summary><b>Departments, categories, statuses</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
 | GET | `/api/departments` | Any user |
 | GET | `/api/departments/:id` | Any user |
 | POST | `/api/departments` | Admin |
-| PUT | `/api/departments/:id` | Admin |
+| PUT | `/api/departments/:id` | Any user |
+| DELETE | `/api/departments/:id` | Admin |
 | GET | `/api/categories` | Any user |
 | GET | `/api/categories/:id` | Any user |
 | POST | `/api/categories` | Admin |
-| PUT | `/api/categories/:id` | Admin |
+| PUT | `/api/categories/:id` | Any user |
+| DELETE | `/api/categories/:id` | Admin |
 | GET | `/api/statuses` | Any user |
 | GET | `/api/statuses/:id` | Any user |
+| POST | `/api/statuses` | Admin |
+| PUT | `/api/statuses/:id` | Admin |
+| DELETE | `/api/statuses/:id` | Admin |
+
+</details>
+
+<details><summary><b>Borrow &amp; return (equipment)</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
 | GET | `/api/borrow/available` | Any user |
 | GET | `/api/borrow/current` | Any user |
 | GET | `/api/borrow/history` | Any user |
+| GET | `/api/borrow/returns` | Any user |
 | GET | `/api/borrow/borrower/:id` | Any user |
 | GET | `/api/borrow/:id` | Any user |
-| POST | `/api/borrow` | Admin |
-| POST | `/api/borrow/return` | Admin |
-| POST | `/api/borrow/:id/return` | Admin |
+| POST | `/api/borrow` | Any user |
+| POST | `/api/borrow/return` | Any user |
+| POST | `/api/borrow/:id/return` | Any user |
+
+</details>
+
+<details><summary><b>Custom fields &amp; view columns (equipment)</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
+| GET | `/api/custom-fields/types` | Any user |
+| GET | `/api/custom-fields` | Any user |
+| GET | `/api/custom-fields/category/:categoryId` | Any user |
+| POST | `/api/custom-fields` | Admin |
+| PUT | `/api/custom-fields/:fieldId` | Admin |
+| DELETE | `/api/custom-fields/:fieldId` | Admin |
+| POST | `/api/custom-fields/category/:categoryId/attach` | Admin |
+| DELETE | `/api/custom-fields/category/:categoryId/field/:fieldId` | Admin |
+| GET | `/api/view-columns/available-fields` | Admin |
+| GET | `/api/view-columns` | Admin |
+| GET | `/api/view-columns/:categoryId` | Admin |
+| PUT | `/api/view-columns/:categoryId` | Admin |
+
+</details>
+
+<details><summary><b>Parts - types, stock, statuses, custom fields</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
+| GET | `/api/part-types` | Any user |
+| GET | `/api/part-types/columns` | Admin |
+| GET | `/api/part-types/stock-columns` | Admin |
+| GET | `/api/part-types/:id/categories` | Admin |
+| PUT | `/api/part-types/:id/categories` | Admin |
+| GET | `/api/part-types/:id/stock-columns` | Any user |
+| PUT | `/api/part-types/:id/stock-columns` | Admin |
+| POST | `/api/part-types` | Admin |
+| PUT | `/api/part-types/:id` | Admin |
+| DELETE | `/api/part-types/:id` | Admin |
+| GET | `/api/part-stock` | Any user |
+| GET | `/api/part-stock/available` | Any user |
+| GET | `/api/part-stock/summary` | Any user |
+| POST | `/api/part-stock` | Admin |
+| PUT | `/api/part-stock/:id` | Admin |
+| DELETE | `/api/part-stock/:id` | Admin |
+| GET | `/api/part-statuses` | Any user |
+| GET | `/api/part-statuses/:id` | Any user |
+| POST | `/api/part-statuses` | Admin |
+| PUT | `/api/part-statuses/:id` | Admin |
+| DELETE | `/api/part-statuses/:id` | Admin |
+| GET | `/api/part-custom-fields/types` | Any user |
+| GET | `/api/part-custom-fields` | Any user |
+| GET | `/api/part-custom-fields/part-type/:partTypeId` | Any user |
+| POST | `/api/part-custom-fields` | Admin |
+| PUT | `/api/part-custom-fields/:fieldId` | Admin |
+| DELETE | `/api/part-custom-fields/:fieldId` | Admin |
+| POST | `/api/part-custom-fields/part-type/:partTypeId/attach` | Admin |
+| DELETE | `/api/part-custom-fields/part-type/:partTypeId/field/:fieldId` | Admin |
+| GET | `/api/part-replacements` | Any user |
+
+</details>
+
+<details><summary><b>Borrowing loose parts</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
+| GET | `/api/part-borrow/available` | Any user |
+| GET | `/api/part-borrow/current` | Any user |
+| GET | `/api/part-borrow/history` | Any user |
+| GET | `/api/part-borrow/returns` | Any user |
+| GET | `/api/part-borrow/borrower/:id` | Any user |
+| GET | `/api/part-borrow/:id` | Any user |
+| POST | `/api/part-borrow` | Any user |
+| POST | `/api/part-borrow/:id/return` | Any user |
+| DELETE | `/api/part-borrow/:id` | Admin |
+
+</details>
+
+<details><summary><b>Software licenses, server usage, antivirus, device replacement</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
+| GET | `/api/licenses` | Any user |
+| POST | `/api/licenses` | Admin |
+| PUT | `/api/licenses/:id` | Admin |
+| DELETE | `/api/licenses/:id` | Admin |
+| GET | `/api/server-usage` | Any user |
+| POST | `/api/server-usage` | Admin |
+| PATCH | `/api/server-usage/equipment/:id/usage` | Any user |
+| DELETE | `/api/server-usage/:id` | Admin |
+| GET | `/api/antivirus` | Any user |
+| POST | `/api/antivirus` | Admin |
+| PUT | `/api/antivirus/:id` | Admin |
+| DELETE | `/api/antivirus/:id` | Admin |
+| GET | `/api/replacements` | Any user |
+
+</details>
+
+<details><summary><b>Recycle bin, audit log, reports, search</b></summary>
+
+| Method | Endpoint | Access |
+|---|---|---|
+| GET | `/api/recycle-bin` | Admin |
+| GET | `/api/recycle-bin/:id` | Admin |
+| POST | `/api/recycle-bin/:id/restore` | Admin |
+| DELETE | `/api/recycle-bin/:id` | Admin |
+| DELETE | `/api/recycle-bin/purge-all` | Admin |
+| GET | `/api/audit?limit=200` | Admin |
+| GET | `/api/reports/equipment` | Any user |
+| GET | `/api/reports/employees` | Any user |
+| GET | `/api/reports/borrow-history` | Any user |
+| GET | `/api/reports/part-stock` | Any user |
+| GET | `/api/search?q=X` | Any user |
+| GET | `/api/filters` | Any user |
+
+</details>
 
 ## Editing and deleting
 
 ### Audit log
 
 Successful updates and deletes are recorded with the acting account, action,
-record type and ID, submitted changes, and time. Run
-`migrations/20260803_add_audit_log.sql` once before deploying. Administrators
-can read the newest entries from `GET /api/audit?limit=200`.
+record type and ID, submitted changes, and time - `middleware/auditActivity.js`,
+applied per-route. Administrators read it from `GET /api/audit?limit=200`.
 
 Authenticated non-admin users may update or delete employees, equipment details,
 departments, and categories, and may unassign equipment before deleting a staff
@@ -202,9 +391,17 @@ and user-account management remain admin-only.
 
 **Deletable (authenticated users, all guarded):** employees, departments, categories.
 
-**Not deletable:** equipment and borrow records. Removing a device with borrow
-history would orphan those records, and the history is usually the part worth
-keeping. Retire equipment instead - `PUT` with `status: "Retired - IT Stock"`.
+**Deletable, admin-only:** equipment - `DELETE /api/equipment/:id` exists, but is
+meant for correcting a mistaken entry, not for retiring a real device. It's
+guarded the same way as the rest: refused with 409 while any borrow record,
+antivirus record, server usage entry, or part replacement still references
+it, which in practice means anything with real usage history can't be
+deleted through this endpoint at all. Retire a real device instead - `PUT`
+with `status: "Retired - IT Stock"` - which keeps its history and is what the
+409's own `hint` field suggests.
+
+**Not deletable at all:** borrow records. There's no endpoint for it - a loan
+is either open or returned, never erased.
 
 Every delete is refused while anything still references the record, and the
 error says exactly what is blocking it:
@@ -221,14 +418,20 @@ So in practice these only remove records with nothing attached - a duplicate
 entered by mistake, a department created by typo. Anything with real history
 stays.
 
+A delete that does go through is captured to the **recycle bin** first (see
+below), not gone outright - it can be restored later if it turns out to have
+been a mistake.
+
 ### Employees who leave
 
-Deleting them is the wrong tool. `borrow_record.borrower_id` is NOT NULL with a
-foreign key, so the database blocks it - and the value of loan history is
-knowing *who* had something. A record saying "someone borrowed the projector and
-never returned it" is worse than no record.
+Deleting them is the wrong tool. `borrow_record.borrower_id` is nullable
+specifically so a deletion doesn't have to be blocked by loan history - the
+borrower's name is snapshotted onto the loan (`borrower_name`) and the id
+cleared, so "someone borrowed the projector and never returned it" stays a
+readable record even after the person is gone.
 
-Deactivate instead:
+Deactivate instead, though, when the goal is day-to-day housekeeping rather
+than a genuine data cleanup:
 
 ```json
 PUT /api/employees/:id
@@ -239,18 +442,10 @@ They vanish from `GET /api/employees` (and so from every assign and borrow
 dropdown), but their history stays intact and still resolves to a real name.
 Use `?include_inactive=true` to see them again.
 
-The delete refusal distinguishes two cases, so the UI can tell the user whether
-it is something they can fix:
-
-| Situation | Response |
-|---|---|
-| Items still on loan, or equipment assigned | `blocking` lists what to clear first |
-| Everything returned, but past history exists | Explains the history would be lost, suggests deactivating |
-
-**Edit equipment** - `PUT /api/equipment/:id` (admin). Send only the fields that
-change; anything omitted is left alone. Accepts `category` / `department` as
-name or id. Rejects an asset code or service tag that would clash with another
-record.
+**Edit equipment** - `PUT /api/equipment/:id` (or `/api/equipment/:view/:id`).
+Send only the fields that change; anything omitted is left alone. Accepts
+`category` / `department` as name or id. Rejects an asset code or service tag
+that would clash with another record.
 
 **Instead of deleting:**
 
@@ -378,7 +573,7 @@ equipment currently has that status.
 `Installed` exists so wall-mounted cameras and racked servers don't appear in the
 assign or borrow lists simply because nobody owns them.
 
-**For the frontend:** `GET /api/statuses` returns all six with `is_assignable`
+**For the frontend:** `GET /api/statuses` returns all of these with `is_assignable`
 and `is_borrowable` flags. Use it to populate the dropdown and to grey out
 actions that aren't possible - no need to hardcode the rules client-side.
 
@@ -471,3 +666,208 @@ Refuses to overwrite an existing owner - it tells you who has it instead.
 **3. What's still in stock** → `GET /api/stock/available?category=Computer`
 
 **4. What arrived in January** → `GET /api/stock/by-date?from=2026-01-01&to=2026-01-31`
+
+## Custom fields (equipment)
+
+Category-specific attributes that don't warrant a real column on
+`dbo.equipment` - "Warranty End" on Laptops, say. A field is defined once
+(`equipment_custom_field`) and attached to whichever categories use it
+(`equipment_category_field`), so the same field is never redefined twice for
+two categories that happen to want the same attribute.
+
+```json
+POST /api/custom-fields                                    (admin)
+{ "fieldLabel": "Warranty End", "fieldType": "date" }
+
+POST /api/custom-fields/category/4/attach                  (admin)
+{ "fieldId": 7, "sortOrder": 1, "isRequired": false }
+```
+
+`fieldType` is one of `text`, `number`, `date`, `boolean`. Values are always
+stored as text underneath - the type drives the frontend's input control and
+validation, not a differently-typed column, so adding a field a category
+gains later needs no migration.
+
+Values ride alongside the normal equipment create/update calls - any body key
+matching an attached field's `field_key` is saved automatically, no separate
+endpoint needed for the common case. `GET /api/equipment/:id` returns them
+inline.
+
+**View columns** (`/api/view-columns`) are the companion piece: which of a
+category's fields (built-in or custom) actually show up as a column on that
+category's equipment table, and in what order. Configuring this is what makes
+`GET /api/equipment/:view` return a genuinely different shape per category
+(a Laptop's table looks different from a Server's) without any client-side
+per-category logic.
+
+## Parts (spare-part inventory)
+
+Separate from equipment: `dbo.equipment` is what a device *is*, this is what's
+on the shelf to fit into one - RAM, storage, batteries, or a model-identified
+accessory like a mouse or bag.
+
+**Part types** (`/api/part-types`) define what kinds of part exist. Two
+attributes decide how a type behaves everywhere else in this system:
+
+| Field | Meaning |
+|---|---|
+| `tracks_value` | Identified by a value ("16 GB") vs. a model (`model_name`/`model_number`) |
+| `is_countable` | Can quantities accumulate on a device (`'add'` action), or only ever get replaced whole |
+
+A part type can optionally map to a real `dbo.equipment` column
+(`equipment_column: "ram"`) or a custom field key, so fitting it updates the
+device's own record automatically - see Part replacements below.
+
+**Part statuses** (`/api/part-statuses`) mirror equipment's own status system,
+one level down - a real reference table, not free text, but without
+`is_assignable` (parts aren't assigned to a person, only borrowed):
+
+| Status | Meaning | Borrowable |
+|---|---|---|
+| `Working - IT Stock` | On the shelf, working | **Yes** |
+| `Broken - IT Stock` | Not usable | No |
+| `Working/Using` | Still good, already earmarked for something else | No |
+
+**Stock** (`/api/part-stock`) is counted, not individually identified - "3 x
+8GB RAM working" rather than tracking each stick with its own code. Working
+and broken stock of the same part are separate lines, so a faulty module is
+never offered for fitting.
+
+```json
+POST /api/part-stock                                       (admin)
+{ "part_type_id": 3, "part_value": "16", "status": "Working - IT Stock", "quantity": 4 }
+```
+
+**Part custom fields** (`/api/part-custom-fields`) and **stock columns**
+(`/api/part-types/:id/stock-columns`) are the parts-side equivalents of
+equipment's custom fields and view columns - kept as entirely separate tables
+from their equipment counterparts, since a device attribute and a spare-part
+attribute are never meant to be the same field even when the name matches.
+
+### Part replacements
+
+Fitting a part from stock onto a device, or undoing that:
+
+```json
+POST /api/equipment/:id/part-replacements                  (admin)
+{ "part_type_id": 3, "action": "replace", "from_stock_id": 41, "new_value": "16" }
+```
+
+`action` is `replace`, `add` (only for `is_countable` types - sums onto the
+current value), or `remove` (nothing fitted, only taken out). The part
+leaving stock is decremented atomically with the history row and, when the
+part type maps to a real column or custom field, the device's own record -
+so stock counts, device specs and replacement history can never drift apart.
+
+`DELETE /api/equipment/:id/part-replacements/:replacementId` (admin) undoes
+one: restores the device's prior value, and returns the fitted part to
+stock. `add` actions can't be undone - once several adds have stacked,
+there's no single "before" value to restore to.
+
+Reading the history: `GET /api/equipment/:id/part-replacements` for one
+device, `GET /api/employees/:id/part-replacements` for everything across an
+employee's whole kit, `GET /api/part-replacements` for every replacement
+ever logged.
+
+## Software licenses
+
+`/api/licenses` - what's licensed, and which devices it's installed on
+(many-to-many via `equipment_software_license`).
+
+```json
+POST /api/licenses                                         (admin)
+{ "product_name": "Office 365", "product_type": "Software",
+  "license_type": "Annual Subscription", "date_expire": "2027-01-01" }
+```
+
+`license_type` is `Free`, `Perpetual`, or `Annual Subscription`. Status
+(`active` / `near expire` / `expired` / `unknown`) is always computed, never
+set directly - `active`/`Perpetual` are always active; an Annual Subscription
+is `near expire` inside one month of `date_expire`, `expired` past it. The
+same rule runs both at write time and on every read, so a license's status
+never disagrees with itself between "what was just saved" and "what the list
+shows."
+
+**Attaching a license to a device** is separate from creating the license
+record itself:
+
+```json
+GET /api/equipment/:id/licenses                             (any user - what's on this device)
+POST /api/equipment/:id/licenses         { "license_id": 12 }  (admin)
+DELETE /api/equipment/:id/licenses/:licenseId                (admin)
+```
+
+`GET /api/equipment/licenses/:id/equipment` is the reverse lookup: which
+devices hold a given license, for answering "we have 50 seats - how many are
+used, and by whom?"
+
+## Server usage
+
+`/api/server-usage` - the capacity-planning sheet (Total Capacity vs. Usage)
+for Server-category equipment. Deliberately separate from `dbo.equipment`:
+that table stores what a server *is* (its CPU/RAM/HD, which this reads
+directly, never duplicating it), this table stores what to *do* about its
+capacity.
+
+**It's a history log, not one row per server** - every save adds a new row
+rather than overwriting the last one, so "what was this server's load as of a
+given date" stays answerable later.
+
+- `GET /api/server-usage` - today's view: every Server-category device, its
+  single latest entry (blank if none yet, so a server nobody has filled in
+  still shows up to prompt someone to).
+- `GET /api/server-usage?from=2026-01-01&to=2026-01-31` - the calendar view
+  instead: every entry actually recorded in that range. A server edited twice
+  in the window returns two rows; a server untouched in it doesn't appear at
+  all - a log of what happened, not "every server, blank or not."
+- `PATCH /api/server-usage/equipment/:id/usage` - the self-service form, open
+  to **any signed-in user**, not just admins (unlike the admin-only `POST`
+  above). Deliberately narrow: only `cpu_usage_pct`, `memory_usage_pct`,
+  `hdd_usage_gb` - never capacity, due date, owner, or remark. A field left
+  out of a call carries forward from the most recent entry rather than
+  blanking out, and a bare number like `"45"` gets `%` appended automatically.
+
+## Antivirus tracking
+
+`/api/antivirus` - per-device install status, plan/due/completed dates. A
+device can legitimately have more than one install record over time
+(reinstalled after a wipe, say) - reads that need "the current one" always
+pick the most recent by install date, not just any row.
+
+## Device replacement
+
+`/api/replacements` - whole-device swaps (this laptop for that one), distinct
+from **part** replacements above (a component swapped inside the same
+device). Records the employee, the old and new equipment, and condition/
+location notes on both sides at the time of the swap.
+
+## Recycle bin
+
+Deleting an employee, equipment, department, or software license captures a
+full snapshot to `dbo.recycle_bin` first, in the same transaction as the
+delete itself - so a failed delete can't leave an orphaned bin entry, and a
+failed bin write can't lose the record. (Category deletion does not currently
+go through the bin, even though `category` is one of the types `restore()`
+knows how to put back - worth wiring up if categories start getting deleted
+in practice.)
+
+```json
+GET /api/recycle-bin?entity_type=employee                  (admin)
+POST /api/recycle-bin/42/restore                           (admin)
+DELETE /api/recycle-bin/42                                 (admin, permanent)
+DELETE /api/recycle-bin/purge-all?confirm=true              (admin, empties everything)
+```
+
+**Restoring puts the row back at its original id** (an `IDENTITY_INSERT`
+operation - the one place in this app that still has to be raw SQL, since no
+ORM can force a value into an auto-increment primary key), so anything that
+already referenced it - a borrow record, say - doesn't end up pointing at
+nothing. Refused when: already restored, the id has since been taken by
+something else, or none of the stored columns still exist on the table
+(schema changed since the delete).
+
+## Reports
+
+`/api/reports/*` - equipment, employees, borrow history, and part stock,
+exported as Excel workbooks (`exceljs`) for anyone who needs the data outside
+the API itself.
