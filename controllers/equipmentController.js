@@ -51,7 +51,7 @@ async function getCategories(req, res, next) {
 }
 
 //unssign
-async function unassign(req, res) {
+async function unassign(req, res, next) {
   const { equipment_id, equipment_ids, owner_id, status } = req.body;
     const selectors = [
       Boolean(equipment_id),
@@ -84,8 +84,7 @@ async function unassign(req, res) {
     // return single object for single id, otherwise array
     return res.json(rows.length === 1 ? rows[0] : rows);
   } catch (err) {
-    console.error('unassign error', err);
-    return res.status(500).json({ error: err.message });
+    next(err);
   }
 }
 

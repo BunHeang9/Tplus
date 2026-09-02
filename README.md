@@ -27,14 +27,43 @@ throughout.
 ### What's not here yet
 
 Worth knowing if you're picking this up fresh: no CI pipeline, no linter
-config, and `console.log`/`console.error` (a small, deliberate footprint -
-7 call sites total, all in `server.js`/`config/sequelize.js`/`middleware/`)
-rather than a structured logger. Rate limiting exists only as a narrow,
-hand-rolled, in-memory throttle on `/api/auth/signup` (see below) - nothing
-app-wide, and nothing that would survive a restart or work across more than
-one process; `/api/auth/login` itself has none. None of these block running
-the app - they're the natural next layer of maturity, not missing pieces the
-app depends on.
+config, and `console.log`/`console.error` (a small, deliberate footprint,
+not a structured logger) in `server.js`, `config/sequelize.js`, the
+error-handling and audit-log middleware, `utils/mailer.js`'s SMTP-not-configured
+fallback, and the `create-admin.js` CLI script (where console output is the
+tool's actual interface, not logging). Rate limiting exists only as a
+narrow, hand-rolled, in-memory throttle on `/api/auth/signup` and
+`/api/auth/forgot-password` (see Password reset above) - nothing app-wide,
+nothing that survives a restart or works across more than one process, and
+`/api/auth/login` itself still has none. `middleware/errorHandler.js` hides
+real error messages from callers only when `NODE_ENV=production` is set
+(it is, in `.env`, since this API is reachable outside localhost) - the
+full message and stack trace are still always logged server-side either
+way, just never returned in the response body. None of these block running the app -
+they're the natural next layer of maturity, not missing pieces the app
+depends on.
+
+**No HTTPS in this codebase** - `server.js` listens on plain HTTP only.
+That's fine for how this ran during development: frontend and backend on
+the same computer (nothing crosses a real network), or shared temporarily
+between developers via a Cloudflare Tunnel, which provides HTTPS itself at
+Cloudflare's edge without this app needing to do anything. It stops being
+fine the moment this is hosted as a real, always-on company server multiple
+people connect to over the office network - the actual next step planned
+for this app - since Basic Auth (see Authentication above) sends the real
+password on every single request, and none of that is encrypted by this
+codebase itself. Whoever hosts it needs to put real HTTPS in front of it
+(a reverse proxy like nginx or IIS with a TLS certificate, or a permanent
+Cloudflare-proxied domain instead of a temporary Tunnel) before real staff
+credentials start flowing across the office network - this is the one item
+on this whole list worth treating as a blocker for that step, not just a
+nice-to-have.
+
+Also not built: **email verification at signup** - confirming a new
+account's email address is real before the account is usable. That's a
+different feature from the password reset flow above, which only requires
+an email already be correct; it never confirms the person actually owns
+it.
 
 ## Project structure
 
