@@ -185,12 +185,28 @@ async function findAll(filters = {}) {
     });
   }
 
+  // Sorted in JS below, not via ORDER BY on the joined category name - found
+  // live (real production timeout, 2026-09-02): with all 5 associations
+  // above present together, asking SQL Server to sort by a JOINED column
+  // (category.category_name) sent every one of these queries into a
+  // catastrophic execution plan - 15+ second timeouts on a table of ~500
+  // rows that a raw, unsorted version of the identical SQL answered in
+  // ~300ms. Isolated by re-running the exact captured SQL directly (fast)
+  // and bisecting which include + which ORDER BY combination reproduced it
+  // (only the full 5-association set AND the joined-column sort together
+  // triggered it - any subset, or sorting by equipment_id instead, was
+  // fine). Rather than chase SQL Server's plan choice (no access to tune
+  // indexes or plans here), sorting ~500 rows in JS after the fact is
+  // trivial and sidesteps the bad plan entirely - the DB-side ORDER BY only
+  // exists now to make the row order deterministic before the JS sort,
+  // which doesn't otherwise matter.
   const rows = await Equipment.findAll({
     where: conditions.length ? { [Op.and]: conditions } : undefined,
     include: equipmentIncludes(),
-    order: [[{ model: Category, as: 'category' }, 'category_name', 'ASC'], ['equipment_id', 'ASC']],
+    order: [['equipment_id', 'ASC']],
   });
-  return rows.map(shapeEquipmentRow);
+  return rows.map(shapeEquipmentRow).sort((a, b) =>
+    (a.category_name || '').localeCompare(b.category_name || '') || a.equipment_id - b.equipment_id);
 }
 
 async function findById(id) {
