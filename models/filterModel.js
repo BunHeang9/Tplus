@@ -5,7 +5,7 @@ const { Category } = require('./categoryModel');
 const { Department } = require('./departmentModel');
 const { EquipmentStatus } = require('./statusModel');
 const { Employee } = require('./employeeModel');
-const { Equipment } = require('./equipmentModel');
+const { Equipment, getAssignableStatusIds } = require('./equipmentModel');
 
 // Reverse of Equipment.belongsTo(Category, {as:'category'}) - declared here
 // rather than in categoryModel.js, which can never import Equipment back
@@ -93,6 +93,13 @@ async function getAllFilterOptions() {
 // here means unowned equipment locations only, not every device's. Moved
 // here from assignController.js, which used to run these queries itself.
 async function getAssignFormData() {
+  // Fetched up front, not inside the Promise.all below, because the
+  // available_count query needs it to build its WHERE clause - see
+  // equipmentModel.getAssignableStatusIds()'s own comment for why this is
+  // the same source of truth findAvailableForAssign() (GET /api/assign/
+  // available) uses, so the two can't disagree the way they did before.
+  const assignableStatusIds = await getAssignableStatusIds();
+
   const [positions, statuses, categories, locations] = await Promise.all([
     Employee.findAll({
       attributes: ['position', [fn('COUNT', col('employee_id')), 'employee_count']],
@@ -115,20 +122,30 @@ async function getAssignFormData() {
       raw: true,
     }),
     // available_count is a conditional COUNT across a JOIN (category ->
-    // equipment WHERE owner_id IS NULL). Unlike categoryModel.js's own
-    // equipment_count (genuinely blocked - that file is imported BY
-    // equipmentModel.js, so it can never import Equipment back without a
-    // require cycle), filterModel.js is a leaf that already imports both
-    // Category and Equipment, so this converts to a real include + COUNT -
-    // required:false keeps a category with zero unowned equipment in the
-    // results instead of dropping it, same as the original LEFT JOIN-shaped
-    // subquery would.
+    // equipment WHERE owner_id IS NULL AND status_id IN assignableStatusIds).
+    // Unlike categoryModel.js's own equipment_count (genuinely blocked -
+    // that file is imported BY equipmentModel.js, so it can never import
+    // Equipment back without a require cycle), filterModel.js is a leaf
+    // that already imports both Category and Equipment, so this converts
+    // to a real include + COUNT - required:false keeps a category with
+    // zero available equipment in the results instead of dropping it,
+    // same as the original LEFT JOIN-shaped subquery would.
+    // Real bug fixed here (frontend-reported): this used to filter only
+    // owner_id IS NULL, so a category full of unowned-but-not-assignable
+    // equipment (e.g. status "Installed" or "Retired") showed a count with
+    // nothing actually pickable behind it in GET /api/assign/available,
+    // which enforces the status too. Adding the same status_id condition
+    // (from the same getAssignableStatusIds() call findAvailableForAssign()
+    // itself uses) makes the two agree by construction, not by coincidence.
     Category.findAll({
       attributes: [
         'category_id', 'category_name',
         [fn('COUNT', col('unownedEquipment.equipment_id')), 'available_count'],
       ],
-      include: [{ model: Equipment, as: 'unownedEquipment', attributes: [], where: { owner_id: null }, required: false }],
+      include: [{
+        model: Equipment, as: 'unownedEquipment', attributes: [], required: false,
+        where: { owner_id: null, status_id: { [Op.in]: assignableStatusIds } },
+      }],
       where: { is_active: true },
       group: ['Category.category_id', 'Category.category_name'],
       order: [['category_name', 'ASC']],

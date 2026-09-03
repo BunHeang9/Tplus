@@ -585,6 +585,23 @@ async function findAvailable(category, includeInstalled) {
   });
 }
 
+// Single source of truth for "assignable" - both findAvailableForAssign()
+// below and filterModel.js's available_count read this same set of status
+// ids, specifically so the two can never drift out of sync again the way
+// they did before this fix: available_count only checked owner_id IS NULL
+// and ignored status entirely, so a category full of unowned-but-Retired
+// or unowned-but-Installed equipment showed a count with nothing behind
+// it - the dropdown claimed devices were pickable that findAvailableForAssign
+// itself would never actually return.
+async function getAssignableStatusIds() {
+  const rows = await EquipmentStatus.findAll({
+    where: { is_assignable: true },
+    attributes: ['status_id'],
+    raw: true,
+  });
+  return rows.map((r) => r.status_id);
+}
+
 // What can be picked from the assign page's device dropdown: unowned,
 // assignable, optionally narrowed by search text/category/status/location.
 // Distinct from findAvailable() above - that one is a plain unowned+
@@ -593,8 +610,15 @@ async function findAvailable(category, includeInstalled) {
 // assignController.js, which used to run this query itself.
 async function findAvailableForAssign({ q, category, status, location } = {}) {
   // No owner is not enough: a wall-mounted camera has no owner either.
-  // is_assignable marks what can actually be handed to a person.
-  const where = { owner_id: null };
+  // status_id IN (...) is what actually enforces "assignable" - see
+  // getAssignableStatusIds() above. The equipmentStatus include below stays
+  // a plain LEFT JOIN now, kept only to read back status_name for display;
+  // it used to also be how "assignable" was enforced (an INNER JOIN filtered
+  // by is_assignable), which is why filterModel.js's separate owner_id-only
+  // count could quietly drift out of sync with this function without either
+  // one erroring.
+  const assignableStatusIds = await getAssignableStatusIds();
+  const where = { owner_id: null, status_id: { [Op.in]: assignableStatusIds } };
   if (category) where['$category.category_name$'] = category;
   if (status) where.status = status;
   if (location) where.location = location;
@@ -617,7 +641,7 @@ async function findAvailableForAssign({ q, category, status, location } = {}) {
     where,
     include: [
       { model: Category, as: 'category' },
-      { model: EquipmentStatus, as: 'equipmentStatus', where: { is_assignable: true }, required: true },
+      { model: EquipmentStatus, as: 'equipmentStatus', required: false },
     ],
     order: [
       [{ model: Category, as: 'category' }, 'category_name', 'ASC'],
@@ -832,5 +856,6 @@ module.exports = {
   unassignByOwnerId,
   findAvailable,
   findAvailableForAssign,
+  getAssignableStatusIds,
   findByDateRange,
 };
