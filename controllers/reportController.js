@@ -97,7 +97,6 @@ const BORROW_COLUMNS = [
   { key: 'expected_return_date', header: 'Due Back' },
   { key: 'return_date', header: 'Returned' },
   { key: 'loan_status', header: 'Status' },
-  { key: 'purpose', header: 'Purpose' },
 ];
 
 // Same filters as GET /api/borrow/history (equipment_id, borrower_id, from, to).

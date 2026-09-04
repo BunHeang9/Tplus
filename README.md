@@ -699,8 +699,7 @@ POST /api/borrow
   "full_name": "Maneekone",
   "borrow_date": "2026-07-28",
   "expected_return_date": "2026-08-04",
-  "condition_on_borrow": "Good",
-  "purpose": "Presentation in meeting room 2"
+  "condition_on_borrow": "Good"
 }
 ```
 `borrower_id` may be used instead of `full_name`. `borrow_date` defaults to today.

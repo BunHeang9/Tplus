@@ -42,7 +42,6 @@ const PartBorrowRecord = sequelize.define('PartBorrowRecord', {
   condition_on_return: { type: DataTypes.STRING(400), allowNull: true },
   issued_by_id: { type: DataTypes.INTEGER, allowNull: true },
   received_by_id: { type: DataTypes.INTEGER, allowNull: true },
-  purpose: { type: DataTypes.STRING(400), allowNull: true },
   remark: { type: DataTypes.STRING(400), allowNull: true },
   // Legacy DATETIME with its own DB-side default - allowNull:true here even
   // though the column itself is NOT NULL, same pattern as borrowModel.js's
@@ -137,7 +136,6 @@ async function create(d) {
       expected_return_date: d.expected_return_date || null,
       condition_on_borrow: d.condition_on_borrow || null,
       issued_by_id: d.issued_by_id || null,
-      purpose: d.purpose || null,
       remark: d.remark || null,
     }, { transaction });
 
@@ -172,7 +170,6 @@ async function findById(borrowId) {
     condition_on_return: b.condition_on_return,
     issued_by: issuer ? issuer.full_name : null,
     received_by: receiver ? receiver.full_name : null,
-    purpose: b.purpose,
     remark: b.remark,
   });
 }
@@ -257,7 +254,6 @@ async function findCurrentlyBorrowed(overdueOnly) {
       condition_on_return: b.condition_on_return,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
       is_overdue: isOverdue ? 1 : 0,
     });
@@ -311,7 +307,6 @@ async function findHistory(filters = {}) {
       condition_on_return: b.condition_on_return,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
       loan_status: b.return_date === null ? 'Out' : 'Returned',
     });
@@ -371,7 +366,6 @@ async function findReturns(filters = {}) {
       condition_on_return: b.condition_on_return,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
       days_kept: Math.round((returnDay - borrowDay) / dayMs),
       was_late: wasLate ? 1 : 0,
@@ -417,7 +411,6 @@ async function findByBorrower(borrowerId, openOnly) {
       condition_on_return: b.condition_on_return,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
       loan_status: b.return_date === null ? 'Out' : 'Returned',
     });

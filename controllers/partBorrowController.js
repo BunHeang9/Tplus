@@ -14,7 +14,7 @@ const asDate = (d) => (d ? new Date(d).toISOString().slice(0, 10) : null);
 
 // POST /api/part-borrow
 // { stock_id, quantity, borrower_id, borrow_date, expected_return_date,
-//   condition_on_borrow, purpose, remark }
+//   condition_on_borrow, remark }
 async function borrow(req, res, next) {
   const { stock_id, quantity, borrower_id, borrow_date } = req.body;
 

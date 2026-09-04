@@ -39,7 +39,6 @@ const BorrowRecord = sequelize.define('BorrowRecord', {
   condition_on_return: { type: DataTypes.STRING(255), allowNull: true },
   issued_by_id: { type: DataTypes.INTEGER, allowNull: true },
   received_by_id: { type: DataTypes.INTEGER, allowNull: true },
-  purpose: { type: DataTypes.STRING(255), allowNull: true },
   remark: { type: DataTypes.STRING(255), allowNull: true },
   // Legacy DATETIME with its own DB-side default - same allowNull:true,
   // no-defaultValue pattern used everywhere else in this migration.
@@ -79,7 +78,6 @@ const CurrentlyBorrowedView = sequelize.define('CurrentlyBorrowedView', {
   days_out: DataTypes.INTEGER,
   is_overdue: DataTypes.INTEGER,
   condition_on_borrow: DataTypes.STRING(255),
-  purpose: DataTypes.STRING(255),
   remark: DataTypes.STRING(255),
 }, {
   tableName: 'vw_currently_borrowed',
@@ -171,7 +169,6 @@ async function create(d) {
       expected_return_date: d.expected_return_date || null,
       condition_on_borrow: d.condition_on_borrow || null,
       issued_by_id: d.issued_by_id || null,
-      purpose: d.purpose || null,
       remark: d.remark || null,
     }, { transaction });
 
@@ -295,7 +292,6 @@ async function findHistory(filters = {}) {
       condition_on_return: b.condition_on_return,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
     });
   });
@@ -368,7 +364,6 @@ async function findReturns(filters = {}) {
       current_status: equipment.equipmentStatus ? equipment.equipmentStatus.status_name : null,
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
-      purpose: b.purpose,
       remark: b.remark,
       _wasLate: wasLate,
     });
@@ -452,7 +447,6 @@ async function findByBorrower(borrowerId, openOnly) {
       loan_status: b.return_date === null ? 'Out' : 'Returned',
       condition_on_borrow: b.condition_on_borrow,
       condition_on_return: b.condition_on_return,
-      purpose: b.purpose,
       remark: b.remark,
     });
   });
