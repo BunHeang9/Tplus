@@ -312,7 +312,7 @@ async function findHistory(filters = {}) {
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
       remark: b.remark,
-      loan_status: b.return_date === null ? 'Out' : 'Returned',
+      loan_status: b.return_date === null ? 'In Use' : 'Returned',
     });
   });
 }
@@ -416,7 +416,7 @@ async function findByBorrower(borrowerId, openOnly) {
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
       remark: b.remark,
-      loan_status: b.return_date === null ? 'Out' : 'Returned',
+      loan_status: b.return_date === null ? 'In Use' : 'Returned',
     });
   });
 }
