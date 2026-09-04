@@ -255,12 +255,16 @@ async function findCurrentlyBorrowed(overdueOnly) {
       issued_by: issuer ? issuer.full_name : null,
       received_by: receiver ? receiver.full_name : null,
       remark: b.remark,
-      is_overdue: isOverdue ? 1 : 0,
+      // A real true/false, not SQL's usual 0/1 - matches the same fix on
+      // the equipment side (borrowModel.js's findCurrentlyBorrowed()),
+      // prompted by real feedback that a bare 1 rendered on the frontend
+      // meant nothing to a non-technical user.
+      is_overdue: !!isOverdue,
     });
   });
 
-  if (overdueOnly === 'true') shaped = shaped.filter((r) => r.is_overdue === 1);
-  shaped.sort((a, b) => (b.is_overdue - a.is_overdue) || (new Date(a.borrow_date) - new Date(b.borrow_date)));
+  if (overdueOnly === 'true') shaped = shaped.filter((r) => r.is_overdue);
+  shaped.sort((a, b) => (Number(b.is_overdue) - Number(a.is_overdue)) || (new Date(a.borrow_date) - new Date(b.borrow_date)));
 
   return shaped;
 }

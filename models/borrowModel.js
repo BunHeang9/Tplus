@@ -239,7 +239,14 @@ async function findCurrentlyBorrowed(overdueOnly) {
     order: [['is_overdue', 'DESC'], ['borrow_date', 'ASC']],
     raw: true,
   });
-  return rows.map(fixDates);
+  // is_overdue comes back as SQL Server's own 0/1 (the view computes it via
+  // a CASE WHEN...THEN 1 ELSE 0 END, not a real bit/boolean column) -
+  // converted to a real true/false here, since a non-technical frontend
+  // user was seeing the bare 1 rendered verbatim and had no idea what it
+  // meant (real feedback, not theoretical). true/false behaves identically
+  // to 1/0 in any JS truthy check, so this is a pure readability fix, not a
+  // behavior change for any caller already doing `if (row.is_overdue)`.
+  return rows.map((row) => ({ ...fixDates(row), is_overdue: !!row.is_overdue }));
 }
 
 async function findHistory(filters = {}) {

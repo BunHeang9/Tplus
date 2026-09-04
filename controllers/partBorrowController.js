@@ -122,7 +122,7 @@ async function getCurrent(req, res, next) {
     const records = await partBorrowModel.findCurrentlyBorrowed(req.query.overdue);
     res.json({
       count: records.length,
-      overdue_count: records.filter((r) => r.is_overdue === 1).length,
+      overdue_count: records.filter((r) => r.is_overdue).length,
       borrowed: records,
     });
   } catch (err) {
